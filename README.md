@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/veniai/PLDR/actions/workflows/ci.yml/badge.svg)](https://github.com/veniai/PLDR/actions/workflows/ci.yml)
 
-PLDR 是一个面向开源情报工作的证据化采集、事件聚合、来源独立性分析与辅助研判工作台。
+PLDR 是一个面向开源情报工作的证据优先工作台。它借鉴 Palantir 的对象、关系和受控 AI 思路，但不照搬通用企业本体：PLDR 以“来源—文档—快照—主张—证据—研判”为核心链路，让每项分析结论都能回到材料、版本和原文片段。
 
 当前仓库已完成 **P0.2 分析员工作台**。内置专题用于演示从公开材料进入系统，到事件聚合、主张证据、结构化研判和证据简报生成的完整闭环：
 
@@ -79,4 +79,4 @@ LLM_TIMEOUT_SECONDS=60
 
 ## 当前边界
 
-P0.2 已经足以支撑第一轮跨电脑演示和产品讨论。真实业务试点仍需补充网页版本历史、采集任务调度、导入资料人工归并、跨媒体转载链识别、账号权限、审计日志和长期许可证决策。详见 `STATUS.md` 与 `docs/product/ROADMAP.md`。
+P0.2 已经合入 `master`，足以支撑第一轮跨电脑演示和产品讨论。当前唯一下一优先级是 **P0.3 待处理采集箱与人工确认入档**：网页、粘贴文本和本地文件先进入采集箱，AI 只生成候选事件、实体、主张和证据，分析员新建、合并、修改或驳回后，只有确认结果才进入正式事件档案和可追溯报告。详见 `STATUS.md`、`docs/product/P0.3-INGESTION-INBOX.md` 与 `docs/product/ROADMAP.md`。
