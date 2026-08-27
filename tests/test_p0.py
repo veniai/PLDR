@@ -398,25 +398,54 @@ class P0Test(unittest.TestCase):
         self.assertEqual(private.status_code, 200, private.text)
         self.assertEqual(private.json()["intake_item"]["status"], "failed")
         self.assertIn("blocked", private.json()["intake_item"]["error"])
+        short_page = self.client.post(
+            "/pldr-api/v1/import/url",
+            json={
+                "url": "https://short-page.example.org/report",
+                "html": "<html><body><p>too short</p></body></html>",
+                "language": "en",
+            },
+        )
+        self.assertEqual(short_page.status_code, 200, short_page.text)
+        self.assertEqual(short_page.json()["intake_item"]["status"], "failed")
+        self.assertTrue(short_page.json()["intake_item"]["material"]["raw_hash"])
+        self.assertTrue(short_page.json()["intake_item"]["material"]["raw_snapshot"])
+        self.assertTrue(short_page.json()["intake_item"]["material"]["extracted_hash"])
         empty = self.client.post(
             "/pldr-api/v1/intake/text",
-            json={"text": " ", "source_description": "Empty note", "language": "en"},
+            json={"text": "", "source_description": "Empty note", "language": "en"},
         )
+        self.assertEqual(empty.status_code, 200, empty.text)
         self.assertEqual(empty.json()["intake_item"]["status"], "failed")
+        self.assertTrue(empty.json()["intake_item"]["material"]["raw_hash"])
+        self.assertTrue(empty.json()["intake_item"]["material"]["extracted_hash"])
         damaged = self.client.post(
             "/pldr-api/v1/intake/files",
             files={"file": ("broken.pdf", b"%PDF-1.4 broken", "application/pdf")},
             data={"source_description": "Damaged file", "language": "en"},
         )
+        self.assertEqual(damaged.status_code, 200, damaged.text)
         self.assertEqual(damaged.json()["intake_item"]["status"], "failed")
         self.assertIn("damaged", damaged.json()["intake_item"]["error"])
+        damaged_item = damaged.json()["intake_item"]
+        self.assertEqual(damaged_item["file"]["size_bytes"], len(b"%PDF-1.4 broken"))
+        self.assertEqual(damaged_item["file"]["media_type"], "application/pdf")
+        self.assertTrue(damaged_item["material"]["raw_hash"])
+        self.assertTrue(damaged_item["material"]["raw_snapshot"])
+        self.assertEqual(damaged_item["material"]["raw_encoding"], "base64")
         unsupported = self.client.post(
             "/pldr-api/v1/intake/files",
             files={"file": ("payload.exe", b"MZ", "application/octet-stream")},
             data={"source_description": "Unsupported file", "language": "en"},
         )
+        self.assertEqual(unsupported.status_code, 200, unsupported.text)
         self.assertEqual(unsupported.json()["intake_item"]["status"], "failed")
         self.assertIn("Unsupported file type", unsupported.json()["intake_item"]["error"])
+        unsupported_item = unsupported.json()["intake_item"]
+        self.assertEqual(unsupported_item["file"]["size_bytes"], len(b"MZ"))
+        self.assertEqual(unsupported_item["file"]["media_type"], "application/octet-stream")
+        self.assertTrue(unsupported_item["material"]["raw_hash"])
+        self.assertTrue(unsupported_item["material"]["raw_snapshot"])
         oversized = self.client.post(
             "/pldr-api/v1/intake/files",
             files={"file": ("oversized.txt", b"x" * (5 * 1024 * 1024 + 1), "text/plain")},
@@ -424,6 +453,17 @@ class P0Test(unittest.TestCase):
         )
         self.assertEqual(oversized.json()["intake_item"]["status"], "failed")
         self.assertIn("exceeds the 5 MiB limit", oversized.json()["intake_item"]["error"])
+        self.assertEqual(oversized.json()["intake_item"]["file"]["size_bytes"], 5 * 1024 * 1024 + 1)
+        self.assertTrue(oversized.json()["intake_item"]["material"]["raw_hash"])
+        malformed_rss = self.client.post(
+            "/pldr-api/v1/import/rss",
+            json={"xml": "<rss>", "source_name": "Malformed RSS", "language": "en"},
+        )
+        self.assertEqual(malformed_rss.status_code, 200, malformed_rss.text)
+        malformed_item = malformed_rss.json()["intake_items"][0]
+        self.assertEqual(malformed_item["status"], "failed")
+        self.assertTrue(malformed_item["material"]["raw_hash"])
+        self.assertTrue(malformed_item["material"]["raw_snapshot"])
 
         self.assertEqual(counts(SessionLocal()), baseline)
         listed = self.client.get("/pldr-api/v1/intake?limit=200")
@@ -744,6 +784,14 @@ class P0Test(unittest.TestCase):
             "/pldr-api/v1/intake/",
         ]:
             self.assertIn(endpoint, script.text)
+        for control_state in [
+            '$("#import-url").disabled = !isUrlMode;',
+            '$("#import-text").required = isTextMode;',
+            '$("#import-text").disabled = !isTextMode;',
+            '$("#import-file").required = isFileMode;',
+            '$("#import-file").disabled = !isFileMode;',
+        ]:
+            self.assertIn(control_state, script.text)
 
         styles = self.client.get("/assets/styles.css")
         self.assertEqual(styles.status_code, 200)

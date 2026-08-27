@@ -590,16 +590,23 @@ function setImportMode(mode) {
   state.importMode = mode;
   $$(".import-tab").forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
   const isUrlMode = mode === "url" || mode === "rss";
+  const isTextMode = mode === "text";
+  const isFileMode = mode === "file";
   $("#import-url-label").textContent = mode === "rss" ? "RSS / Atom 地址" : "公开网页地址";
   $("#import-url").placeholder = mode === "rss" ? "https://example.org/feed.xml" : "https://example.org/article";
   $("#import-url").required = isUrlMode;
+  $("#import-url").disabled = !isUrlMode;
   $("#import-url-field").hidden = !isUrlMode;
-  $("#import-text-field").hidden = mode !== "text";
-  $("#import-file-field").hidden = mode !== "file";
+  $("#import-text").required = isTextMode;
+  $("#import-text").disabled = !isTextMode;
+  $("#import-text-field").hidden = !isTextMode;
+  $("#import-file").required = isFileMode;
+  $("#import-file").disabled = !isFileMode;
+  $("#import-file-field").hidden = !isFileMode;
   $("#import-title-field").hidden = mode === "rss" || mode === "file";
   $("#import-published-field").hidden = mode !== "text";
   $("#import-source-label").textContent = mode === "url" || mode === "rss" ? "来源说明" : "来源说明（必填）";
-  $("#import-source").required = !isUrlMode;
+  $("#import-source").required = isTextMode || isFileMode;
 }
 
 async function submitImport(event) {

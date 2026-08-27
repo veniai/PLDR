@@ -21,7 +21,7 @@ class ImportRssRequest(BaseModel):
     language:str=Field(default="en",max_length=20)
 
 class IntakeTextRequest(BaseModel):
-    text:str=Field(min_length=1,max_length=200_000)
+    text:str=Field(default="",max_length=200_000)
     source_description:str=Field(min_length=3,max_length=500)
     title:str|None=Field(default=None,max_length=500)
     published_at:str|None=Field(default=None,max_length=40)

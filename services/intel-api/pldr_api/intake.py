@@ -364,7 +364,18 @@ async def submit_web_intake(
         session.refresh(item)
         return await generate_candidates(session, item)
     except Exception as exc:
-        return _failed_item(session, input_type, exc, **common)
+        failure_html = html or ""
+        failure_text = normalize_text(failure_html)
+        return _failed_item(
+            session,
+            input_type,
+            exc,
+            raw_snapshot=failure_html,
+            raw_hash=sha256_text(failure_html) if failure_html else "",
+            extracted_snapshot=failure_text,
+            extracted_hash=content_hash(failure_text) if failure_html else "",
+            **common,
+        )
 
 
 async def submit_text_intake(session: Session, request: Any) -> IntakeItem:
@@ -395,7 +406,17 @@ async def submit_text_intake(session: Session, request: Any) -> IntakeItem:
         session.refresh(item)
         return await generate_candidates(session, item)
     except Exception as exc:
-        return _failed_item(session, "text", exc, **common)
+        normalized_failure = normalize_text(request.text)
+        return _failed_item(
+            session,
+            "text",
+            exc,
+            raw_snapshot=request.text,
+            raw_hash=sha256_text(request.text),
+            extracted_snapshot=normalized_failure,
+            extracted_hash=content_hash(normalized_failure),
+            **common,
+        )
 
 
 def _extract_pdf(data: bytes) -> str:
@@ -426,37 +447,55 @@ async def submit_file_intake(
     filename = Path(upload.filename or "").name
     suffix = Path(filename).suffix.lower()
     common = {"source_description": source_description.strip(), "language": language}
+    failure_values: dict[str, Any] = {
+        "original_filename": filename or None,
+        "media_type": (getattr(upload, "content_type", "") or "application/octet-stream")[:120],
+        "size_bytes": None,
+        "raw_snapshot": "",
+        "raw_hash": "",
+        "review": {"material": {"raw_encoding": "none"}},
+    }
     try:
+        data = await upload.read(MAX_FILE_BYTES + 1)
+        failure_values.update(
+            size_bytes=len(data),
+            raw_snapshot=base64.b64encode(data).decode("ascii"),
+            raw_hash=sha256_bytes(data),
+            review={"material": {"raw_encoding": "base64"}},
+        )
         if not filename or suffix not in SUPPORTED_FILE_SUFFIXES:
             raise ValueError(f"Unsupported file type; allowed: {', '.join(sorted(SUPPORTED_FILE_SUFFIXES))}")
         if not source_description or len(source_description.strip()) < 3:
             raise ValueError("A source description of at least 3 characters is required")
-        data = await upload.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise ValueError(f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)} MiB limit")
         if not data:
             raise ValueError("File is empty")
         media_type = SUPPORTED_FILE_SUFFIXES[suffix]
+        failure_values["media_type"] = media_type
         if suffix == ".pdf":
             extracted = _extract_pdf(data)
-            raw_snapshot = base64.b64encode(data).decode("ascii")
-            raw_hash = sha256_bytes(data)
+            raw_snapshot = failure_values["raw_snapshot"]
+            raw_hash = failure_values["raw_hash"]
             raw_encoding = "base64"
         else:
             try:
                 raw_text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("Text file is not valid UTF-8") from exc
+            raw_snapshot = raw_text
+            raw_hash = sha256_text(raw_text)
+            raw_encoding = "utf-8"
+            failure_values.update(
+                raw_snapshot=raw_snapshot,
+                raw_hash=raw_hash,
+                review={"material": {"raw_encoding": raw_encoding}},
+            )
             if suffix in {".html", ".htm"}:
                 page = extract_page(raw_text)
                 extracted = page.body
             else:
                 extracted = normalize_text(raw_text)
-            if len(extracted) < 10:
-                raise ValueError("File contains no extractable text")
-            raw_snapshot = raw_text
-            raw_hash = sha256_text(raw_text)
-            raw_encoding = "utf-8"
         if len(extracted) < 10:
             raise ValueError("File contains no extractable text")
         item = _base_item(
@@ -480,7 +519,7 @@ async def submit_file_intake(
             session,
             "file",
             exc,
-            original_filename=filename or None,
+            **failure_values,
             **common,
         )
 
@@ -554,6 +593,8 @@ async def submit_rss_intake(
             )
         return results
     except Exception as exc:
+        failure_xml = xml or ""
+        failure_text = normalize_text(failure_xml)
         return [
             _failed_item(
                 session,
@@ -562,6 +603,10 @@ async def submit_rss_intake(
                 source_url=url,
                 source_description=source_name,
                 language=language,
+                raw_snapshot=failure_xml,
+                raw_hash=sha256_text(failure_xml) if failure_xml else "",
+                extracted_snapshot=failure_text,
+                extracted_hash=content_hash(failure_text) if failure_xml else "",
             )
         ]
 
