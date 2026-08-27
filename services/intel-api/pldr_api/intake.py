@@ -842,20 +842,47 @@ def _get_or_create_intake_source(session: Session, item: IntakeItem) -> Source:
 
 
 def _create_formal_document(session: Session, item: IntakeItem) -> Document:
-    source = _get_or_create_intake_source(session, item)
     canonical_url = item.canonical_url or item.source_url or f"pldr:intake/{item.id}"
     existing = session.scalar(select(Document).where(Document.canonical_url == canonical_url))
     if existing is not None:
         if existing.content_hash != item.extracted_hash:
             raise ValueError("Canonical URL already has a different formal snapshot; resolve the conflict before confirmation")
+        if existing.body != item.extracted_snapshot:
+            raise ValueError("Canonical URL snapshot body differs from the submitted extracted text")
+        # A repeated submission of the same canonical URL and snapshot must associate the
+        # existing formal provenance rather than create an orphan Source. The intake item
+        # remains the durable trace from this review decision back to that Document.
         snapshot = session.scalar(
             select(Snapshot)
             .where(Snapshot.document_id == existing.id)
             .order_by(Snapshot.captured_at.desc())
             .limit(1)
         )
-        item.final_snapshot_id = snapshot.id if snapshot else None
+        if snapshot is None or snapshot.excerpt != item.extracted_snapshot:
+            snapshot_id = "snap_intake_" + hashlib.sha1(f"{existing.id}:{item.id}".encode("utf-8")).hexdigest()[:16]
+            snapshot = Snapshot(
+                id=snapshot_id,
+                document_id=existing.id,
+                captured_at=item.created_at,
+                content_hash=item.extracted_hash,
+                excerpt=item.extracted_snapshot,
+                storage_path="inline-intake-reused",
+            )
+            session.add(snapshot)
+            session.flush()
+        reuse_metadata = dict(existing.metadata_json or {})
+        intake_ids = list(reuse_metadata.get("intake_item_ids", []))
+        original_intake_id = reuse_metadata.get("intake_item_id")
+        if original_intake_id is not None and original_intake_id not in intake_ids:
+            intake_ids.insert(0, original_intake_id)
+        if item.id not in intake_ids:
+            intake_ids.append(item.id)
+        reuse_metadata["intake_item_ids"] = intake_ids
+        existing.metadata_json = reuse_metadata
+        item.final_document_id = existing.id
+        item.final_snapshot_id = snapshot.id
         return existing
+    source = _get_or_create_intake_source(session, item)
     document_id = "doc_intake_" + hashlib.sha1(f"{item.id}:{item.extracted_hash}".encode("utf-8")).hexdigest()[:14]
     duplicate = session.scalar(
         select(Document)
@@ -870,6 +897,7 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         "source_description": item.source_description,
         "raw_hash": item.raw_hash,
         "confirmation_stage": "P0.3-human-confirmed",
+        "intake_item_ids": [item.id],
     }
     if duplicate is not None:
         metadata["duplicate_of_document_id"] = duplicate.id

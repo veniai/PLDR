@@ -20,7 +20,7 @@ from pldr_api.intake import confirm_intake, get_intake_item
 from pldr_api.schemas import IntakeConfirmationRequest
 from pldr_api.security import UnsafeUrlError, validate_public_http_url
 from pldr_api.seed import counts, seed_database
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 
 class P0Test(unittest.TestCase):
@@ -208,6 +208,55 @@ class P0Test(unittest.TestCase):
                 session.get(Document, first_document_id).source.independence_group,
             )
             self.assertEqual(second_document.metadata_json["duplicate_of_document_id"], first_document_id)
+
+        before_canonical_reuse = counts(SessionLocal())
+        repeated = self.client.post(
+            "/pldr-api/v1/import/url",
+            json={
+                "url": "https://alpha.example.org/shared-dispatch",
+                "source_name": "Renamed Alpha Example",
+                "html": html,
+                "language": "en",
+            },
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        repeated_item = repeated.json()["intake_item"]
+        self.assertEqual(repeated_item["status"], "candidate_ready")
+        repeated_confirmation = self.client.post(
+            f"/pldr-api/v1/intake/{repeated_item['id']}/confirm",
+            json=self.confirmation_request(repeated_item),
+        )
+        self.assertEqual(repeated_confirmation.status_code, 200, repeated_confirmation.text)
+        repeated_result = repeated_confirmation.json()["result"]["formal_object_ids"]
+        self.assertEqual(repeated_result["document"], first_document_id)
+        self.assertEqual(
+            repeated_result["source"],
+            first_confirmation.json()["result"]["formal_object_ids"]["source"],
+        )
+        after_canonical_reuse = counts(SessionLocal())
+        self.assertEqual(after_canonical_reuse["sources"], before_canonical_reuse["sources"])
+        self.assertEqual(after_canonical_reuse["documents"], before_canonical_reuse["documents"])
+        self.assertEqual(after_canonical_reuse["events"], before_canonical_reuse["events"] + 1)
+        self.assertEqual(after_canonical_reuse["claims"], before_canonical_reuse["claims"] + 1)
+        self.assertEqual(after_canonical_reuse["evidence"], before_canonical_reuse["evidence"] + 1)
+        with SessionLocal() as session:
+            persisted_repeated = session.get(IntakeItem, repeated_item["id"])
+            assert persisted_repeated is not None
+            self.assertEqual(persisted_repeated.final_document_id, first_document_id)
+            self.assertTrue(persisted_repeated.final_snapshot_id)
+            reused_document = session.get(Document, first_document_id)
+            assert reused_document is not None
+            self.assertEqual(
+                reused_document.metadata_json["intake_item_ids"],
+                [first_item["id"], repeated_item["id"]],
+            )
+            orphan_intake_sources = session.scalar(
+                select(func.count())
+                .select_from(Source)
+                .outerjoin(Document, Document.source_id == Source.id)
+                .where(Document.id.is_(None), Source.id.like("src_intake_%"))
+            )
+            self.assertEqual(orphan_intake_sources, 0)
 
     def test_evidence_exact_substrings(self):
         with SessionLocal() as session:
