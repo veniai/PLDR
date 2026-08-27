@@ -40,6 +40,7 @@ def get_event(session: Session, event_id: str) -> Event | None:
 
 def serialize_event_card(event: Event) -> dict[str, Any]:
     documents = [link.document for link in event.document_links]
+    event_metadata = event.metadata_json or {}
     groups = {d.source.independence_group for d in documents}
     languages = sorted({d.language for d in documents})
     source_types = Counter(d.source.source_type for d in documents)
@@ -53,7 +54,7 @@ def serialize_event_card(event: Event) -> dict[str, Any]:
         "title": event.title,
         "summary": event.summary,
         "event_type": event.event_type,
-        "start_at": iso(event.start_at),
+        "start_at": None if event_metadata.get("start_at_known") is False else iso(event.start_at),
         "end_at": iso(event.end_at),
         "location": {
             "name": event.location_name,
@@ -70,13 +71,20 @@ def serialize_event_card(event: Event) -> dict[str, Any]:
         "entities": entities,
         "claim_counts": dict(claim_counts),
         "has_contested_claim": any(c.status in {"contested", "unverified"} for c in event.claims),
+        "provenance": {
+            "intake_item_id": event_metadata.get("intake_item_id"),
+            "confirmation_stage": event_metadata.get("confirmation_stage"),
+        },
     }
 
 
 def serialize_document(document: Document, event_id: str | None = None) -> dict[str, Any]:
+    metadata = document.metadata_json or {}
+    canonical_url = None if document.canonical_url.startswith("pldr:") else document.canonical_url
     return {
         "id": document.id,
-        "title": document.title,
+        "title": None if metadata.get("title_known") is False else document.title,
+        "title_known": metadata.get("title_known", True),
         "source": {
             "id": document.source.id,
             "name": document.source.name,
@@ -85,15 +93,20 @@ def serialize_document(document: Document, event_id: str | None = None) -> dict[
             "reliability_tier": document.source.reliability_tier,
             "independence_group": document.source.independence_group,
         },
-        "published_at": iso(document.published_at),
+        "published_at": None if metadata.get("published_at_known") is False else iso(document.published_at),
         "fetched_at": iso(document.fetched_at),
         "language": document.language,
         "content_hash": document.content_hash,
         "upstream_story_id": document.upstream_story_id,
         "is_cached": document.is_cached,
-        "canonical_url": document.canonical_url,
+        "canonical_url": canonical_url,
+        "canonical_url_known": canonical_url is not None,
         "snapshot_url": f"/snapshots/{document.id}" + (f"?event_id={event_id}" if event_id else ""),
-        "metadata": document.metadata_json,
+        "metadata": metadata,
+        "provenance": {
+            "intake_item_id": metadata.get("intake_item_id"),
+            "confirmation_stage": metadata.get("confirmation_stage"),
+        },
     }
 
 
@@ -161,7 +174,8 @@ def serialize_source(source: Source) -> dict[str, Any]:
     return {
         "id": source.id,
         "name": source.name,
-        "base_url": source.base_url,
+        "base_url": None if source.base_url.startswith("pldr:") else source.base_url,
+        "base_url_known": not source.base_url.startswith("pldr:"),
         "country": source.country,
         "language": source.language,
         "type": source.source_type,

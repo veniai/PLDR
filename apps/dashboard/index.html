@@ -13,7 +13,7 @@
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div>
-          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P0.2</span></div>
+          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P0.3</span></div>
           <p>开源情报证据工作台</p>
         </div>
       </div>
@@ -36,6 +36,10 @@
         </div>
       </div>
       <div class="command-actions">
+        <button class="btn btn-ghost intake-button" id="btn-intake" type="button">
+          <span aria-hidden="true">▤</span> 待处理采集箱
+          <span id="intake-count" class="count-badge">0</span>
+        </button>
         <button class="btn btn-ghost" id="btn-import" type="button">
           <span aria-hidden="true">＋</span> 导入资料
         </button>
@@ -189,17 +193,27 @@
         <button id="import-close" class="icon-btn" type="button" aria-label="关闭导入窗口">×</button>
       </div>
       <div class="import-tabs" role="tablist" aria-label="导入方式">
-        <button class="import-tab active" type="button" data-mode="url">网页 URL</button>
+        <button class="import-tab active" type="button" data-mode="url">公共网页</button>
+        <button class="import-tab" type="button" data-mode="text">粘贴文本</button>
+        <button class="import-tab" type="button" data-mode="file">本地文件</button>
         <button class="import-tab" type="button" data-mode="rss">RSS / Atom</button>
       </div>
-      <label class="form-field">
+      <label id="import-url-field" class="form-field">
         <span id="import-url-label">公开网页地址</span>
         <input id="import-url" type="url" required placeholder="https://example.org/article">
       </label>
+      <label id="import-text-field" class="form-field" hidden>
+        <span>粘贴正文（未知标题和发布时间会保持未知）</span>
+        <textarea id="import-text" rows="7" required placeholder="粘贴可核验的材料原文"></textarea>
+      </label>
+      <label id="import-file-field" class="form-field" hidden>
+        <span>受支持文件：TXT / Markdown / HTML / PDF，最大 5 MiB</span>
+        <input id="import-file" type="file" required accept=".txt,.md,.markdown,.html,.htm,.pdf">
+      </label>
       <div class="form-grid">
         <label class="form-field">
-          <span>来源名称</span>
-          <input id="import-source" type="text" maxlength="160" placeholder="留空则按域名识别">
+          <span id="import-source-label">来源说明</span>
+          <input id="import-source" type="text" maxlength="160" placeholder="网页可留空；文本/文件必填">
         </label>
         <label class="form-field">
           <span>语言</span>
@@ -212,18 +226,41 @@
         </label>
       </div>
       <label id="import-title-field" class="form-field">
-        <span>标题覆盖值，可选</span>
-        <input id="import-title" type="text" maxlength="500" placeholder="通常由页面自动识别">
+        <span>已知标题（可选；未知请留空）</span>
+        <input id="import-title" type="text" maxlength="500" placeholder="未知则留空">
+      </label>
+      <label id="import-published-field" class="form-field" hidden>
+        <span>已知发布时间（ISO-8601，可选）</span>
+        <input id="import-published" type="datetime-local" placeholder="未知则留空">
       </label>
       <div class="form-notice">
-        系统会保存规范化 URL、抓取时间、正文哈希与来源信息。新资料进入资料库后仍需人工归并到事件。
+        所有新材料先进入持久化待处理采集箱。系统保存原始/提取快照与指纹；AI 仅生成候选，正式事件、主张和报告只会在人工确认后改变。
       </div>
       <div id="import-result" class="import-result" aria-live="polite"></div>
       <div class="modal-actions">
         <button id="import-cancel" class="btn btn-ghost" type="button">取消</button>
-        <button id="import-submit" class="btn btn-primary" type="submit">抓取并入库</button>
+        <button id="import-submit" class="btn btn-primary" type="submit">提交到采集箱</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="intake-modal" class="modal intake-modal" aria-labelledby="intake-modal-title">
+    <div class="modal-header">
+      <div>
+        <span class="panel-kicker">P0.3 INTAKE REVIEW</span>
+        <h2 id="intake-modal-title">待处理采集箱</h2>
+      </div>
+      <button id="intake-close" class="icon-btn" type="button" aria-label="关闭采集箱">×</button>
+    </div>
+    <div class="intake-layout">
+      <section class="intake-list-panel" aria-label="采集箱条目">
+        <div class="intake-list-toolbar">
+          <span id="intake-summary">0 条待处理</span>
+        </div>
+        <div id="intake-list" class="intake-list" role="list"></div>
+      </section>
+      <section id="intake-detail" class="intake-detail" aria-live="polite"></section>
+    </div>
   </dialog>
 
   <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>

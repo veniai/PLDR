@@ -78,6 +78,7 @@ class Event(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     document_links: Mapped[list["EventDocument"]] = relationship(back_populates="event", cascade="all, delete-orphan")
     entity_links: Mapped[list["EventEntity"]] = relationship(back_populates="event", cascade="all, delete-orphan")
     claims: Mapped[list["Claim"]] = relationship(back_populates="event", cascade="all, delete-orphan")
@@ -153,3 +154,65 @@ class Assessment(Base):
     generated_by: Mapped[str] = mapped_column(String(80), default="deterministic-fallback")
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     event: Mapped[Event] = relationship(back_populates="assessments")
+
+
+class IntakeItem(Base):
+    """A persisted material submission that remains outside the formal dossier until review."""
+
+    __tablename__ = "intake_items"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    input_type: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="parsed", index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    source_description: Mapped[str] = mapped_column(String(500), default="")
+    source_url: Mapped[str | None] = mapped_column(String(900))
+    canonical_url: Mapped[str | None] = mapped_column(String(900))
+    title: Mapped[str | None] = mapped_column(String(500))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    language: Mapped[str] = mapped_column(String(20), default="en")
+    original_filename: Mapped[str | None] = mapped_column(String(300))
+    media_type: Mapped[str | None] = mapped_column(String(120))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    raw_snapshot: Mapped[str] = mapped_column(Text, default="")
+    raw_hash: Mapped[str] = mapped_column(String(64), default="")
+    extracted_snapshot: Mapped[str] = mapped_column(Text, default="")
+    extracted_hash: Mapped[str] = mapped_column(String(64), default="")
+    candidate_mode: Mapped[str | None] = mapped_column(String(30))
+    candidate_model: Mapped[str | None] = mapped_column(String(160))
+    candidate_error: Mapped[str | None] = mapped_column(Text)
+    candidate_relations: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    review: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    confirmation_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    confirmation_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    disposition: Mapped[str | None] = mapped_column(String(30))
+    reviewed_by: Mapped[str | None] = mapped_column(String(160))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejection_reason: Mapped[str | None] = mapped_column(Text)
+    final_event_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    final_document_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    final_snapshot_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    candidates: Mapped[list["IntakeCandidate"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan", order_by="IntakeCandidate.object_type, IntakeCandidate.candidate_key"
+    )
+
+
+class IntakeCandidate(Base):
+    """Immutable machine proposal plus analyst disposition; never a formal PLDR object."""
+
+    __tablename__ = "intake_candidates"
+    __table_args__ = (UniqueConstraint("item_id", "candidate_key", name="uq_intake_candidate_key"),)
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    item_id: Mapped[str] = mapped_column(ForeignKey("intake_items.id"), index=True)
+    candidate_key: Mapped[str] = mapped_column(String(80))
+    object_type: Mapped[str] = mapped_column(String(20), index=True)
+    source_mode: Mapped[str] = mapped_column(String(30))
+    machine_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    human_data: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    validation_error: Mapped[str | None] = mapped_column(Text)
+    disposition: Mapped[str | None] = mapped_column(String(30))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    final_object_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    item: Mapped[IntakeItem] = relationship(back_populates="candidates")

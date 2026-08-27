@@ -5,23 +5,50 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, REPO_ROOT, SessionLocal, engine, get_session
-from .importers import import_rss, import_url_document
+from .intake import (
+    build_confirmation_preview,
+    cancel_intake,
+    confirm_intake,
+    get_intake_item,
+    reject_intake,
+    serialize_intake,
+    submit_file_intake,
+    submit_rss_intake,
+    submit_text_intake,
+    submit_web_intake,
+    generate_candidates,
+)
 from .llm import run_model_task
-from .models import Claim, Document, Event, Evidence, Source
+from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Source
 from .reporting import REPORT_DIR, build_report
-from .repository import get_event,get_events,serialize_claim,serialize_document,serialize_event_card,serialize_event_detail,serialize_source
-from .schemas import ImportRssRequest, ImportUrlRequest, ModelTaskRequest, ReportRequest
+from .repository import (
+    get_event,
+    get_events,
+    serialize_claim,
+    serialize_event_card,
+    serialize_event_detail,
+    serialize_source,
+)
+from .schemas import (
+    ImportRssRequest,
+    ImportUrlRequest,
+    IntakeCancelRequest,
+    IntakeConfirmationRequest,
+    IntakeRejectRequest,
+    IntakeTextRequest,
+    ModelTaskRequest,
+    ReportRequest,
+)
 from .seed import counts, seed_database
 
 DASHBOARD_DIR = REPO_ROOT / "apps" / "dashboard"
@@ -44,8 +71,19 @@ def require_admin_token(x_pldr_admin_token: str | None = Header(default=None)) -
         raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
+def ensure_compatible_schema() -> None:
+    """Add additive P0.3 columns to an existing P0.2 database without rebuilding user data."""
+    inspector = inspect(engine)
+    if "events" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("events")}
+        if "metadata_json" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE events ADD COLUMN metadata_json JSON"))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    ensure_compatible_schema()
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as session:
         seed_database(session)
@@ -54,7 +92,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="PLDR P0 Intelligence API",
-    version="0.1.1",
+    version="0.3.0",
     description="Evidence-centered OSINT P0 with a World Monitor-inspired map-first dashboard.",
     lifespan=lifespan,
 )
@@ -77,7 +115,7 @@ def dashboard() -> FileResponse:
 @app.get("/health", include_in_schema=False)
 @app.get("/pldr-api/health")
 def health(session: Session = Depends(get_session)) -> dict[str, Any]:
-    return {"status": "ok", "version": "0.1.1", "mode": "demo", "counts": counts(session)}
+    return {"status": "ok", "version": "0.3.0", "mode": "demo", "counts": counts(session)}
 
 
 @app.post("/api/v1/admin/reseed", include_in_schema=False)
@@ -132,9 +170,23 @@ def overview(session: Session = Depends(get_session)) -> dict[str, Any]:
             or 0,
             "source_status": source_status,
         },
+        "intake": {
+            "total": session.scalar(select(func.count()).select_from(IntakeItem)) or 0,
+            "candidate_ready": session.scalar(
+                select(func.count()).select_from(IntakeItem).where(IntakeItem.status == "candidate_ready")
+            )
+            or 0,
+            "confirmed": session.scalar(
+                select(func.count()).select_from(IntakeItem).where(IntakeItem.status == "confirmed")
+            )
+            or 0,
+        },
         "events": cards,
         "information_gaps": list(dict.fromkeys(all_gaps))[:12],
-        "last_updated": max((c["end_at"] or c["start_at"] for c in cards), default=None),
+        "last_updated": max(
+            (value for c in cards if (value := c["end_at"] or c["start_at"]) is not None),
+            default=None,
+        ),
         "disclaimer": "Demo snapshots are paraphrased and must be replaced by freshly captured originals before operational use.",
     }
 
@@ -207,55 +259,177 @@ def create_report(request: ReportRequest, session: Session = Depends(get_session
 @app.post("/api/v1/import/url", include_in_schema=False)
 @app.post("/pldr-api/v1/import/url")
 async def import_url(request: ImportUrlRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
-    try:
-        document = await import_url_document(
-            session,
-            str(request.url),
-            request.source_name,
-            request.title,
-            request.html,
-            request.language,
-        )
-        session.refresh(document)
-        document = session.scalar(
-            select(Document)
-            .where(Document.id == document.id)
-            .options(selectinload(Document.source))
-        )
-        assert document is not None
-        return {"status": "ok", "document": serialize_document(document)}
-    except Exception as exc:
-        session.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    item = await submit_web_intake(
+        session,
+        str(request.url),
+        request.source_name,
+        request.title,
+        request.html,
+        request.language,
+    )
+    return {"status": item.status, "intake_item": serialize_intake(item)}
 
 
 @app.post("/api/v1/import/rss", include_in_schema=False)
 @app.post("/pldr-api/v1/import/rss")
 async def import_rss_feed(request: ImportRssRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+    items = await submit_rss_intake(
+        session,
+        str(request.url) if request.url else None,
+        request.xml,
+        request.source_name,
+        request.language,
+    )
+    serialized = [serialize_intake(item) for item in items]
+    return {
+        "status": "ok" if all(item.status != "failed" for item in items) else "partial_failure",
+        "count": len(serialized),
+        "intake_items": serialized,
+        "documents": [
+            {
+                "id": item.id,
+                "title": item.title,
+                "status": item.status,
+                "error": item.error,
+            }
+            for item in items
+        ],
+    }
+
+
+@app.post("/api/v1/intake/text", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/text")
+async def intake_text(request: IntakeTextRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+    item = await submit_text_intake(session, request)
+    return {"status": item.status, "intake_item": serialize_intake(item)}
+
+
+@app.post("/api/v1/intake/files", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/files")
+async def intake_file(
+    file: UploadFile = File(...),
+    source_description: str = Form(...),
+    language: str = Form("en"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = await submit_file_intake(session, file, source_description, language)
+    return {"status": item.status, "intake_item": serialize_intake(item)}
+
+
+@app.get("/api/v1/intake", include_in_schema=False)
+@app.get("/pldr-api/v1/intake")
+def intake_list(
+    status: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    query = select(IntakeItem).options(selectinload(IntakeItem.candidates)).order_by(IntakeItem.created_at.desc())
+    if status:
+        query = query.where(IntakeItem.status == status)
+    items = list(session.scalars(query.limit(limit)))
+    return {"items": [serialize_intake(item) for item in items], "count": len(items)}
+
+
+@app.get("/api/v1/intake/options", include_in_schema=False)
+@app.get("/pldr-api/v1/intake/options")
+def intake_options(session: Session = Depends(get_session)) -> dict[str, Any]:
+    events = list(session.scalars(select(Event).order_by(Event.start_at.desc())))
+    entities = list(session.scalars(select(Entity).order_by(Entity.name)))
+    return {
+        "events": [{"id": event.id, "title": event.title} for event in events],
+        "entities": [{"id": entity.id, "name": entity.name, "type": entity.entity_type} for entity in entities],
+    }
+
+
+@app.post("/api/v1/intake/{item_id}/regenerate", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/regenerate")
+async def regenerate_intake_candidates(
+    item_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    if item.status not in {"parsed", "generation_failed"}:
+        raise HTTPException(status_code=409, detail=f"Candidates cannot be regenerated from status {item.status}")
+    item = await generate_candidates(session, item)
+    return serialize_intake(item)
+
+
+@app.post("/api/v1/intake/{item_id}/preview", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/preview")
+def intake_preview(
+    item_id: str,
+    request: IntakeConfirmationRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    return build_confirmation_preview(session, item, request)
+
+
+@app.post("/api/v1/intake/{item_id}/confirm", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/confirm")
+def intake_confirm(
+    item_id: str,
+    request: IntakeConfirmationRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
     try:
-        documents = await import_rss(
-            session,
-            str(request.url) if request.url else None,
-            request.xml,
-            request.source_name,
-            request.language,
-        )
-        ids = [x.id for x in documents]
-        hydrated = (
-            list(
-                session.scalars(
-                    select(Document)
-                    .where(Document.id.in_(ids))
-                    .options(selectinload(Document.source))
-                )
-            )
-            if ids
-            else []
-        )
-        return {"status": "ok", "count": len(hydrated), "documents": [serialize_document(x) for x in hydrated]}
-    except Exception as exc:
+        item, result, created = confirm_intake(session, item, request)
+    except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "confirmed", "created": created, "result": result, "intake_item": serialize_intake(item)}
+
+
+@app.post("/api/v1/intake/{item_id}/reject", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/reject")
+def intake_reject(
+    item_id: str,
+    request: IntakeRejectRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    try:
+        item = reject_intake(session, item, request.analyst, request.reason)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "rejected", "intake_item": serialize_intake(item)}
+
+
+@app.post("/api/v1/intake/{item_id}/cancel", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/cancel")
+def intake_cancel(
+    item_id: str,
+    request: IntakeCancelRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    try:
+        item = cancel_intake(session, item, request.analyst, request.reason)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "cancelled", "intake_item": serialize_intake(item)}
+
+
+@app.get("/api/v1/intake/{item_id}", include_in_schema=False)
+@app.get("/pldr-api/v1/intake/{item_id}")
+def intake_detail(item_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    return serialize_intake(item)
 
 
 @app.post("/api/v1/model/task", include_in_schema=False)
@@ -288,7 +462,15 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
             1,
         )
     back_link = f"/?event={html_lib.escape(event_id)}" if event_id else "/"
-    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(document.title)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(document.title)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{document.published_at.isoformat()}<br>抓取时间：{document.fetched_at.isoformat()} · 正文 SHA-256：{document.content_hash}<br>独立来源组：{html_lib.escape(document.source.independence_group)}</div><article>{body}</article></main></body></html>"""
+    title_display = "未知标题" if document.metadata_json.get("title_known") is False else document.title
+    published_display = document.published_at.isoformat().replace("+00:00", "Z") if document.published_at else "未知"
+    source_url = document.canonical_url if not document.canonical_url.startswith("pldr:") else ""
+    source_url_display = (
+        f"<a href='{html_lib.escape(source_url, quote=True)}' target='_blank' rel='noopener'>{html_lib.escape(source_url)}</a>"
+        if source_url
+        else "未知"
+    )
+    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{document.fetched_at.isoformat()} · 正文 SHA-256：{document.content_hash}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
 
 
 @app.get("/api/v1/timeline", include_in_schema=False)
@@ -337,5 +519,9 @@ def runtime_config() -> dict[str, Any]:
             "html_reports",
             "url_import",
             "rss_import",
+            "intake_inbox",
+            "candidate_isolation",
+            "human_confirmation",
+            "file_intake",
         ],
     }
