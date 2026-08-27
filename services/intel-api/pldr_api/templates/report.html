@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root{font-family:Inter,"Noto Sans SC",system-ui,sans-serif;color:#17232d;background:#eef3f6}
+    *{box-sizing:border-box}body{margin:0}.page{max-width:1040px;margin:0 auto;padding:42px 30px 70px}
+    header{padding:28px 30px;background:#0b2633;color:#e8f7fc;border-radius:14px;box-shadow:0 18px 45px rgba(18,48,63,.16)}
+    header h1{margin:0 0 8px;font-size:28px;line-height:1.25}header p{margin:0;color:#91b4c4;font-size:13px}
+    .notice{margin:18px 0;padding:13px 15px;background:#fff4d7;border-left:4px solid #cf941d;border-radius:0 8px 8px 0;color:#765b22;font-size:13px;line-height:1.6}
+    .event{margin-top:20px;padding:25px 27px;background:#fff;border:1px solid #d9e4e9;border-radius:12px;box-shadow:0 10px 30px rgba(25,61,78,.07)}
+    h2{margin:0 0 10px;color:#0d4b66;font-size:21px}h3{margin:22px 0 9px;color:#24596f;font-size:15px}
+    .summary{font-size:14px;line-height:1.75;color:#3a5260}.meta{color:#6c8795;font-size:12px;line-height:1.65}
+    .assessment{padding:15px 17px;background:#edf7fa;border-left:4px solid #2a9fc3;border-radius:0 8px 8px 0;color:#294b5a;line-height:1.7}
+    .analysis-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:11px}
+    .analysis-grid>div{padding:12px 14px;background:#f6f9fa;border:1px solid #dce7eb;border-radius:8px}
+    .analysis-grid h4{margin:0 0 6px;color:#446b7d;font-size:12px}.analysis-grid ul{margin:0;padding-left:18px}.analysis-grid li{margin:4px 0;color:#526c78;font-size:12px;line-height:1.55}
+    .claim{margin:12px 0;padding:15px 16px;background:#f5f9fb;border:1px solid #dce8ed;border-left:4px solid #4eaccb;border-radius:0 8px 8px 0}
+    .claim.contested{border-left-color:#d29a35}.claim.unverified{border-left-color:#9568c4}.claim.refuted{border-left-color:#d4565b}
+    .claim-title{display:flex;gap:9px;align-items:flex-start}.claim-title b{font-size:14px;line-height:1.55}.status{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#dcecf2;color:#396477;font-size:10px}
+    .evidence{margin:10px 0 0;padding:12px 14px;background:#fff;border:1px solid #dae5e9;border-left:3px solid #4da86f;border-radius:0 7px 7px 0}
+    .evidence.contradicts{border-left-color:#d45c60}.evidence.context{border-left-color:#c89a36}.evidence blockquote{margin:7px 0;color:#334e5b;font-size:13px;line-height:1.65}
+    .evidence-top{display:flex;gap:8px;color:#678392;font-size:11px}.evidence-top strong{color:#315f72}
+    .evidence footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px;color:#718b98;font-size:11px}
+    .evidence a{flex:0 0 auto;color:#087a9f;font-weight:650;text-decoration:none}.evidence a:hover{text-decoration:underline}
+    .sources{margin-top:13px;padding-top:12px;border-top:1px solid #e2eaee}.source-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;color:#597481;font-size:11px}
+    .hash{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#7d929c}
+    @media(max-width:680px){.page{padding:16px 10px 40px}header,.event{padding:20px 17px}.analysis-grid{grid-template-columns:1fr}.evidence footer,.source-row{align-items:flex-start;flex-direction:column}}
+    @media print{body{background:#fff}.page{max-width:none;padding:0}header,.event{box-shadow:none}.event{break-inside:avoid}.claim{break-inside:avoid}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <h1>{{ title }}</h1>
+      <p>PLDR 证据化开源情报简报 · 生成时间 {{ generated_at }}</p>
+    </header>
+
+    {% if demo_notice %}
+    <div class="notice">当前为 P0 演示简报。关键判断必须打开证据快照，并在正式使用前回到原始来源再次核验。</div>
+    {% endif %}
+
+    {% for event in events %}
+    <section class="event">
+      <h2>{{ event.title }}</h2>
+      <p class="summary">{{ event.summary }}</p>
+      <p class="meta">时间 {{ event.start_at }} · 地点 {{ event.location.name }} · 文档 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }} · 事件置信度 {{ (event.confidence * 100)|round|int }}%</p>
+
+      {% if event.assessment %}
+      <h3>结构化研判</h3>
+      <div class="assessment">{{ event.assessment.judgement }}</div>
+      <div class="analysis-grid">
+        <div><h4>关键假设</h4><ul>{% for item in event.assessment.assumptions %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
+        <div><h4>替代解释</h4><ul>{% for item in event.assessment.alternatives %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
+        <div><h4>信息缺口</h4><ul>{% for item in event.assessment.information_gaps %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
+        <div><h4>证伪条件</h4><ul>{% for item in event.assessment.falsifiers %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
+      </div>
+      {% endif %}
+
+      <h3>主张与证据</h3>
+      {% for claim in event.claims %}
+      <article class="claim {{ claim.status }}">
+        <div class="claim-title"><span class="status">{{ claim.status }}</span><b>{{ claim.text }}</b></div>
+        <p class="meta">主张置信度 {{ (claim.confidence * 100)|round|int }}% · 来源 {{ claim.origin }}</p>
+        {% for evidence in claim.evidence %}
+        <div class="evidence {{ evidence.stance }}">
+          <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ evidence.stance }}</strong><span>证据强度 {{ (evidence.strength * 100)|round|int }}%</span></div>
+          <blockquote>{{ evidence.snippet }}</blockquote>
+          <footer>
+            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>
+            <a href="{{ evidence.document.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
+          </footer>
+        </div>
+        {% else %}
+        <p class="meta">该主张尚未连接原文证据。</p>
+        {% endfor %}
+      </article>
+      {% endfor %}
+
+      <div class="sources">
+        <h3>关联资料</h3>
+        {% for document in event.documents %}
+        <div class="source-row">
+          <span>{{ document.source.name }} · {{ document.title }}</span>
+          <span class="hash">{{ document.content_hash[:18] }}…</span>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+  </main>
+</body>
+</html>

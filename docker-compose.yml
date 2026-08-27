@@ -1,0 +1,19 @@
+services:
+  pldr-p0:
+    build:
+      context: .
+      dockerfile: services/intel-api/Dockerfile
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      PLDR_DATABASE_URL: sqlite:////app/data/runtime/pldr-p0.db
+      PLDR_CORS_ORIGINS: ${PLDR_CORS_ORIGINS:-http://127.0.0.1:8765,http://localhost:8765}
+      PLDR_ADMIN_TOKEN: ${PLDR_ADMIN_TOKEN:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+    volumes:
+      - ./data/runtime:/app/data/runtime
+      - ./reports:/app/reports
+    restart: unless-stopped

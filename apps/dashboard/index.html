@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>PLDR · 开源情报证据工作台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P0.2</span></div>
+          <p>开源情报证据工作台</p>
+        </div>
+      </div>
+      <div id="metrics" class="metrics" aria-label="专题指标"></div>
+      <div class="system-state">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="system-state-text">正在连接</span>
+      </div>
+    </header>
+
+    <section class="command-bar" aria-labelledby="topic-title">
+      <div class="topic-copy">
+        <span class="eyebrow">ACTIVE INTELLIGENCE TOPIC</span>
+        <h1 id="topic-title">专题加载中</h1>
+        <p id="topic-description">正在组装事件、来源与证据链。</p>
+        <div class="topic-meta">
+          <span id="topic-mode" class="meta-chip">模式加载中</span>
+          <span id="topic-range" class="meta-chip">时间范围加载中</span>
+          <span id="topic-updated" class="meta-chip">更新时间加载中</span>
+        </div>
+      </div>
+      <div class="command-actions">
+        <button class="btn btn-ghost" id="btn-import" type="button">
+          <span aria-hidden="true">＋</span> 导入资料
+        </button>
+        <button class="btn btn-primary" id="btn-report" type="button" disabled>
+          <span aria-hidden="true">▣</span> 生成证据简报
+        </button>
+        <button class="icon-btn" id="btn-refresh" type="button" aria-label="刷新专题" title="刷新专题">
+          ↻
+        </button>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <section class="panel map-panel" aria-labelledby="map-title">
+        <div class="panel-header">
+          <div>
+            <span class="panel-kicker">GEOSPATIAL VIEW</span>
+            <h2 id="map-title">专题态势</h2>
+          </div>
+          <div class="map-legend" aria-label="事件重要性图例">
+            <span><i class="legend-dot critical"></i>极高</span>
+            <span><i class="legend-dot high"></i>高</span>
+            <span><i class="legend-dot medium"></i>中</span>
+          </div>
+        </div>
+        <div id="map-stage" role="group" aria-label="地理态势示意图">
+          <div class="map-grid" aria-hidden="true"></div>
+          <div class="land land-a" aria-hidden="true"></div>
+          <div class="land land-b" aria-hidden="true"></div>
+          <div class="land land-c" aria-hidden="true"></div>
+          <div class="land land-d" aria-hidden="true"></div>
+          <div class="route-line" aria-hidden="true"></div>
+          <div id="markers"></div>
+          <div class="map-caption">公开来源地理态势示意 · 点击节点打开事件档案</div>
+        </div>
+        <div id="timeline" class="timeline" aria-label="事件时间线"></div>
+      </section>
+
+      <aside class="panel event-panel" aria-labelledby="event-title">
+        <div class="panel-header">
+          <div>
+            <span class="panel-kicker">EVENT STREAM</span>
+            <h2 id="event-title">事件流</h2>
+          </div>
+          <span id="event-count" class="count-badge">0</span>
+        </div>
+        <div class="filter-stack">
+          <label class="search-box">
+            <span aria-hidden="true">⌕</span>
+            <input id="search" type="search" placeholder="搜索事件、实体、地点" autocomplete="off">
+            <kbd>Ctrl K</kbd>
+          </label>
+          <div class="filter-row">
+            <label>
+              <span>重要性</span>
+              <select id="importance-filter">
+                <option value="">全部</option>
+                <option value="critical">极高</option>
+                <option value="high">高</option>
+                <option value="medium">中</option>
+                <option value="low">低</option>
+              </select>
+            </label>
+            <label>
+              <span>语言</span>
+              <select id="language-filter">
+                <option value="">全部</option>
+                <option value="en">英语</option>
+                <option value="zh">中文</option>
+                <option value="ar">阿拉伯语</option>
+                <option value="fr">法语</option>
+              </select>
+            </label>
+          </div>
+          <label class="toggle-row">
+            <input id="contested-filter" type="checkbox">
+            <span class="toggle"></span>
+            <span>仅显示争议或待核实事件</span>
+          </label>
+        </div>
+        <div id="events" class="event-list" aria-live="polite"></div>
+      </aside>
+
+      <section class="panel assessment-panel" aria-labelledby="assessment-title">
+        <div class="panel-header">
+          <div>
+            <span class="panel-kicker">ANALYTIC JUDGEMENT</span>
+            <h2 id="assessment-title">结构化研判</h2>
+          </div>
+          <span id="assessment-confidence" class="confidence-chip">未选择事件</span>
+        </div>
+        <div id="assessment" class="panel-body empty-state">
+          <div class="empty-icon">◎</div>
+          <p>选择一个事件，查看当前判断、关键假设、替代解释与证伪条件。</p>
+        </div>
+      </section>
+
+      <section class="panel source-panel" aria-labelledby="source-title">
+        <div class="panel-header">
+          <div>
+            <span class="panel-kicker">SOURCE HEALTH</span>
+            <h2 id="source-title">来源状态</h2>
+          </div>
+          <span id="source-summary" class="count-badge">0 / 0</span>
+        </div>
+        <div id="sources" class="source-list"></div>
+      </section>
+
+      <section class="panel gap-panel" aria-labelledby="gap-title">
+        <div class="panel-header">
+          <div>
+            <span class="panel-kicker">COLLECTION GAPS</span>
+            <h2 id="gap-title">信息缺口</h2>
+          </div>
+          <span id="gap-count" class="count-badge warning">0</span>
+        </div>
+        <div id="gaps" class="gap-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="event-drawer" class="event-drawer" aria-hidden="true" aria-labelledby="drawer-title">
+    <div class="drawer-header">
+      <div>
+        <span class="panel-kicker">EVENT DOSSIER</span>
+        <h2 id="drawer-title">事件档案</h2>
+      </div>
+      <button id="drawer-close" class="icon-btn" type="button" aria-label="关闭事件档案">×</button>
+    </div>
+    <div id="drawer-summary" class="drawer-summary"></div>
+    <nav class="drawer-tabs" aria-label="事件档案内容">
+      <button class="drawer-tab active" type="button" data-tab="overview">概览</button>
+      <button class="drawer-tab" type="button" data-tab="claims">主张与证据</button>
+      <button class="drawer-tab" type="button" data-tab="documents">来源资料</button>
+    </nav>
+    <div id="drawer-content" class="drawer-content"></div>
+    <div class="drawer-footer">
+      <button id="drawer-report" class="btn btn-primary" type="button">生成本事件简报</button>
+      <button id="drawer-copy" class="btn btn-ghost" type="button">复制事件摘要</button>
+    </div>
+  </aside>
+
+  <dialog id="import-modal" class="modal">
+    <form id="import-form" method="dialog">
+      <div class="modal-header">
+        <div>
+          <span class="panel-kicker">COLLECTION INTAKE</span>
+          <h2>导入公开资料</h2>
+        </div>
+        <button id="import-close" class="icon-btn" type="button" aria-label="关闭导入窗口">×</button>
+      </div>
+      <div class="import-tabs" role="tablist" aria-label="导入方式">
+        <button class="import-tab active" type="button" data-mode="url">网页 URL</button>
+        <button class="import-tab" type="button" data-mode="rss">RSS / Atom</button>
+      </div>
+      <label class="form-field">
+        <span id="import-url-label">公开网页地址</span>
+        <input id="import-url" type="url" required placeholder="https://example.org/article">
+      </label>
+      <div class="form-grid">
+        <label class="form-field">
+          <span>来源名称</span>
+          <input id="import-source" type="text" maxlength="160" placeholder="留空则按域名识别">
+        </label>
+        <label class="form-field">
+          <span>语言</span>
+          <select id="import-language">
+            <option value="en">英语</option>
+            <option value="zh">中文</option>
+            <option value="ar">阿拉伯语</option>
+            <option value="fr">法语</option>
+          </select>
+        </label>
+      </div>
+      <label id="import-title-field" class="form-field">
+        <span>标题覆盖值，可选</span>
+        <input id="import-title" type="text" maxlength="500" placeholder="通常由页面自动识别">
+      </label>
+      <div class="form-notice">
+        系统会保存规范化 URL、抓取时间、正文哈希与来源信息。新资料进入资料库后仍需人工归并到事件。
+      </div>
+      <div id="import-result" class="import-result" aria-live="polite"></div>
+      <div class="modal-actions">
+        <button id="import-cancel" class="btn btn-ghost" type="button">取消</button>
+        <button id="import-submit" class="btn btn-primary" type="submit">抓取并入库</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
