@@ -1067,11 +1067,11 @@ class P0Test(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(calls[0][1], "https://api.search.brave.com/v1/news/search")
+        self.assertEqual(calls[0][1], "https://api.search.brave.com/res/v1/news/search")
         self.assertEqual(calls[0][2]["q"], "adapter contract")
         self.assertNotIn("result_filter", calls[0][2])
         self.assertEqual(calls[0][3]["X-Subscription-Token"], "test-key")
-        self.assertEqual(calls[1][1], "https://api.search.brave.com/v1/web/search")
+        self.assertEqual(calls[1][1], "https://api.search.brave.com/res/v1/web/search")
         self.assertEqual(calls[1][2]["result_filter"], "web")
         self.assertEqual(calls[2][1], "http://127.0.0.1:8888/search")
         self.assertEqual(calls[2][2]["format"], "json")

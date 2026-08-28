@@ -166,7 +166,12 @@ async def request_brave_search(
             reason="not_configured",
         )
     channel = f"brave-search-api:{request.scope}"
-    endpoint = f"{config.base_url}/v1/{request.scope}/search"
+    # Brave's API dashboard labels the operation as POST /v1/{scope}/search, but the
+    # deployed service root is /res. A request without that resource prefix is rejected
+    # by the edge before parameter or credential validation.
+    base_url = config.base_url.rstrip("/")
+    resource_root = base_url if base_url.endswith("/res") else f"{base_url}/res"
+    endpoint = f"{resource_root}/v1/{request.scope}/search"
     params: dict[str, Any] = {
         "q": request.keyword,
         "count": request.limit,

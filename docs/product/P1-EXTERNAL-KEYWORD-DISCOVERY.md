@@ -12,7 +12,7 @@
 
 | 组件 | 版本 | 许可证/条款 | 部署边界 |
 | --- | --- | --- | --- |
-| Brave Search API | REST v1 | Brave Search API Terms of Service | 外部 SaaS。部署方通过 `PLDR_SEARCH_API_KEY` 提供密钥；PLDR 不提交、记录或硬编码密钥。 |
+| Brave Search API | REST v1（`POST /res/v1/{news或web}/search`） | Brave Search API Terms of Service | 外部 SaaS。部署方通过 `PLDR_SEARCH_API_KEY` 提供密钥；PLDR 不提交、记录或硬编码密钥。 |
 | SearXNG | 2026.8.22 | AGPL-3.0-or-later | 运营方自行部署并启用 JSON 输出的实例，通过 `PLDR_SEARCH_BASE_URL` 配置。PLDR 仅通过 HTTP 调用，不复制或修改 SearXNG 源码。 |
 
 默认提供 Brave 薄适配层；未配置密钥时 API 返回 503 和明确错误，界面显示未配置状态，绝不生成演示搜索结果。SearXNG 是可配置的替代后端，适合需要自管检索边界的部署。PLDR 不自研网页索引、通用搜索引擎或上游应用套件。
