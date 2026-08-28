@@ -15,7 +15,7 @@ os.environ.pop("PLDR_ADMIN_TOKEN", None)
 from fastapi.testclient import TestClient
 from pldr_api.database import Base, SessionLocal, engine
 from pldr_api.main import app
-from pldr_api.models import Document, Evidence, IntakeItem, Source
+from pldr_api.models import Document, Evidence, IntakeItem, Snapshot, Source
 from pldr_api.intake import confirm_intake, get_intake_item
 from pldr_api.schemas import IntakeConfirmationRequest
 from pldr_api.security import UnsafeUrlError, validate_public_http_url
@@ -265,6 +265,13 @@ class P0Test(unittest.TestCase):
                     evidence.document.body[evidence.start_offset : evidence.end_offset],
                     evidence.snippet,
                 )
+                if evidence.snapshot_id is not None:
+                    snapshot = session.get(Snapshot, evidence.snapshot_id)
+                    self.assertIsNotNone(snapshot)
+                    self.assertEqual(
+                        snapshot.excerpt[evidence.start_offset : evidence.end_offset],
+                        evidence.snippet,
+                    )
 
     def test_private_urls_are_rejected(self):
         for url in [
@@ -729,10 +736,14 @@ class P0Test(unittest.TestCase):
             evidence = detail["claims"][-1]["evidence"][0]
             self.assertIn(evidence["document"]["id"], {created_document_id, detail["documents"][-1]["id"]})
             self.assertGreaterEqual(evidence["start_offset"], 0)
-            snapshot = self.client.get(evidence["document"]["snapshot_url"])
+            self.assertIsNotNone(evidence["snapshot_id"])
+            self.assertIn(evidence["snapshot_id"], evidence["snapshot_url"])
+            snapshot = self.client.get(evidence["snapshot_url"])
             self.assertEqual(snapshot.status_code, 200)
             self.assertIn("<mark", snapshot.text)
             self.assertIn("来源：", snapshot.text)
+            self.assertIn(f"Snapshot：{evidence['snapshot_id']}", snapshot.text)
+            self.assertNotIn("1970-01-01", snapshot.text)
             if event_id == created_event_id:
                 self.assertIn("https://", snapshot.text)
                 self.assertIn("原始地址：", snapshot.text)

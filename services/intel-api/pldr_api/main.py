@@ -29,7 +29,7 @@ from .intake import (
     generate_candidates,
 )
 from .llm import run_model_task
-from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Source
+from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Snapshot, Source
 from .reporting import REPORT_DIR, build_report
 from .repository import (
     get_event,
@@ -79,6 +79,38 @@ def ensure_compatible_schema() -> None:
         if "metadata_json" not in columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE events ADD COLUMN metadata_json JSON"))
+    if "evidence" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("evidence")}
+        if "snapshot_id" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE evidence ADD COLUMN snapshot_id VARCHAR(64)"))
+                connection.execute(text("CREATE INDEX IF NOT EXISTS idx_evidence_snapshot_id ON evidence (snapshot_id)"))
+
+
+def backfill_evidence_snapshots() -> None:
+    """Attach pre-P0.3 evidence to the exact stored snapshot containing its snippet."""
+    with SessionLocal() as session:
+        evidence_rows = list(session.scalars(select(Evidence).where(Evidence.snapshot_id.is_(None))))
+        for evidence in evidence_rows:
+            snapshots = list(
+                session.scalars(
+                    select(Snapshot)
+                    .where(Snapshot.document_id == evidence.document_id)
+                    .order_by(Snapshot.captured_at.desc())
+                )
+            )
+            if not snapshots:
+                continue
+            matching = next(
+                (
+                    snapshot
+                    for snapshot in snapshots
+                    if snapshot.excerpt[evidence.start_offset : evidence.end_offset] == evidence.snippet
+                ),
+                None,
+            )
+            evidence.snapshot_id = (matching or snapshots[0]).id
+        session.commit()
 
 
 @asynccontextmanager
@@ -87,6 +119,7 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as session:
         seed_database(session)
+    backfill_evidence_snapshots()
     yield
 
 
@@ -446,15 +479,31 @@ async def model_task(request: ModelTaskRequest) -> dict[str, Any]:
 
 @app.get("/snapshots/{document_id}", response_class=HTMLResponse)
 def snapshot(document_id: str, event_id: str | None = None, session: Session = Depends(get_session)) -> str:
-    document = session.scalar(
-        select(Document)
-        .where(Document.id == document_id)
-        .options(selectinload(Document.source), selectinload(Document.evidence_items))
+    selected_snapshot = session.scalar(
+        select(Snapshot)
+        .where(Snapshot.id == document_id)
+        .options(selectinload(Snapshot.document).selectinload(Document.source))
+    )
+    document = (
+        selected_snapshot.document
+        if selected_snapshot is not None
+        else session.scalar(
+            select(Document)
+            .where(Document.id == document_id)
+            .options(selectinload(Document.source), selectinload(Document.evidence_items))
+        )
     )
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
-    body = html_lib.escape(document.body)
-    for evidence in sorted(document.evidence_items, key=lambda x: len(x.snippet), reverse=True):
+    session.refresh(document, attribute_names=["evidence_items"])
+    relevant_evidence = [
+        evidence
+        for evidence in document.evidence_items
+        if selected_snapshot is None or evidence.snapshot_id == selected_snapshot.id
+    ]
+    snapshot_body = selected_snapshot.excerpt if selected_snapshot is not None else document.body
+    body = html_lib.escape(snapshot_body)
+    for evidence in sorted(relevant_evidence, key=lambda x: len(x.snippet), reverse=True):
         escaped = html_lib.escape(evidence.snippet)
         body = body.replace(
             escaped,
@@ -462,15 +511,28 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
             1,
         )
     back_link = f"/?event={html_lib.escape(event_id)}" if event_id else "/"
-    title_display = "未知标题" if document.metadata_json.get("title_known") is False else document.title
-    published_display = document.published_at.isoformat().replace("+00:00", "Z") if document.published_at else "未知"
+    document_metadata = document.metadata_json or {}
+    title_display = "未知标题" if document_metadata.get("title_known") is False else document.title
+    published_known = document_metadata.get("published_at_known", True) is not False
+    published_display = (
+        document.published_at.isoformat().replace("+00:00", "Z")
+        if document.published_at and published_known
+        else "未知"
+    )
     source_url = document.canonical_url if not document.canonical_url.startswith("pldr:") else ""
     source_url_display = (
         f"<a href='{html_lib.escape(source_url, quote=True)}' target='_blank' rel='noopener'>{html_lib.escape(source_url)}</a>"
         if source_url
         else "未知"
     )
-    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{document.fetched_at.isoformat()} · 正文 SHA-256：{document.content_hash}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
+    captured_at = (
+        selected_snapshot.captured_at if selected_snapshot is not None else document.fetched_at
+    ).isoformat()
+    snapshot_hash = (
+        selected_snapshot.content_hash if selected_snapshot is not None else document.content_hash
+    )
+    snapshot_id_display = selected_snapshot.id if selected_snapshot is not None else "未知"
+    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{captured_at} · 正文 SHA-256：{snapshot_hash}<br>Snapshot：{html_lib.escape(snapshot_id_display)}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
 
 
 @app.get("/api/v1/timeline", include_in_schema=False)

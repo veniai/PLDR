@@ -131,6 +131,7 @@ class Evidence(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     claim_id: Mapped[str] = mapped_column(ForeignKey("claims.id"), index=True)
     document_id: Mapped[str] = mapped_column(ForeignKey("documents.id"), index=True)
+    snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("snapshots.id"), index=True)
     snippet: Mapped[str] = mapped_column(Text, nullable=False)
     start_offset: Mapped[int] = mapped_column(Integer, nullable=False)
     end_offset: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -139,6 +140,7 @@ class Evidence(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     claim: Mapped[Claim] = relationship(back_populates="evidence_items")
     document: Mapped[Document] = relationship(back_populates="evidence_items")
+    snapshot: Mapped[Snapshot | None] = relationship()
 
 
 class Assessment(Base):

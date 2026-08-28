@@ -1114,6 +1114,7 @@ def confirm_intake(
                 id=evidence_id,
                 claim_id=claim_id,
                 document_id=document.id,
+                snapshot_id=item.final_snapshot_id,
                 snippet=decision.snippet,
                 start_offset=start,
                 end_offset=end,

@@ -70,7 +70,7 @@
           <blockquote>{{ evidence.snippet }}</blockquote>
           <footer>
             <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>
-            <a href="{{ evidence.document.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
+            <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
           </footer>
         </div>
         {% else %}

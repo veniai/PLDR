@@ -449,7 +449,7 @@ function renderClaimsTab(event) {
             <blockquote>${escapeHtml(evidence.snippet)}</blockquote>
             <footer>
               <span>${escapeHtml(evidence.document.source.name)} · ${formatDate(evidence.document.published_at)}</span>
-              <a href="${escapeHtml(withEventContext(evidence.document.snapshot_url, event.id))}" target="_blank" rel="noopener">查看证据快照 ↗</a>
+              <a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document.snapshot_url, event.id))}" target="_blank" rel="noopener">查看证据快照 ↗</a>
             </footer>
           </article>`).join("") : '<p class="muted">该主张尚未连接原文证据。</p>'}
       </div>

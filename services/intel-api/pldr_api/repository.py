@@ -20,12 +20,16 @@ def iso(value: datetime | None) -> str | None:
 
 def event_query():
     return select(Event).options(
-        selectinload(Event.document_links).selectinload(EventDocument.document).selectinload(Document.source),
+        selectinload(Event.document_links)
+        .selectinload(EventDocument.document)
+        .selectinload(Document.source),
+        selectinload(Event.document_links).selectinload(EventDocument.document).selectinload(Document.snapshots),
         selectinload(Event.entity_links).selectinload(EventEntity.entity),
         selectinload(Event.claims)
         .selectinload(Claim.evidence_items)
         .selectinload(Evidence.document)
         .selectinload(Document.source),
+        selectinload(Event.claims).selectinload(Claim.evidence_items).selectinload(Evidence.snapshot),
         selectinload(Event.assessments),
     )
 
@@ -81,6 +85,7 @@ def serialize_event_card(event: Event) -> dict[str, Any]:
 def serialize_document(document: Document, event_id: str | None = None) -> dict[str, Any]:
     metadata = document.metadata_json or {}
     canonical_url = None if document.canonical_url.startswith("pldr:") else document.canonical_url
+    snapshot = max(document.snapshots, key=lambda item: item.captured_at, default=None)
     return {
         "id": document.id,
         "title": None if metadata.get("title_known") is False else document.title,
@@ -101,7 +106,9 @@ def serialize_document(document: Document, event_id: str | None = None) -> dict[
         "is_cached": document.is_cached,
         "canonical_url": canonical_url,
         "canonical_url_known": canonical_url is not None,
-        "snapshot_url": f"/snapshots/{document.id}" + (f"?event_id={event_id}" if event_id else ""),
+        "snapshot_id": snapshot.id if snapshot else None,
+        "snapshot_url": f"/snapshots/{snapshot.id if snapshot else document.id}"
+        + (f"?event_id={event_id}" if event_id else ""),
         "metadata": metadata,
         "provenance": {
             "intake_item_id": metadata.get("intake_item_id"),
@@ -111,8 +118,18 @@ def serialize_document(document: Document, event_id: str | None = None) -> dict[
 
 
 def serialize_evidence(evidence: Evidence, event_id: str | None = None) -> dict[str, Any]:
+    snapshot = evidence.snapshot or max(
+        evidence.document.snapshots,
+        key=lambda item: item.captured_at,
+        default=None,
+    )
+    snapshot_url = f"/snapshots/{snapshot.id if snapshot else evidence.document_id}" + (
+        f"?event_id={event_id}" if event_id else ""
+    )
     return {
         "id": evidence.id,
+        "snapshot_id": snapshot.id if snapshot else None,
+        "snapshot_url": snapshot_url,
         "snippet": evidence.snippet,
         "start_offset": evidence.start_offset,
         "end_offset": evidence.end_offset,
