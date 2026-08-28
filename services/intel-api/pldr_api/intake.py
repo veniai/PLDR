@@ -664,6 +664,7 @@ def serialize_intake(item: IntakeItem) -> dict[str, Any]:
             "extracted_snapshot": item.extracted_snapshot,
             **item.review.get("material", {}),
         },
+        "search": item.review.get("external_search") or None,
         "candidate_generation": {
             "mode": item.candidate_mode,
             "model": item.candidate_model,
@@ -1163,6 +1164,14 @@ def confirm_intake(
             "evidence": sorted(evidence_ids.values()),
         },
         "human_changes": differences,
+        "trace": {
+            "intake_item_id": item.id,
+            "input_type": item.input_type,
+            "external_search": item.review.get("external_search"),
+            "machine_candidate_source": item.candidate_mode,
+            "human_disposition": request.disposition,
+            "analyst": request.analyst,
+        },
     }
     item.status = "confirmed"
     item.error = None

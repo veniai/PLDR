@@ -40,6 +40,8 @@ from .repository import (
     serialize_source,
 )
 from .schemas import (
+    ExternalSearchRequest,
+    ExternalSearchSelectionRequest,
     ImportRssRequest,
     ImportUrlRequest,
     IntakeCancelRequest,
@@ -50,6 +52,13 @@ from .schemas import (
     ReportRequest,
 )
 from .seed import counts, seed_database
+from .search import (
+    ExternalSearchError,
+    execute_external_search,
+    provider_metadata,
+    retry_search_result,
+    select_search_results,
+)
 
 DASHBOARD_DIR = REPO_ROOT / "apps" / "dashboard"
 ASSET_DIR = DASHBOARD_DIR / "assets"
@@ -330,6 +339,45 @@ async def import_rss_feed(request: ImportRssRequest, session: Session = Depends(
     }
 
 
+@app.post("/api/v1/search", include_in_schema=False)
+@app.post("/pldr-api/v1/search")
+async def external_search(
+    request: ExternalSearchRequest, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    try:
+        return await execute_external_search(session, request)
+    except ExternalSearchError as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"message": str(exc), "reason": exc.reason, "query_run_id": exc.query_run_id},
+        ) from exc
+
+
+@app.post("/api/v1/search/select", include_in_schema=False)
+@app.post("/pldr-api/v1/search/select")
+async def select_external_search_results(
+    request: ExternalSearchSelectionRequest, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    try:
+        return await select_search_results(session, request)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/search/results/{result_id}/retry", include_in_schema=False)
+@app.post("/pldr-api/v1/search/results/{result_id}/retry")
+async def retry_external_search_result(
+    result_id: str, session: Session = Depends(get_session)
+) -> dict[str, Any]:
+    try:
+        return await retry_search_result(session, result_id)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/api/v1/intake/text", include_in_schema=False)
 @app.post("/pldr-api/v1/intake/text")
 async def intake_text(request: IntakeTextRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
@@ -585,5 +633,7 @@ def runtime_config() -> dict[str, Any]:
             "candidate_isolation",
             "human_confirmation",
             "file_intake",
+            "external_keyword_discovery",
         ],
+        "external_search": provider_metadata(),
     }
