@@ -263,7 +263,7 @@ class SearchResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     query_run: Mapped[SearchQueryRun] = relationship(back_populates="results")
     selection: Mapped["SearchSelection | None"] = relationship(
-        back_populates="result", uselist=False, cascade="all, delete-orphan"
+        back_populates="result", uselist=False
     )
 
 
@@ -284,3 +284,26 @@ class SearchSelection(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     result: Mapped[SearchResult] = relationship(back_populates="selection")
     intake_item: Mapped[IntakeItem] = relationship()
+    events: Mapped[list["SearchSelectionEvent"]] = relationship(
+        back_populates="selection",
+        cascade="all, delete-orphan",
+        order_by="SearchSelectionEvent.created_at",
+    )
+
+
+class SearchSelectionEvent(Base):
+    """One analyst submission of an identified result, even when intake is reused."""
+
+    __tablename__ = "external_search_selection_events"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    selection_id: Mapped[str] = mapped_column(
+        ForeignKey("external_search_selections.id"), index=True
+    )
+    query_run_id: Mapped[str] = mapped_column(
+        ForeignKey("external_search_query_runs.id"), index=True
+    )
+    result_id: Mapped[str] = mapped_column(ForeignKey("external_search_results.id"), index=True)
+    outcome: Mapped[str] = mapped_column(String(30), default="added")
+    trace_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    selection: Mapped[SearchSelection] = relationship(back_populates="events")

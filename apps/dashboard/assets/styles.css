@@ -430,6 +430,8 @@ a:hover { color: #a6edff; }
 .intake-facts div { padding: 8px; border: 1px solid var(--line-soft); border-radius: 7px; background: rgba(6, 17, 24, 0.68); }
 .intake-facts dt { color: var(--muted); font-size: 9px; }
 .intake-facts dd { margin: 3px 0 0; overflow-wrap: anywhere; color: #cfe5ee; font-size: 10px; }
+.search-trace-list { margin: 0; padding-left: 14px; }
+.search-trace-list li { margin: 3px 0; color: #9fbcc9; }
 .snapshot-box { margin: 8px 0; border: 1px solid var(--line-soft); border-radius: 7px; background: rgba(6, 17, 24, 0.7); }
 .snapshot-box summary { padding: 8px 9px; color: var(--cyan); cursor: pointer; font-size: 10px; }
 .snapshot-box pre, .candidate-card pre, .confirmed-trace pre, .intake-preview pre { max-height: 240px; overflow: auto; margin: 0; padding: 9px; border-top: 1px solid var(--line-soft); color: #a8c6d3; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 9px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

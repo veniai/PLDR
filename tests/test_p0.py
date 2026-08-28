@@ -30,6 +30,7 @@ from pldr_api.models import (
     SearchQueryRun,
     SearchResult,
     SearchSelection,
+    SearchSelectionEvent,
     Snapshot,
     Source,
 )
@@ -1148,6 +1149,19 @@ class P0Test(unittest.TestCase):
             repeated = self.client.post("/pldr-api/v1/search/select", json={"result_ids": selected_ids})
             self.assertEqual(repeated.status_code, 200, repeated.text)
 
+        with patch("pldr_api.search.request_search", controlled_backend):
+            second_search = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "selective intake second query", "scope": "web"},
+            )
+            self.assertEqual(second_search.status_code, 200, second_search.text)
+            second_result = second_search.json()["results"][0]
+            self.assertNotEqual(second_result["id"], results[0]["id"])
+            second_selected = self.client.post(
+                "/pldr-api/v1/search/select", json={"result_ids": [second_result["id"]]}
+            )
+            self.assertEqual(second_selected.status_code, 200, second_selected.text)
+
         self.assertEqual(
             fetched,
             ["https://alpha.example.org/selected", "https://charlie.example.org/selected"],
@@ -1164,6 +1178,11 @@ class P0Test(unittest.TestCase):
             [entry["intake_item_id"] for entry in repeated.json()["results"]],
             [alpha_response["intake_item_id"], charlie_response["intake_item_id"]],
         )
+        second_alpha = second_selected.json()["results"][0]
+        self.assertEqual(second_alpha["outcome"], "already_added")
+        self.assertEqual(second_alpha["intake_item_id"], alpha_response["intake_item_id"])
+        self.assertEqual(second_alpha["result"]["selection"]["latest_query_run_id"], second_search.json()["id"])
+        self.assertEqual(second_alpha["result"]["selection"]["latest_result_id"], second_result["id"])
 
         with SessionLocal() as session:
             search_items = list(
@@ -1195,13 +1214,47 @@ class P0Test(unittest.TestCase):
             self.assertEqual(alpha.status, "candidate_ready")
             self.assertEqual(alpha.title, "Selected original page selected")
             trace = alpha.review["external_search"]
-            self.assertEqual(trace["keyword"], "selective intake")
+            self.assertEqual(trace["keyword"], "selective intake second query")
             self.assertEqual(trace["scope"], "web")
             self.assertEqual(trace["channel"], "brave-search-api:web")
-            self.assertEqual(trace["result_id"], results[0]["id"])
-            self.assertEqual(trace["query_run_id"], search.json()["id"])
+            self.assertEqual(trace["result_id"], second_result["id"])
+            self.assertEqual(trace["query_run_id"], second_search.json()["id"])
             self.assertEqual(trace["original_url"], "https://alpha.example.org/selected")
             self.assertEqual(trace["search_title"], "Alpha search headline")
+            history = alpha.review["external_search_history"]
+            self.assertEqual(
+                [entry["query_run_id"] for entry in history],
+                [search.json()["id"], search.json()["id"], second_search.json()["id"]],
+            )
+            self.assertEqual(
+                [entry["result_id"] for entry in history],
+                [results[0]["id"], results[0]["id"], second_result["id"]],
+            )
+            selection = session.scalar(
+                select(SearchSelection).where(SearchSelection.intake_item_id == alpha.id)
+            )
+            assert selection is not None
+            events = list(
+                session.scalars(
+                    select(SearchSelectionEvent)
+                    .where(SearchSelectionEvent.selection_id == selection.id)
+                    .order_by(SearchSelectionEvent.created_at)
+                )
+            )
+            self.assertEqual([event.outcome for event in events], ["added", "already_added", "already_added"])
+            self.assertEqual(
+                [event.query_run_id for event in events],
+                [search.json()["id"], search.json()["id"], second_search.json()["id"]],
+            )
+
+        serialized_second_trace = self.client.get(
+            f"/pldr-api/v1/intake/{alpha_response['intake_item_id']}"
+        ).json()
+        self.assertEqual(serialized_second_trace["search"]["query_run_id"], second_search.json()["id"])
+        self.assertEqual(
+            [entry["result_id"] for entry in serialized_second_trace["search_history"]],
+            [results[0]["id"], results[0]["id"], second_result["id"]],
+        )
 
         async def recovered_fetch(url, **_):
             return url, """
@@ -1472,6 +1525,8 @@ class P0Test(unittest.TestCase):
         self.assertIn("未生成演示结果。", script.text)
         self.assertIn("data-search-retry=", script.text)
         self.assertIn('data-intake-action="retry-search"', script.text)
+        self.assertIn("item.search_history", script.text)
+        self.assertIn("历次查询与结果", script.text)
         self.assertIn('escapeHtml(result.title || "无标题")', script.text)
 
         styles = self.client.get("/assets/styles.css")

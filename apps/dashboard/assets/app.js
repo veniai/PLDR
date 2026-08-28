@@ -932,6 +932,7 @@ function renderIntakeFacts(item) {
         <div><dt>搜索结果回链</dt><dd><a href="${escapeHtml(item.search.original_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.search.original_url)}</a></dd></div>
         <div><dt>查询 / 结果</dt><dd>${escapeHtml(item.search.query_run_id || "未知")} → ${escapeHtml(item.search.result_id || "未知")} · 排名 ${item.search.rank ?? "未知"}</dd></div>
         <div><dt>搜索摘要</dt><dd>${escapeHtml(item.search.search_snippet || "未返回；不作为证据")}</dd></div>
+        ${item.search_history?.length ? `<div><dt>历次查询与结果</dt><dd><ul class="search-trace-list">${item.search_history.map((trace) => `<li>${escapeHtml(trace.keyword || "未知关键词")} · ${escapeHtml(trace.channel || trace.provider || "未知渠道")} · ${formatDate(trace.selected_at, true)} · ${escapeHtml(trace.result_id || "未知结果")}</li>`).join("")}</ul></dd></div>` : ""}
       ` : ""}
     </dl>`;
 }

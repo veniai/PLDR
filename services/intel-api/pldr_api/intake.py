@@ -665,6 +665,7 @@ def serialize_intake(item: IntakeItem) -> dict[str, Any]:
             **item.review.get("material", {}),
         },
         "search": item.review.get("external_search") or None,
+        "search_history": item.review.get("external_search_history") or [],
         "candidate_generation": {
             "mode": item.candidate_mode,
             "model": item.candidate_model,

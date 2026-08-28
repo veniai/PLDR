@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, selectinload
 from .extraction import canonicalize_url, extract_page, normalize_text
 from .importers import fetch_public_text
 from .intake import generate_candidates, iso, submit_web_intake
-from .models import IntakeItem, SearchQueryRun, SearchResult, SearchSelection
+from .models import IntakeItem, SearchQueryRun, SearchResult, SearchSelection, SearchSelectionEvent
 from .schemas import ExternalSearchRequest, ExternalSearchSelectionRequest
 
 
@@ -322,6 +322,9 @@ def serialize_selection(selection: SearchSelection | None) -> dict[str, Any] | N
         "intake_item_id": selection.intake_item_id,
         "intake_status": item.status if item is not None else None,
         "retryable": selection.status == "failed",
+        "selection_event_count": len(selection.events),
+        "latest_query_run_id": selection.result.query_run_id,
+        "latest_result_id": selection.result_id,
     }
 
 
@@ -437,14 +440,26 @@ async def execute_external_search(
     selections = {
         selection.result_fingerprint: selection
         for selection in session.scalars(
-            select(SearchSelection).where(SearchSelection.result_fingerprint.in_(seen))
+            select(SearchSelection)
+            .where(SearchSelection.result_fingerprint.in_(seen))
+            .options(
+                selectinload(SearchSelection.result).selectinload(SearchResult.query_run),
+                selectinload(SearchSelection.events),
+            )
         )
     }
     return serialize_query_run(run, list(run.results), selections)
 
 
-def _trace_for_selection(selection: SearchSelection) -> dict[str, Any]:
-    result = selection.result
+def _trace_for_selection(
+    selection: SearchSelection,
+    result: SearchResult | None = None,
+    *,
+    event_id: str | None = None,
+    selected_at: datetime | None = None,
+    outcome: str | None = None,
+) -> dict[str, Any]:
+    result = result or selection.result
     run = result.query_run
     return {
         "query_run_id": run.id,
@@ -461,13 +476,32 @@ def _trace_for_selection(selection: SearchSelection) -> dict[str, Any]:
         "search_published_at": iso(result.published_at),
         "rank": result.rank,
         "selection_id": selection.id,
-        "selected_at": iso(selection.created_at),
+        "selection_event_id": event_id,
+        "selected_at": iso(selected_at or selection.created_at),
+        "outcome": outcome or selection.outcome,
+        "attempt_count": selection.attempt_count,
     }
 
 
-def _attach_trace(item: IntakeItem, selection: SearchSelection) -> None:
+def _attach_trace(
+    item: IntakeItem,
+    selection: SearchSelection,
+    result: SearchResult | None = None,
+    event: SearchSelectionEvent | None = None,
+) -> None:
     review = dict(item.review or {})
-    review["external_search"] = _trace_for_selection(selection)
+    latest = (
+        dict(event.trace_json)
+        if event is not None and event.trace_json
+        else _trace_for_selection(selection, result)
+    )
+    history = list(review.get("external_search_history", []))
+    legacy_trace = review.get("external_search")
+    if not history and legacy_trace:
+        history.append(legacy_trace)
+    history.append(latest)
+    review["external_search"] = latest
+    review["external_search_history"] = history
     item.review = review
 
 
@@ -508,6 +542,35 @@ def _new_selection(
     return selection
 
 
+def _record_selection_event(
+    session: Session,
+    selection: SearchSelection,
+    result: SearchResult,
+    *,
+    outcome: str,
+) -> SearchSelectionEvent:
+    event_id = "srche_" + uuid.uuid4().hex[:24]
+    now = datetime.now(timezone.utc)
+    event = SearchSelectionEvent(
+        id=event_id,
+        selection_id=selection.id,
+        query_run_id=result.query_run_id,
+        result_id=result.id,
+        outcome=outcome,
+        trace_json=_trace_for_selection(
+            selection,
+            result,
+            event_id=event_id,
+            selected_at=now,
+            outcome=outcome,
+        ),
+        created_at=now,
+    )
+    session.add(event)
+    session.flush()
+    return event
+
+
 async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> IntakeItem:
     item = selection.intake_item
     result = selection.result
@@ -518,10 +581,19 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item = await generate_candidates(session, item)
         selection.status = item.status
         selection.last_error = item.candidate_error
+        event = _record_selection_event(
+            session,
+            selection,
+            result,
+            outcome="retry_succeeded" if item.status == "candidate_ready" else "retry_failed",
+        )
+        _attach_trace(item, selection, result, event)
         session.commit()
         return item
     if item.status != "failed":
         selection.status = item.status
+        event = _record_selection_event(session, selection, result, outcome="retry_not_needed")
+        _attach_trace(item, selection, result, event)
         session.commit()
         return item
 
@@ -549,6 +621,13 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item = await generate_candidates(session, item)
         selection.status = item.status
         selection.last_error = item.candidate_error
+        event = _record_selection_event(
+            session,
+            selection,
+            result,
+            outcome="retry_succeeded" if item.status == "candidate_ready" else "retry_failed",
+        )
+        _attach_trace(item, selection, result, event)
         session.commit()
         return item
     except Exception as exc:
@@ -563,6 +642,10 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item.error = str(exc)
         selection.status = "failed"
         selection.last_error = str(exc)
+        result = session.get(SearchResult, result.id)
+        assert result is not None
+        event = _record_selection_event(session, selection, result, outcome="retry_failed")
+        _attach_trace(item, selection, result, event)
         session.commit()
         return item
 
@@ -594,15 +677,20 @@ async def select_search_results(
             .options(
                 selectinload(SearchSelection.result).selectinload(SearchResult.query_run),
                 selectinload(SearchSelection.intake_item),
+                selectinload(SearchSelection.events),
             )
         )
         if existing is not None:
             outcome = "already_added"
             if retry and existing.intake_item.status in {"failed", "generation_failed"}:
+                existing.result = result
                 await _retry_failed_fetch(session, existing)
                 outcome = "retried"
             else:
                 existing.outcome = "already_added"
+                existing.result = result
+                event = _record_selection_event(session, existing, result, outcome=outcome)
+                _attach_trace(existing.intake_item, existing, result, event)
                 session.commit()
             responses.append(
                 {
@@ -621,7 +709,10 @@ async def select_search_results(
             selection = _new_selection(
                 session, result, existing_item, outcome="linked_existing_intake", attempt_count=0
             )
-            _attach_trace(existing_item, selection)
+            event = _record_selection_event(
+                session, selection, result, outcome="linked_existing_intake"
+            )
+            _attach_trace(existing_item, selection, result, event)
             session.commit()
         else:
             item = await submit_web_intake(
@@ -634,7 +725,8 @@ async def select_search_results(
                 input_type="search",
             )
             selection = _new_selection(session, result, item, outcome="added", attempt_count=1)
-            _attach_trace(item, selection)
+            event = _record_selection_event(session, selection, result, outcome="added")
+            _attach_trace(item, selection, result, event)
             session.commit()
         responses.append(
             {
@@ -664,11 +756,16 @@ async def retry_search_result(session: Session, result_id: str) -> dict[str, Any
     selection = session.scalar(
         select(SearchSelection)
         .where(SearchSelection.result_fingerprint == result.result_fingerprint)
-        .options(selectinload(SearchSelection.result), selectinload(SearchSelection.intake_item))
+        .options(
+            selectinload(SearchSelection.result).selectinload(SearchResult.query_run),
+            selectinload(SearchSelection.intake_item),
+            selectinload(SearchSelection.events),
+        )
     )
     if selection is None:
         request = ExternalSearchSelectionRequest(result_ids=[result.id])
         return await select_search_results(session, request)
+    selection.result = result
     item = await _retry_failed_fetch(session, selection)
     return {
         "status": "ok",

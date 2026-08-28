@@ -31,6 +31,7 @@ PLDR_SEARCH_TIMEOUT_SECONDS=12
 - `external_search_query_runs` 保存一次关键词查询、范围、渠道、状态、延迟和错误。
 - `external_search_results` 保存规范化结果、原始 URL、站点、标题、摘要、可获得时间、排名和后端引擎标识。
 - `external_search_selections` 用规范化 URL 指纹把一个已识别结果链接到至多一个采集箱条目，并记录尝试次数、状态和错误。
+- `external_search_selection_events` 记录每一次提交、复用和重试所对应的查询运行与结果；采集条目详情显示最新 trace，并保留完整 `search_history`。
 - 检索渠道不是正式 `Source`；搜索标题、摘要、排名、相对时间和模型答案都不是 `Evidence`。
 - 未勾选结果不会发起原始页抓取，也不会产生采集箱条目。
 - 勾选后仍沿用 P0.3：抓取原始 HTML，保存原始/提取快照，生成候选，人工确认后才创建或关联正式 `Source`、`Document`、`Snapshot`、`Event`、`Entity`、`Claim`、`Evidence`。
@@ -50,7 +51,7 @@ PLDR_SEARCH_TIMEOUT_SECONDS=12
 | --- | --- |
 | Brave/SearXNG 薄适配层 endpoint、认证参数、范围参数、响应解析契约和超时映射 | `test_search_provider_adapters_call_real_backend_contracts` |
 | 新闻与一般网页两个范围、结果规范化、渠道/URL/站点/标题/摘要/时间展示、空结果和后端失败不伪装 | `test_external_search_normalizes_scopes_and_does_not_fake_failures` |
-| 只抓取选中项、未选项不产生条目、追踪关键词/查询/渠道/结果，失败保留错误并可重试 | `test_selected_search_results_selectively_enter_intake_and_can_retry` |
+| 只抓取选中项、未选项不产生条目、追踪关键词/查询/渠道/结果与跨查询重复选择历史，失败保留错误并可重试 | `test_selected_search_results_selectively_enter_intake_and_can_retry` |
 | 搜索结果隔离于正式区，确认后证据精确回链原始快照，重复选择和重复确认幂等，报告不含搜索摘要 | `test_external_search_stays_evidence_first_and_idempotent_after_confirmation` |
 | 私网 URL、重定向到私网、无正文、未配置后端等失败不影响正式对象 | `test_external_search_and_fetch_failures_leave_formal_area_unchanged` |
 | 既有公共网页、RSS、粘贴文本、本地文件与 P0.3 审核闭环回归 | P0.3 原有测试保留并全部通过 |
