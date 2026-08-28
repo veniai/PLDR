@@ -13,6 +13,10 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL_NAME: ${LLM_MODEL_NAME:-}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      PLDR_SEARCH_PROVIDER: ${PLDR_SEARCH_PROVIDER:-brave}
+      PLDR_SEARCH_BASE_URL: ${PLDR_SEARCH_BASE_URL:-https://api.search.brave.com}
+      PLDR_SEARCH_API_KEY: ${PLDR_SEARCH_API_KEY:-}
+      PLDR_SEARCH_TIMEOUT_SECONDS: ${PLDR_SEARCH_TIMEOUT_SECONDS:-12}
     volumes:
       - ./data/runtime:/app/data/runtime
       - ./reports:/app/reports

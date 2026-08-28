@@ -4,8 +4,11 @@ import os
 import shutil
 import tempfile
 import unittest
+import asyncio
 from unittest.mock import patch
 from pathlib import Path
+
+import httpx
 
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="pldr-p0-tests-"))
 os.environ["PLDR_DATABASE_URL"] = f"sqlite:///{TEST_ROOT / 'pldr-p0-test.db'}"
@@ -15,9 +18,32 @@ os.environ.pop("PLDR_ADMIN_TOKEN", None)
 from fastapi.testclient import TestClient
 from pldr_api.database import Base, SessionLocal, engine
 from pldr_api.main import app
-from pldr_api.models import Claim, Document, Evidence, IntakeItem, Snapshot, Source
 from pldr_api.intake import confirm_intake, get_intake_item
+from pldr_api.importers import fetch_public_text
+from pldr_api.models import (
+    Claim,
+    Document,
+    Entity,
+    Event,
+    Evidence,
+    IntakeItem,
+    SearchQueryRun,
+    SearchResult,
+    SearchSelection,
+    SearchSelectionEvent,
+    Snapshot,
+    Source,
+)
+from pldr_api.schemas import ExternalSearchRequest
 from pldr_api.schemas import IntakeConfirmationRequest
+from pldr_api.search import (
+    BackendSearchResponse,
+    ExternalSearchError,
+    SearchHit,
+    SearchProviderConfig,
+    request_brave_search,
+    request_searxng_search,
+)
 from pldr_api.security import UnsafeUrlError, validate_public_http_url
 from pldr_api.seed import counts, seed_database
 from sqlalchemy import func, select
@@ -66,6 +92,38 @@ class P0Test(unittest.TestCase):
     @staticmethod
     def candidate_map(item: dict) -> dict[str, dict]:
         return {candidate["object_type"]: candidate for candidate in item["candidates"]}
+
+    @staticmethod
+    def search_hit(
+        url: str,
+        *,
+        title: str = "External result",
+        snippet: str = "Search-only snippet",
+        published_at=None,
+    ) -> SearchHit:
+        from pldr_api.search import _normalize_hit
+
+        return _normalize_hit(
+            {
+                "url": url,
+                "title": title,
+                "description": snippet,
+                "publishedDate": published_at,
+                "meta_url": {"hostname": url.split("/")[2]},
+                "engine": "controlled-test-engine",
+            },
+            provider="controlled-test",
+            engine="controlled-test-engine",
+        )
+
+    @staticmethod
+    def formal_counts() -> dict[str, int]:
+        models = [Source, Document, Snapshot, Event, Entity, Claim, Evidence]
+        with SessionLocal() as session:
+            return {
+                model.__tablename__: session.scalar(select(func.count()).select_from(model))
+                for model in models
+            }
 
     def confirmation_request(self, item: dict, **overrides) -> dict:
         candidates = self.candidate_map(item)
@@ -813,6 +871,623 @@ class P0Test(unittest.TestCase):
         self.assertIn("未知标题", modified_report_text)
         self.assertIn("human-confirmed", modified_report_text)
 
+    def test_external_search_normalizes_scopes_and_does_not_fake_failures(self):
+        before = self.formal_counts()
+
+        async def controlled_backend(_, request):
+            if request.keyword == "definitely no PLDR matches":
+                return BackendSearchResponse("brave", f"brave-search-api:{request.scope}", [])
+            if request.keyword == "backend failure":
+                raise ExternalSearchError("Controlled rate limit", status_code=429, reason="rate_limited")
+            hits = [
+                self.search_hit(
+                    "https://news.example.org/story?utm_source=test",
+                    title="<script>alert('title')</script>Real title",
+                    snippet="<strong>Search-only</strong> abstract",
+                ),
+                self.search_hit(
+                    "https://news.example.org/story?utm_source=test",
+                    title="Duplicate canonical URL",
+                ),
+            ]
+            return BackendSearchResponse("brave", f"brave-search-api:{request.scope}", hits)
+
+        with patch("pldr_api.search.request_search", controlled_backend):
+            news = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "Suez canal", "scope": "news", "limit": 5, "language": "en"},
+            )
+            web = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "Suez canal", "scope": "web", "limit": 5, "language": "en"},
+            )
+            empty = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "definitely no PLDR matches", "scope": "web"},
+            )
+            failure = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "backend failure", "scope": "news"},
+            )
+
+        self.assertEqual(news.status_code, 200, news.text)
+        self.assertEqual(web.status_code, 200, web.text)
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(failure.status_code, 429, failure.text)
+        self.assertEqual(failure.json()["detail"]["reason"], "rate_limited")
+        news_payload = news.json()
+        web_payload = web.json()
+        self.assertEqual(news_payload["scope"], "news")
+        self.assertEqual(web_payload["scope"], "web")
+        self.assertEqual(news_payload["channel"], "brave-search-api:news")
+        self.assertEqual(web_payload["channel"], "brave-search-api:web")
+        self.assertNotEqual(news_payload["id"], web_payload["id"])
+        self.assertEqual(news_payload["result_count"], 1)
+        self.assertEqual(empty.json()["result_count"], 0)
+        result = news_payload["results"][0]
+        self.assertEqual(result["title"], "Real title")
+        self.assertEqual(result["snippet"], "Search-only abstract")
+        self.assertEqual(result["original_url"], "https://news.example.org/story?utm_source=test")
+        self.assertEqual(result["canonical_url"], "https://news.example.org/story")
+        self.assertEqual(result["site"], "news.example.org")
+        self.assertEqual(result["rank"], 1)
+        self.assertIsNone(result["selection"])
+
+        config = self.client.get("/pldr-api/v1/config").json()
+        self.assertIn("external_keyword_discovery", config["features"])
+        self.assertTrue(config["external_search"]["external_request"])
+        self.assertIn("version", config["external_search"])
+        self.assertIn("license", config["external_search"])
+        self.assertIn("deployment_boundary", config["external_search"])
+
+        with SessionLocal() as session:
+            runs = {
+                run_id: session.get(SearchQueryRun, run_id)
+                for run_id in [
+                    news_payload["id"],
+                    web_payload["id"],
+                    empty.json()["id"],
+                    failure.json()["detail"].get("query_run_id"),
+                ]
+            }
+            self.assertEqual(runs[news_payload["id"]].status, "ok")
+            self.assertEqual(runs[web_payload["id"]].status, "ok")
+            self.assertEqual(runs[empty.json()["id"]].status, "ok")
+            self.assertEqual(runs[failure.json()["detail"].get("query_run_id")].status, "failed")
+            self.assertEqual(runs[failure.json()["detail"].get("query_run_id")].channel, "brave-search-api:news")
+            self.assertIn("Controlled rate limit", runs[failure.json()["detail"].get("query_run_id")].error)
+            self.assertEqual(
+                len(
+                    list(
+                        session.scalars(
+                            select(SearchResult).where(
+                                SearchResult.query_run_id.in_([news_payload["id"], web_payload["id"]])
+                            )
+                        )
+                    )
+                ),
+                2,
+            )
+            self.assertEqual(
+                len(
+                    list(
+                        session.scalars(
+                            select(SearchSelection).where(
+                                SearchSelection.result_id.in_(
+                                    [result["id"] for result in news_payload["results"]]
+                                )
+                            )
+                        )
+                    )
+                ),
+                0,
+            )
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_search_provider_adapters_call_real_backend_contracts(self):
+        calls = []
+
+        class ControlledResponse:
+            status_code = 200
+
+            def __init__(self, section):
+                self.section = section
+
+            def json(self):
+                return {
+                    "web": {
+                        "results": [
+                            {
+                                "url": "https://adapter.example.org/from-brave",
+                                "title": "<b>Brave result</b>",
+                                "description": "Brave description",
+                                "meta_url": {"hostname": "adapter.example.org"},
+                            }
+                        ]
+                    },
+                    "news": {
+                        "results": [
+                            {
+                                "url": "https://adapter.example.org/from-brave-news",
+                                "title": "Brave news result",
+                                "description": "Brave news description",
+                                "meta_url": {"hostname": "adapter.example.org"},
+                                "page_age": "2026-08-28T01:02:03Z",
+                            }
+                        ]
+                    },
+                    "searxng": {
+                        "results": [
+                            {
+                                "url": "https://adapter.example.org/from-searxng",
+                                "title": "SearXNG result",
+                                "content": "SearXNG description",
+                                "publishedDate": "2026-08-28T01:02:03Z",
+                                "engine": "brave",
+                            }
+                        ]
+                    },
+                }[self.section]
+
+        class ControlledClient:
+            def __init__(self, timeout=None):
+                self.timeout = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def post(self, endpoint, json=None, headers=None):
+                calls.append(("POST", endpoint, json, headers))
+                return ControlledResponse("news" if "/news/" in endpoint else "web")
+
+            async def get(self, endpoint, params=None):
+                calls.append(("GET", endpoint, params, None))
+                return ControlledResponse("searxng")
+
+        request = ExternalSearchRequest(keyword="adapter contract", scope="news", limit=5)
+        with patch("pldr_api.search.httpx.AsyncClient", ControlledClient):
+            brave_news = asyncio.run(
+                request_brave_search(
+                    SearchProviderConfig("brave", "https://api.search.brave.com", "test-key", 3),
+                    request,
+                )
+            )
+            brave_web = asyncio.run(
+                request_brave_search(
+                    SearchProviderConfig("brave", "https://api.search.brave.com", "test-key", 3),
+                    request.model_copy(update={"scope": "web"}),
+                )
+            )
+            searxng_news = asyncio.run(
+                request_searxng_search(
+                    SearchProviderConfig("searxng", "http://127.0.0.1:8888", "", 3),
+                    request,
+                )
+            )
+
+        self.assertEqual(calls[0][1], "https://api.search.brave.com/res/v1/news/search")
+        self.assertEqual(calls[0][2]["q"], "adapter contract")
+        self.assertEqual(calls[0][2]["count"], 5)
+        self.assertEqual(calls[0][2]["search_lang"], "en")
+        self.assertEqual(calls[0][2]["country"], "ALL")
+        self.assertEqual(calls[0][2]["safesearch"], "strict")
+        self.assertIs(calls[0][2]["spellcheck"], False)
+        self.assertNotIn("result_filter", calls[0][2])
+        self.assertNotIn("text_decorations", calls[0][2])
+        self.assertEqual(calls[0][3]["X-Subscription-Token"], "test-key")
+        self.assertEqual(calls[0][3]["Accept"], "application/json")
+        self.assertEqual(calls[0][3]["Content-Type"], "application/json")
+        self.assertEqual(calls[1][1], "https://api.search.brave.com/res/v1/web/search")
+        self.assertEqual(calls[1][2]["result_filter"], ["web"])
+        self.assertIs(calls[1][2]["text_decorations"], False)
+        self.assertNotIn("decorators", calls[1][2])
+        self.assertEqual(calls[2][1], "http://127.0.0.1:8888/search")
+        self.assertEqual(calls[2][2]["format"], "json")
+        self.assertEqual(calls[2][2]["categories"], "news")
+
+        self.assertEqual(brave_news.channel, "brave-search-api:news")
+        self.assertEqual(brave_news.hits[0].title, "Brave news result")
+        self.assertEqual(brave_web.hits[0].canonical_url, "https://adapter.example.org/from-brave")
+        self.assertEqual(searxng_news.provider, "searxng")
+        self.assertEqual(searxng_news.hits[0].snippet, "SearXNG description")
+        self.assertEqual(searxng_news.hits[0].published_at.year, 2026)
+
+        class TimeoutClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def get(self, *_, **__):
+                raise httpx.ConnectTimeout("controlled timeout")
+
+        with patch("pldr_api.search.httpx.AsyncClient", TimeoutClient):
+            with self.assertRaises(ExternalSearchError) as timeout_context:
+                asyncio.run(
+                    request_searxng_search(
+                        SearchProviderConfig("searxng", "http://127.0.0.1:8888", "", 3),
+                        request,
+                    )
+                )
+        self.assertEqual(timeout_context.exception.status_code, 504)
+        self.assertEqual(timeout_context.exception.reason, "timeout")
+
+    def test_selected_search_results_selectively_enter_intake_and_can_retry(self):
+        before = self.formal_counts()
+        fetched = []
+
+        async def controlled_backend(_, request):
+            hits = [
+                self.search_hit("https://alpha.example.org/selected", title="Alpha search headline"),
+                self.search_hit("https://bravo.example.org/not-selected", title="Bravo search headline"),
+                self.search_hit("https://charlie.example.org/selected", title="Charlie search headline"),
+            ]
+            return BackendSearchResponse("brave", f"brave-search-api:{request.scope}", hits)
+
+        async def controlled_fetch(url, **_):
+            fetched.append(url)
+            if url.startswith("https://charlie.example.org/"):
+                raise RuntimeError("Controlled original-page timeout")
+            return url, f"""
+                <html><head><title>Selected original page {url.split('/')[3]}</title></head><body><article>
+                <p>This sufficiently long original body is fetched only after an analyst explicitly selected
+                the corresponding external search result for PLDR intake.</p>
+                </article></body></html>
+            """
+
+        with patch("pldr_api.search.request_search", controlled_backend):
+            search = self.client.post(
+                "/pldr-api/v1/search", json={"keyword": "selective intake", "scope": "web"}
+            )
+        self.assertEqual(search.status_code, 200, search.text)
+        results = search.json()["results"]
+        selected_ids = [results[0]["id"], results[2]["id"]]
+        with patch("pldr_api.intake.validate_public_http_url", lambda url, resolve=True: url), patch(
+            "pldr_api.intake.fetch_public_text", controlled_fetch
+        ), patch(
+            "pldr_api.search.fetch_public_text", controlled_fetch
+        ):
+            selected = self.client.post("/pldr-api/v1/search/select", json={"result_ids": selected_ids})
+            self.assertEqual(selected.status_code, 200, selected.text)
+            repeated = self.client.post("/pldr-api/v1/search/select", json={"result_ids": selected_ids})
+            self.assertEqual(repeated.status_code, 200, repeated.text)
+
+        with patch("pldr_api.search.request_search", controlled_backend):
+            second_search = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "selective intake second query", "scope": "web"},
+            )
+            self.assertEqual(second_search.status_code, 200, second_search.text)
+            second_result = second_search.json()["results"][0]
+            self.assertNotEqual(second_result["id"], results[0]["id"])
+            second_selected = self.client.post(
+                "/pldr-api/v1/search/select", json={"result_ids": [second_result["id"]]}
+            )
+            self.assertEqual(second_selected.status_code, 200, second_selected.text)
+
+        self.assertEqual(
+            fetched,
+            ["https://alpha.example.org/selected", "https://charlie.example.org/selected"],
+        )
+        alpha_response, charlie_response = selected.json()["results"]
+        self.assertEqual(alpha_response["intake_status"], "candidate_ready")
+        self.assertEqual(charlie_response["intake_status"], "failed")
+        self.assertIn("Controlled original-page timeout", charlie_response["error"])
+        self.assertEqual(
+            [entry["outcome"] for entry in repeated.json()["results"]],
+            ["already_added", "already_added"],
+        )
+        self.assertEqual(
+            [entry["intake_item_id"] for entry in repeated.json()["results"]],
+            [alpha_response["intake_item_id"], charlie_response["intake_item_id"]],
+        )
+        second_alpha = second_selected.json()["results"][0]
+        self.assertEqual(second_alpha["outcome"], "already_added")
+        self.assertEqual(second_alpha["intake_item_id"], alpha_response["intake_item_id"])
+        self.assertEqual(second_alpha["result"]["selection"]["latest_query_run_id"], second_search.json()["id"])
+        self.assertEqual(second_alpha["result"]["selection"]["latest_result_id"], second_result["id"])
+
+        with SessionLocal() as session:
+            search_items = list(
+                session.scalars(
+                    select(IntakeItem).where(
+                        IntakeItem.source_url.in_(
+                            [
+                                "https://alpha.example.org/selected",
+                                "https://charlie.example.org/selected",
+                            ]
+                        )
+                    )
+                )
+            )
+            self.assertEqual(len(search_items), 2)
+            self.assertEqual(
+                len(
+                    list(
+                        session.scalars(
+                            select(IntakeItem).where(
+                                IntakeItem.source_url == "https://bravo.example.org/not-selected"
+                            )
+                        )
+                    )
+                ),
+                0,
+            )
+            alpha = session.get(IntakeItem, alpha_response["intake_item_id"])
+            self.assertEqual(alpha.status, "candidate_ready")
+            self.assertEqual(alpha.title, "Selected original page selected")
+            trace = alpha.review["external_search"]
+            self.assertEqual(trace["keyword"], "selective intake second query")
+            self.assertEqual(trace["scope"], "web")
+            self.assertEqual(trace["channel"], "brave-search-api:web")
+            self.assertEqual(trace["result_id"], second_result["id"])
+            self.assertEqual(trace["query_run_id"], second_search.json()["id"])
+            self.assertEqual(trace["original_url"], "https://alpha.example.org/selected")
+            self.assertEqual(trace["search_title"], "Alpha search headline")
+            history = alpha.review["external_search_history"]
+            self.assertEqual(
+                [entry["query_run_id"] for entry in history],
+                [search.json()["id"], search.json()["id"], second_search.json()["id"]],
+            )
+            self.assertEqual(
+                [entry["result_id"] for entry in history],
+                [results[0]["id"], results[0]["id"], second_result["id"]],
+            )
+            selection = session.scalar(
+                select(SearchSelection).where(SearchSelection.intake_item_id == alpha.id)
+            )
+            assert selection is not None
+            events = list(
+                session.scalars(
+                    select(SearchSelectionEvent)
+                    .where(SearchSelectionEvent.selection_id == selection.id)
+                    .order_by(SearchSelectionEvent.created_at)
+                )
+            )
+            self.assertEqual([event.outcome for event in events], ["added", "already_added", "already_added"])
+            self.assertEqual(
+                [event.query_run_id for event in events],
+                [search.json()["id"], search.json()["id"], second_search.json()["id"]],
+            )
+
+        serialized_second_trace = self.client.get(
+            f"/pldr-api/v1/intake/{alpha_response['intake_item_id']}"
+        ).json()
+        self.assertEqual(serialized_second_trace["search"]["query_run_id"], second_search.json()["id"])
+        self.assertEqual(
+            [entry["result_id"] for entry in serialized_second_trace["search_history"]],
+            [results[0]["id"], results[0]["id"], second_result["id"]],
+        )
+
+        async def recovered_fetch(url, **_):
+            return url, """
+                <html><head><title>Recovered original page</title></head><body><article>
+                <p>This recovered body is long enough to pass extraction and becomes the only evidence
+                snapshot considered by deterministic candidate generation.</p>
+                </article></body></html>
+            """
+
+        with patch("pldr_api.importers.validate_public_http_url", lambda url, resolve=True: url), patch(
+            "pldr_api.intake.fetch_public_text", recovered_fetch
+        ), patch(
+            "pldr_api.search.fetch_public_text", recovered_fetch
+        ):
+            retried = self.client.post(f"/pldr-api/v1/search/results/{results[2]['id']}/retry")
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(retried.json()["intake_status"], "candidate_ready")
+        self.assertEqual(retried.json()["intake_item_id"], charlie_response["intake_item_id"])
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_external_search_stays_evidence_first_and_idempotent_after_confirmation(self):
+        async def controlled_backend(_, request):
+            return BackendSearchResponse(
+                "brave",
+                f"brave-search-api:{request.scope}",
+                [
+                    self.search_hit(
+                        "https://formal.example.org/confirmed",
+                        title="Search-only headline",
+                        snippet="Search-only abstract that must never become Evidence",
+                    )
+                ],
+            )
+
+        async def controlled_fetch(url, **_):
+            return url, """
+                <html><head><title>Original confirmed page</title></head><body><article>
+                <p>This original page body is the only snapshot allowed to support a human-confirmed
+                claim after external keyword discovery and selective intake.</p>
+                </article></body></html>
+            """
+
+        with patch("pldr_api.search.request_search", controlled_backend):
+            search = self.client.post(
+                "/pldr-api/v1/search", json={"keyword": "formal confirmation", "scope": "news"}
+            )
+            self.assertEqual(search.status_code, 200, search.text)
+            result_id = search.json()["results"][0]["id"]
+        with patch("pldr_api.intake.validate_public_http_url", lambda url, resolve=True: url), patch(
+            "pldr_api.intake.fetch_public_text", controlled_fetch
+        ):
+            selected = self.client.post("/pldr-api/v1/search/select", json={"result_ids": [result_id]})
+        self.assertEqual(selected.status_code, 200, selected.text)
+        intake_payload = self.client.get(
+            f"/pldr-api/v1/intake/{selected.json()['results'][0]['intake_item_id']}"
+        ).json()
+        self.assertIsNotNone(intake_payload["search"])
+        self.assertEqual(intake_payload["title"], "Original confirmed page")
+
+        before = self.formal_counts()
+        request = self.confirmation_request(intake_payload)
+        confirmed = self.client.post(
+            f"/pldr-api/v1/intake/{intake_payload['id']}/confirm", json=request
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertTrue(confirmed.json()["created"])
+        after_confirm = self.formal_counts()
+        expected_delta = {
+            "sources": 1,
+            "documents": 1,
+            "snapshots": 1,
+            "events": 1,
+            "entities": 0,
+            "claims": 1,
+            "evidence": 1,
+        }
+        for key, delta in expected_delta.items():
+            self.assertEqual(after_confirm[key], before[key] + delta, key)
+
+        confirmed_payload = confirmed.json()["intake_item"]
+        confirmation_trace = confirmed_payload["confirmation_result"]["trace"]
+        self.assertEqual(confirmation_trace["intake_item_id"], intake_payload["id"])
+        self.assertEqual(confirmation_trace["external_search"]["query_run_id"], search.json()["id"])
+        self.assertEqual(confirmation_trace["external_search"]["result_id"], result_id)
+        evidence_id = confirmed_payload["confirmation_result"]["formal_object_ids"]["evidence"][0]
+        with SessionLocal() as session:
+            evidence = session.get(Evidence, evidence_id)
+            snapshot = session.get(Snapshot, evidence.snapshot_id)
+            document = session.get(Document, evidence.document_id)
+            self.assertEqual(
+                evidence.document.body[evidence.start_offset : evidence.end_offset],
+                evidence.snippet,
+            )
+            self.assertEqual(snapshot.excerpt, document.body)
+            self.assertEqual(document.canonical_url, "https://formal.example.org/confirmed")
+            self.assertNotIn("Search-only", document.body)
+            self.assertEqual(
+                len(
+                    list(
+                        session.scalars(
+                            select(SearchSelection).where(SearchSelection.intake_item_id == intake_payload["id"])
+                        )
+                    )
+                ),
+                1,
+            )
+
+        repeat_confirmation = self.client.post(
+            f"/pldr-api/v1/intake/{intake_payload['id']}/confirm", json=request
+        )
+        repeat_selection = self.client.post(
+            "/pldr-api/v1/search/select", json={"result_ids": [result_id]}
+        )
+        self.assertEqual(repeat_confirmation.status_code, 200, repeat_confirmation.text)
+        self.assertFalse(repeat_confirmation.json()["created"])
+        self.assertEqual(repeat_selection.status_code, 200, repeat_selection.text)
+        self.assertEqual(
+            repeat_selection.json()["results"][0]["intake_item_id"], intake_payload["id"]
+        )
+        self.assertEqual(self.formal_counts(), after_confirm)
+
+        report = self.client.post(
+            "/pldr-api/v1/reports",
+            json={
+                "event_ids": [confirmed_payload["final_object_ids"]["event"]],
+                "title": "External discovery evidence report",
+            },
+        )
+        self.assertEqual(report.status_code, 200, report.text)
+        report_text = self.client.get(report.json()["url"]).text
+        self.assertIn("original page body", report_text)
+        self.assertNotIn("Search-only headline", report_text)
+        self.assertNotIn("Search-only abstract", report_text)
+
+    def test_external_search_and_fetch_failures_leave_formal_area_unchanged(self):
+        before = self.formal_counts()
+
+        async def controlled_backend(_, request):
+            hits = [
+                self.search_hit("http://10.0.0.1/private-result", title="Private result"),
+                self.search_hit("https://example.org/no-body", title="No-body result"),
+            ]
+            return BackendSearchResponse("brave", f"brave-search-api:{request.scope}", hits)
+
+        async def empty_fetch(url, **_):
+            return url, "<html><body><p>short</p></body></html>"
+
+        with patch("pldr_api.search.request_search", controlled_backend):
+            search = self.client.post(
+                "/pldr-api/v1/search", json={"keyword": "failure isolation", "scope": "web"}
+            )
+        self.assertEqual(search.status_code, 200, search.text)
+        result_ids = [item["id"] for item in search.json()["results"]]
+        with patch("pldr_api.intake.fetch_public_text", empty_fetch):
+            selected = self.client.post("/pldr-api/v1/search/select", json={"result_ids": result_ids})
+            retried_private = self.client.post(
+                f"/pldr-api/v1/search/results/{result_ids[0]}/retry"
+            )
+
+        self.assertEqual(selected.status_code, 200, selected.text)
+        statuses = [entry["intake_status"] for entry in selected.json()["results"]]
+        self.assertEqual(statuses, ["failed", "failed"])
+        self.assertIn("Non-public address", selected.json()["results"][0]["error"])
+        self.assertIn("too short", selected.json()["results"][1]["error"])
+        self.assertEqual(retried_private.status_code, 200)
+        self.assertEqual(retried_private.json()["intake_status"], "failed")
+        self.assertIn("Non-public address", retried_private.json()["error"])
+
+        class RedirectResponse:
+            status_code = 302
+            headers = {"location": "http://127.0.0.1/redirect-target"}
+
+        class RedirectClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def get(self, *_):
+                return RedirectResponse()
+
+        real_validator = validate_public_http_url
+
+        def allow_initial_public_url(url, resolve=True):
+            if url == "https://example.org/redirect":
+                return url
+            return real_validator(url, resolve=False)
+
+        with patch("pldr_api.importers.httpx.AsyncClient", RedirectClient), patch(
+            "pldr_api.importers.validate_public_http_url", allow_initial_public_url
+        ):
+            with self.assertRaises(UnsafeUrlError):
+                asyncio.run(fetch_public_text("https://example.org/redirect"))
+
+        with SessionLocal() as session:
+            items = list(
+                session.scalars(
+                    select(IntakeItem).where(
+                        IntakeItem.id.in_(
+                            [
+                                selected.json()["results"][0]["intake_item_id"],
+                                selected.json()["results"][1]["intake_item_id"],
+                            ]
+                        )
+                    )
+                )
+            )
+            self.assertEqual({item.status for item in items}, {"failed"})
+            self.assertTrue(all(item.review.get("external_search") for item in items))
+        self.assertEqual(self.formal_counts(), before)
+
+        with patch.dict(os.environ, {"PLDR_SEARCH_API_KEY": "", "PLDR_SEARCH_PROVIDER": "brave"}):
+            unconfigured = self.client.post(
+                "/pldr-api/v1/search", json={"keyword": "unconfigured backend", "scope": "web"}
+            )
+        self.assertEqual(unconfigured.status_code, 503, unconfigured.text)
+        self.assertIn("not configured", unconfigured.text)
+        self.assertEqual(self.formal_counts(), before)
+
     def test_workbench_shell_exposes_operational_actions(self):
         dashboard = self.client.get("/")
         self.assertEqual(dashboard.status_code, 200)
@@ -823,8 +1498,14 @@ class P0Test(unittest.TestCase):
             'id="import-modal"',
             'id="intake-modal"',
             'id="btn-intake"',
+            'id="btn-search"',
+            'id="search-modal"',
+            'id="search-status"',
             'id="import-file"',
             'id="contested-filter"',
+            "外部关键词发现",
+            "不是筛选已入档事件",
+            "搜索标题、摘要、排名和检索渠道都不是 Evidence",
         ]:
             self.assertIn(marker, dashboard.text)
 
@@ -836,6 +1517,9 @@ class P0Test(unittest.TestCase):
             "/pldr-api/v1/import/rss",
             "/pldr-api/v1/intake/files",
             "/pldr-api/v1/intake/",
+            "/pldr-api/v1/search",
+            "/pldr-api/v1/search/select",
+            "/pldr-api/v1/search/results/",
         ]:
             self.assertIn(endpoint, script.text)
         for control_state in [
@@ -847,11 +1531,20 @@ class P0Test(unittest.TestCase):
         ]:
             self.assertIn(control_state, script.text)
         self.assertIn('href="/snapshots/${escapeHtml(final.snapshot)}"', script.text)
+        self.assertIn("没有匹配结果。PLDR 不会用演示数据填充空结果。", script.text)
+        self.assertIn("未生成演示结果。", script.text)
+        self.assertIn("data-search-retry=", script.text)
+        self.assertIn('data-intake-action="retry-search"', script.text)
+        self.assertIn("item.search_history", script.text)
+        self.assertIn("历次查询与结果", script.text)
+        self.assertIn('escapeHtml(result.title || "无标题")', script.text)
 
         styles = self.client.get("/assets/styles.css")
         self.assertEqual(styles.status_code, 200)
         self.assertIn("@media (max-width: 580px)", styles.text)
         self.assertIn(".intake-layout { grid-template-columns: 1fr;", styles.text)
+        self.assertIn(".search-modal", styles.text)
+        self.assertIn(".search-result", styles.text)
 
     def test_initial_selection_keeps_workspace_closed_without_a_deep_link(self):
         script = self.client.get("/assets/app.js")

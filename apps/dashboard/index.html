@@ -13,7 +13,7 @@
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div>
-          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P0.3</span></div>
+          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P1.0</span></div>
           <p>开源情报证据工作台</p>
         </div>
       </div>
@@ -36,6 +36,9 @@
         </div>
       </div>
       <div class="command-actions">
+        <button class="btn btn-ghost" id="btn-search" type="button">
+          <span aria-hidden="true">⌕</span> 外部关键词发现
+        </button>
         <button class="btn btn-ghost intake-button" id="btn-intake" type="button">
           <span aria-hidden="true">▤</span> 待处理采集箱
           <span id="intake-count" class="count-badge">0</span>
@@ -182,6 +185,53 @@
       <button id="drawer-copy" class="btn btn-ghost" type="button">复制事件摘要</button>
     </div>
   </aside>
+
+  <dialog id="search-modal" class="modal search-modal" aria-labelledby="search-modal-title">
+    <form id="search-form" method="dialog">
+      <div class="modal-header">
+        <div>
+          <span class="panel-kicker">EXTERNAL KEYWORD DISCOVERY</span>
+          <h2 id="search-modal-title">公开资料关键词搜索</h2>
+        </div>
+        <button id="search-close" class="icon-btn" type="button" aria-label="关闭公开资料搜索">×</button>
+      </div>
+      <div class="search-form-grid">
+        <label class="form-field">
+          <span>关键词（不是筛选已入档事件）</span>
+          <input id="search-keyword" type="search" minlength="2" maxlength="400" placeholder="例如：Suez canal blockage" required>
+        </label>
+        <label class="form-field">
+          <span>范围</span>
+          <select id="search-scope">
+            <option value="news">新闻</option>
+            <option value="web">一般公开网页</option>
+          </select>
+        </label>
+        <label class="form-field">
+          <span>语言</span>
+          <select id="search-language">
+            <option value="en">英语</option>
+            <option value="zh">中文</option>
+            <option value="ar">阿拉伯语</option>
+            <option value="fr">法语</option>
+          </select>
+        </label>
+      </div>
+      <div id="search-provider-summary" class="search-provider-summary"></div>
+      <div class="form-notice">
+        本入口连接现成外部检索后端，只返回候选线索。搜索标题、摘要、排名和检索渠道都不是 Evidence，也不是正式 Source；只有选中后成功抓取的原始页面快照才会进入既有候选与人工确认流程。
+      </div>
+      <div id="search-status" class="search-status" aria-live="polite">输入关键词后开始检索。</div>
+      <div id="search-results" class="search-results" role="list"></div>
+      <div class="search-actions">
+        <span id="search-selection-count">未选择结果</span>
+        <div>
+          <button id="search-submit" class="btn btn-primary" type="submit">检索</button>
+          <button id="search-select" class="btn btn-ghost" type="button" disabled>选中项加入采集箱</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="import-modal" class="modal">
     <form id="import-form" method="dialog">

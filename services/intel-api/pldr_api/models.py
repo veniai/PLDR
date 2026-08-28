@@ -218,3 +218,92 @@ class IntakeCandidate(Base):
     final_object_id: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     item: Mapped[IntakeItem] = relationship(back_populates="candidates")
+
+
+class SearchQueryRun(Base):
+    """A call to an external search backend; deliberately outside the formal dossier."""
+
+    __tablename__ = "external_search_query_runs"
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    keyword: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_keyword: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(20), index=True)
+    provider: Mapped[str] = mapped_column(String(60), nullable=False)
+    channel: Mapped[str] = mapped_column(String(100), nullable=False)
+    language: Mapped[str] = mapped_column(String(20), default="en")
+    status: Mapped[str] = mapped_column(String(20), default="ok", index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    results: Mapped[list["SearchResult"]] = relationship(
+        back_populates="query_run", cascade="all, delete-orphan", order_by="SearchResult.rank"
+    )
+
+
+class SearchResult(Base):
+    """Normalized search metadata. It is not Source, Document, or Evidence."""
+
+    __tablename__ = "external_search_results"
+    __table_args__ = (UniqueConstraint("query_run_id", "result_fingerprint", name="uq_search_result_in_run"),)
+    id: Mapped[str] = mapped_column(String(112), primary_key=True)
+    query_run_id: Mapped[str] = mapped_column(ForeignKey("external_search_query_runs.id"), index=True)
+    result_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(60), nullable=False)
+    channel: Mapped[str] = mapped_column(String(100), nullable=False)
+    original_url: Mapped[str] = mapped_column(String(900), nullable=False)
+    canonical_url: Mapped[str] = mapped_column(String(900), nullable=False)
+    site_name: Mapped[str] = mapped_column(String(200), default="")
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    snippet: Mapped[str] = mapped_column(Text, default="")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    engine: Mapped[str] = mapped_column(String(120), default="")
+    raw_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    query_run: Mapped[SearchQueryRun] = relationship(back_populates="results")
+    selection: Mapped["SearchSelection | None"] = relationship(
+        back_populates="result", uselist=False
+    )
+
+
+class SearchSelection(Base):
+    """Durable one-to-one link from an identified result URL to an intake item."""
+
+    __tablename__ = "external_search_selections"
+    id: Mapped[str] = mapped_column(String(112), primary_key=True)
+    result_id: Mapped[str] = mapped_column(ForeignKey("external_search_results.id"), index=True)
+    result_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    intake_item_id: Mapped[str] = mapped_column(ForeignKey("intake_items.id"), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="parsed", index=True)
+    outcome: Mapped[str] = mapped_column(String(30), default="added")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1)
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    result: Mapped[SearchResult] = relationship(back_populates="selection")
+    intake_item: Mapped[IntakeItem] = relationship()
+    events: Mapped[list["SearchSelectionEvent"]] = relationship(
+        back_populates="selection",
+        cascade="all, delete-orphan",
+        order_by="SearchSelectionEvent.created_at",
+    )
+
+
+class SearchSelectionEvent(Base):
+    """One analyst submission of an identified result, even when intake is reused."""
+
+    __tablename__ = "external_search_selection_events"
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    selection_id: Mapped[str] = mapped_column(
+        ForeignKey("external_search_selections.id"), index=True
+    )
+    query_run_id: Mapped[str] = mapped_column(
+        ForeignKey("external_search_query_runs.id"), index=True
+    )
+    result_id: Mapped[str] = mapped_column(ForeignKey("external_search_results.id"), index=True)
+    outcome: Mapped[str] = mapped_column(String(30), default="added")
+    trace_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    selection: Mapped[SearchSelection] = relationship(back_populates="events")

@@ -78,6 +78,15 @@ class IntakeCancelRequest(BaseModel):
     analyst:str=Field(default="analyst",min_length=1,max_length=160)
     reason:str=Field(default="Cancelled before confirmation",min_length=3,max_length=2000)
 
+class ExternalSearchRequest(BaseModel):
+    keyword:str=Field(min_length=2,max_length=400)
+    scope:Literal["news","web"]="web"
+    limit:int=Field(default=10,ge=5,le=20)
+    language:str=Field(default="en",min_length=2,max_length=20)
+
+class ExternalSearchSelectionRequest(BaseModel):
+    result_ids:list[str]=Field(min_length=1,max_length=20)
+
 class ModelTaskRequest(BaseModel):
     task:Literal["normalize_event_title","summarize_event","extract_entities_locations","extract_claims_evidence","draft_report","extract_intake_candidates"]
     payload:dict

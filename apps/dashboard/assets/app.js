@@ -12,6 +12,10 @@ const state = {
   intakeOptions: { events: [], entities: [] },
   selectedIntakeId: null,
   intakeDrafts: {},
+  searchRun: null,
+  searchResults: [],
+  searchError: "",
+  searchBusy: false,
   loading: false,
 };
 
@@ -39,7 +43,8 @@ const LABELS = {
     cancelled: "已撤销",
     failed: "采集失败",
   },
-  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS" },
+  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果" },
+  searchScope: { news: "新闻", web: "一般公开网页" },
 };
 
 function escapeHtml(value) {
@@ -86,7 +91,7 @@ async function api(path, options = {}) {
     payload = { detail: text || `HTTP ${response.status}` };
   }
   if (!response.ok) {
-    const detail = payload?.detail || payload?.message || `HTTP ${response.status}`;
+    const detail = payload?.detail?.message || payload?.detail || payload?.message || `HTTP ${response.status}`;
     throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
   return payload;
@@ -609,6 +614,183 @@ function setImportMode(mode) {
   $("#import-source").required = isTextMode || isFileMode;
 }
 
+function openExternalSearchModal() {
+  const modal = $("#search-modal");
+  if (typeof modal.showModal === "function") modal.showModal();
+  else modal.setAttribute("open", "");
+  renderSearchProvider();
+  $("#search-keyword").focus();
+}
+
+function closeExternalSearchModal() {
+  const modal = $("#search-modal");
+  if (typeof modal.close === "function") modal.close();
+  else modal.removeAttribute("open");
+}
+
+function renderSearchProvider() {
+  const search = state.config?.external_search || {};
+  const summary = $("#search-provider-summary");
+  if (!summary) return;
+  summary.className = `search-provider-summary ${search.configured ? "ok" : "warning"}`;
+  summary.innerHTML = `
+    <strong>${escapeHtml(search.component || search.provider || "外部检索后端")}</strong>
+    <span>${escapeHtml(search.version || "版本未知")} · ${escapeHtml(search.license || "许可证未知")}</span>
+    <small>${escapeHtml(search.deployment_boundary || "部署边界未知")}</small>
+    ${search.configured ? "" : `<em>${escapeHtml(search.error || "尚未配置；不会用演示数据伪装结果。")}</em>`}
+  `;
+}
+
+function searchSelectionLabel(result) {
+  const selection = result.selection;
+  if (!selection) return "未加入";
+  const status = LABELS.intakeStatus[selection.intake_status || selection.status] || selection.status;
+  if (selection.intake_status === "failed") return `${status} · 可重试`;
+  return status;
+}
+
+function renderSearchResults() {
+  const root = $("#search-results");
+  if (!root) return;
+  root.innerHTML = state.searchResults.length ? state.searchResults.map((result) => `
+    <article class="search-result ${result.selection ? "selected" : ""}" role="listitem">
+      <label class="search-select">
+        <input type="checkbox" value="${escapeHtml(result.id)}" ${result.selection ? "disabled" : ""}>
+        <span>${escapeHtml(searchSelectionLabel(result))}</span>
+      </label>
+      <div class="search-result-body">
+        <div class="search-result-meta">
+          <span>#${result.rank || "-"}</span>
+          <span>${escapeHtml(result.site || "未知站点")}</span>
+          <span>${escapeHtml(result.channel || result.provider || "未知渠道")}</span>
+          <span>${formatDate(result.published_at, true)}</span>
+        </div>
+        <h3>${escapeHtml(result.title || "无标题")}</h3>
+        ${result.snippet ? `<p>${escapeHtml(result.snippet)}</p>` : '<p class="muted">检索后端未返回摘要。</p>'}
+        <a href="${escapeHtml(result.original_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(result.original_url)}</a>
+        <div class="search-result-footer">
+          <small>查询运行：${escapeHtml(result.query_run_id || "未知")} · 结果：${escapeHtml(result.id || "未知")}</small>
+          ${result.selection?.retryable ? `<button class="btn btn-ghost warning" type="button" data-search-retry="${escapeHtml(result.id)}">重试抓取</button>` : ""}
+        </div>
+        ${result.selection?.last_error ? `<p class="validation-error">${escapeHtml(result.selection.last_error)}</p>` : ""}
+      </div>
+    </article>
+  `).join("") : '<div class="search-empty">没有匹配结果。PLDR 不会用演示数据填充空结果。</div>';
+  $$("input[type='checkbox']", root).forEach((input) => input.addEventListener("change", updateSearchSelectionCount));
+  updateSearchSelectionCount();
+}
+
+function updateSearchSelectionCount() {
+  const selected = $$("#search-results input[type='checkbox']:checked");
+  $("#search-select").disabled = state.searchBusy || selected.length === 0;
+  $("#search-selection-count").textContent = selected.length
+    ? `已选择 ${selected.length} / ${state.searchResults.length} 个结果`
+    : `共 ${state.searchResults.length} 个结果，未选择`;
+}
+
+async function submitExternalSearch(event) {
+  event.preventDefault();
+  if (state.searchBusy) return;
+  const keyword = $("#search-keyword").value.trim();
+  if (keyword.length < 2) {
+    $("#search-status").className = "search-status error";
+    $("#search-status").textContent = "请输入至少 2 个字符的关键词。";
+    return;
+  }
+  state.searchBusy = true;
+  state.searchError = "";
+  const submit = $("#search-submit");
+  submit.disabled = true;
+  submit.textContent = "检索中";
+  $("#search-select").disabled = true;
+  $("#search-status").className = "search-status";
+  $("#search-status").textContent = "正在调用外部检索后端…";
+  try {
+    const payload = await api("/pldr-api/v1/search", {
+      method: "POST",
+      body: JSON.stringify({
+        keyword,
+        scope: $("#search-scope").value,
+        language: $("#search-language").value,
+        limit: 10,
+      }),
+    });
+    state.searchRun = payload;
+    state.searchResults = payload.results || [];
+    $("#search-status").className = "search-status ok";
+    $("#search-status").textContent = `检索完成：${state.searchResults.length} 条结果 · ${payload.channel} · ${payload.latency_ms || 0} ms`;
+    renderSearchResults();
+  } catch (error) {
+    state.searchError = error.message;
+    state.searchResults = [];
+    $("#search-status").className = "search-status error";
+    $("#search-status").textContent = `检索失败：${error.message}。未生成演示结果。`;
+    renderSearchResults();
+  } finally {
+    state.searchBusy = false;
+    submit.disabled = false;
+    submit.textContent = "检索";
+    updateSearchSelectionCount();
+  }
+}
+
+async function submitSelectedSearchResults() {
+  const selectedIds = $$("#search-results input[type='checkbox']:checked").map((input) => input.value);
+  if (!selectedIds.length || state.searchBusy) return;
+  state.searchBusy = true;
+  const button = $("#search-select");
+  button.disabled = true;
+  button.textContent = "抓取选中项";
+  $("#search-status").className = "search-status";
+  $("#search-status").textContent = "只抓取勾选结果；搜索摘要不会进入证据链。";
+  try {
+    const payload = await api("/pldr-api/v1/search/select", {
+      method: "POST",
+      body: JSON.stringify({ result_ids: selectedIds }),
+    });
+    const updates = new Map((payload.results || []).map((entry) => [entry.result_id, entry.result]));
+    state.searchResults = state.searchResults.map((result) => updates.get(result.id) || result);
+    const failures = (payload.results || []).filter((entry) => entry.intake_status === "failed").length;
+    $("#search-status").className = `search-status ${failures ? "warning" : "ok"}`;
+    $("#search-status").textContent = failures
+      ? `已处理 ${payload.results?.length || 0} 项：${failures} 项抓取失败，错误已保留且可重试。`
+      : `已处理 ${payload.results?.length || 0} 项，采集箱保留完整查询到结果追踪。`;
+    renderSearchResults();
+    await refreshIntakeData();
+    toast("选中结果已进入待处理采集箱。", "success");
+  } catch (error) {
+    $("#search-status").className = "search-status error";
+    $("#search-status").textContent = `加入采集箱失败：${error.message}`;
+  } finally {
+    state.searchBusy = false;
+    button.textContent = "选中项加入采集箱";
+    updateSearchSelectionCount();
+  }
+}
+
+async function retryExternalSearchResult(resultId) {
+  if (state.searchBusy) return;
+  state.searchBusy = true;
+  $("#search-status").className = "search-status";
+  $("#search-status").textContent = "正在重试抓取原始页面…";
+  try {
+    const payload = await api(`/pldr-api/v1/search/results/${encodeURIComponent(resultId)}/retry`, { method: "POST" });
+    state.searchResults = state.searchResults.map((result) => (result.id === resultId ? payload.result : result));
+    $("#search-status").className = `search-status ${payload.intake_status === "failed" ? "warning" : "ok"}`;
+    $("#search-status").textContent = payload.intake_status === "failed"
+      ? `重试仍失败：${payload.error || payload.result?.selection?.last_error || "未知错误"}`
+      : "重试完成，条目仍需候选审核和人工确认。";
+    renderSearchResults();
+    await refreshIntakeData();
+  } catch (error) {
+    $("#search-status").className = "search-status error";
+    $("#search-status").textContent = `重试失败：${error.message}`;
+  } finally {
+    state.searchBusy = false;
+    updateSearchSelectionCount();
+  }
+}
+
 async function submitImport(event) {
   event.preventDefault();
   const mode = state.importMode;
@@ -673,7 +855,7 @@ function intakeStatusClass(status) {
 }
 
 function intakeTitle(item) {
-  return item.title || item.source?.description || item.file?.name || `${LABELS.inputType[item.input_type] || item.input_type}材料`;
+  return item.title || item.search?.search_title || item.source?.description || item.file?.name || `${LABELS.inputType[item.input_type] || item.input_type}材料`;
 }
 
 function candidateList(item, type) {
@@ -683,7 +865,7 @@ function candidateList(item, type) {
 function renderIntakeList() {
   const root = $("#intake-list");
   if (!root) return;
-  const activeCount = state.intakeItems.filter((item) => ["parsed", "candidate_ready", "generation_failed"].includes(item.status)).length;
+  const activeCount = state.intakeItems.filter((item) => ["parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status)).length;
   const badge = $("#intake-count");
   if (badge) badge.textContent = String(activeCount);
   $("#intake-summary").textContent = `${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`;
@@ -724,6 +906,7 @@ function renderIntakeDetail(item = null) {
       </div>
       ${item.error || item.candidate_generation?.error ? `<p>${escapeHtml(item.error || item.candidate_generation.error)}</p>` : ""}
       ${item.status === "generation_failed" ? '<div class="trace-links"><button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新生成候选</button></div>' : ""}
+      ${item.status === "failed" && item.search?.result_id ? `<div class="trace-links"><button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取原始页</button></div>` : ""}
     </article>
     ${renderIntakeFacts(item)}
     ${renderIntakeSnapshots(item)}
@@ -743,6 +926,14 @@ function renderIntakeFacts(item) {
       <div><dt>发布时间</dt><dd>${formatDate(item.published_at, true)}</dd></div>
       <div><dt>材料指纹</dt><dd>${escapeHtml(item.material?.extracted_hash || "未生成")}</dd></div>
       ${item.file?.name ? `<div><dt>文件</dt><dd>${escapeHtml(item.file.name)} · ${escapeHtml(item.file.media_type)} · ${item.file.size_bytes || 0} bytes</dd></div>` : ""}
+      ${item.search ? `
+        <div><dt>发现关键词</dt><dd>${escapeHtml(item.search.keyword || "未知")}</dd></div>
+        <div><dt>检索范围 / 渠道</dt><dd>${escapeHtml(LABELS.searchScope[item.search.scope] || item.search.scope || "未知")} · ${escapeHtml(item.search.channel || item.search.provider || "未知")}</dd></div>
+        <div><dt>搜索结果回链</dt><dd><a href="${escapeHtml(item.search.original_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.search.original_url)}</a></dd></div>
+        <div><dt>查询 / 结果</dt><dd>${escapeHtml(item.search.query_run_id || "未知")} → ${escapeHtml(item.search.result_id || "未知")} · 排名 ${item.search.rank ?? "未知"}</dd></div>
+        <div><dt>搜索摘要</dt><dd>${escapeHtml(item.search.search_snippet || "未返回；不作为证据")}</dd></div>
+        ${item.search_history?.length ? `<div><dt>历次查询与结果</dt><dd><ul class="search-trace-list">${item.search_history.map((trace) => `<li>${escapeHtml(trace.keyword || "未知关键词")} · ${escapeHtml(trace.channel || trace.provider || "未知渠道")} · ${formatDate(trace.selected_at, true)} · ${escapeHtml(trace.result_id || "未知结果")}</li>`).join("")}</ul></dd></div>` : ""}
+      ` : ""}
     </dl>`;
 }
 
@@ -965,6 +1156,21 @@ async function handleIntakeAction(action, domEvent = null) {
     }
     return;
   }
+  if (action === "retry-search") {
+    const searchResultId = domEvent?.target?.dataset?.searchResultId;
+    if (!searchResultId) {
+      toast("搜索结果追踪缺失，无法重试。", "error", 7000);
+      return;
+    }
+    try {
+      const result = await api(`/pldr-api/v1/search/results/${encodeURIComponent(searchResultId)}/retry`, { method: "POST" });
+      toast(result.intake_status === "failed" ? `重试仍失败：${result.error || "未知错误"}` : "原始页重试完成，等待候选审核。", result.intake_status === "failed" ? "error" : "success", 7000);
+      await refreshIntakeData();
+    } catch (error) {
+      toast(`原始页重试失败：${error.message}`, "error", 7000);
+    }
+    return;
+  }
   if (item.status !== "candidate_ready") return;
   try {
     if (action === "preview") {
@@ -1053,6 +1259,7 @@ async function refreshData({
     state.events = overview.events || [];
     state.sources = sources.items || [];
     state.config = config;
+    renderSearchProvider();
     state.intakeItems = intakeList.items || [];
     if (!state.selectedIntakeId) {
       state.selectedIntakeId = state.intakeItems.find((item) => item.status === "candidate_ready")?.id || null;
@@ -1100,6 +1307,7 @@ function bindEvents() {
   $("#contested-filter").addEventListener("change", applyFilters);
   $("#btn-refresh").addEventListener("click", () => refreshData());
   $("#btn-report").addEventListener("click", () => generateReport());
+  $("#btn-search").addEventListener("click", openExternalSearchModal);
   $("#btn-import").addEventListener("click", openImportModal);
   $("#btn-intake").addEventListener("click", () => openIntakeModal());
   $("#drawer-close").addEventListener("click", closeDrawer);
@@ -1109,9 +1317,17 @@ function bindEvents() {
   $("#import-close").addEventListener("click", closeImportModal);
   $("#import-cancel").addEventListener("click", closeImportModal);
   $("#import-form").addEventListener("submit", submitImport);
+  $("#search-close").addEventListener("click", closeExternalSearchModal);
+  $("#search-form").addEventListener("submit", submitExternalSearch);
+  $("#search-select").addEventListener("click", submitSelectedSearchResults);
   $("#intake-close").addEventListener("click", closeIntakeModal);
 
   document.addEventListener("click", (event) => {
+    const searchRetry = event.target.closest("[data-search-retry]");
+    if (searchRetry) {
+      retryExternalSearchResult(searchRetry.dataset.searchRetry);
+      return;
+    }
     const intakeNode = event.target.closest("[data-intake-id]");
     if (intakeNode) {
       state.selectedIntakeId = intakeNode.dataset.intakeId;
@@ -1150,6 +1366,7 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       if ($("#event-drawer").classList.contains("open")) closeDrawer();
+      else if ($("#search-modal").open) closeExternalSearchModal();
       else if ($("#intake-modal").open) closeIntakeModal();
       else if ($("#import-modal").open) closeImportModal();
     }
