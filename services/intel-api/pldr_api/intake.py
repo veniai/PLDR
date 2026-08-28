@@ -730,6 +730,7 @@ def validate_confirmation(
     candidates = _candidate_map(item)
     selected_claims = {decision.candidate_key for decision in request.claims if decision.action != "exclude"}
     selected_evidence = {decision.candidate_key for decision in request.evidence if decision.action == "include"}
+    final_event_id = request.merge_event_id if request.disposition == "merge" else None
     if not selected_claims:
         errors.append("At least one claim candidate must be selected")
     if not selected_evidence:
@@ -756,8 +757,11 @@ def validate_confirmation(
         if not decision.text.strip():
             errors.append(f"Claim text is required for {decision.candidate_key}")
         if decision.action == "merge":
-            if not decision.merge_claim_id or session.get(Claim, decision.merge_claim_id) is None:
+            claim_target = session.get(Claim, decision.merge_claim_id) if decision.merge_claim_id else None
+            if claim_target is None:
                 errors.append(f"Invalid claim merge target for {decision.candidate_key}")
+            elif final_event_id is None or claim_target.event_id != final_event_id:
+                errors.append(f"Claim merge target for {decision.candidate_key} must belong to the selected final event")
 
     relation_claim = {
         relation["from"]: relation["to"]
@@ -1076,6 +1080,8 @@ def confirm_intake(
             claim = session.get(Claim, decision.merge_claim_id)
             if claim is None:
                 raise ValueError(f"Claim merge target missing: {decision.merge_claim_id}")
+            if claim.event_id != event.id:
+                raise ValueError("Claim merge target must belong to the selected final event")
         else:
             claim = Claim(
                 id="clm_intake_" + uuid.uuid4().hex[:16],

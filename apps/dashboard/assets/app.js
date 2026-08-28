@@ -767,7 +767,7 @@ function renderConfirmedRecord(item, final) {
       <p>处置：${escapeHtml(item.disposition)} · 分析员：${escapeHtml(item.reviewed_by)} · 时间：${formatDate(item.reviewed_at, true)}</p>
       <div class="trace-links">
         <button class="text-btn" type="button" data-intake-action="open-event" data-event-target="${escapeHtml(final.event)}">打开正式事件</button>
-        <a href="/snapshots/${escapeHtml(final.document)}" target="_blank" rel="noopener">打开正式快照</a>
+        <a href="/snapshots/${escapeHtml(final.snapshot)}" target="_blank" rel="noopener">打开正式快照</a>
       </div>
       <pre>${escapeHtml(JSON.stringify(item.confirmation_result, null, 2))}</pre>
     </section>`;

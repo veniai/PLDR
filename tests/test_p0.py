@@ -15,7 +15,7 @@ os.environ.pop("PLDR_ADMIN_TOKEN", None)
 from fastapi.testclient import TestClient
 from pldr_api.database import Base, SessionLocal, engine
 from pldr_api.main import app
-from pldr_api.models import Document, Evidence, IntakeItem, Snapshot, Source
+from pldr_api.models import Claim, Document, Evidence, IntakeItem, Snapshot, Source
 from pldr_api.intake import confirm_intake, get_intake_item
 from pldr_api.schemas import IntakeConfirmationRequest
 from pldr_api.security import UnsafeUrlError, validate_public_http_url
@@ -146,6 +146,49 @@ class P0Test(unittest.TestCase):
             )
             groups = {source.independence_group for source in session.scalars(select(Source))}
             self.assertEqual(len(groups), 13)
+
+    def test_cross_event_claim_merge_is_rejected(self):
+        baseline = counts(SessionLocal())
+        submitted = self.client.post(
+            "/pldr-api/v1/intake/text",
+            json={
+                "text": "The cross-event audit note states that the port reopened after a safety inspection.",
+                "source_description": "Cross-event audit note",
+                "language": "en",
+            },
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        item = submitted.json()["intake_item"]
+        self.assertEqual(item["status"], "candidate_ready")
+        with SessionLocal() as session:
+            existing_claim = session.scalars(select(Claim).where(Claim.event_id == "evt_grounding")).first()
+            assert existing_claim is not None
+            existing_claim_id = existing_claim.id
+
+        request = self.confirmation_request(item, disposition="merge", merge_event_id="evt_queue")
+        request["claims"] = [
+            {
+                "candidate_key": self.candidate_map(item)["claim"]["candidate_key"],
+                "action": "merge",
+                "text": "Cross-event claim",
+                "status": "unverified",
+                "confidence": 0.5,
+                "temporal_scope": "",
+                "merge_claim_id": existing_claim_id,
+            }
+        ]
+        preview = self.client.post(f"/pldr-api/v1/intake/{item['id']}/preview", json=request)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertFalse(preview.json()["confirmable"])
+        self.assertIn("must belong to the selected final event", "; ".join(preview.json()["errors"]))
+
+        confirmation = self.client.post(f"/pldr-api/v1/intake/{item['id']}/confirm", json=request)
+        self.assertEqual(confirmation.status_code, 400, confirmation.text)
+        self.assertIn("must belong to the selected final event", confirmation.json()["detail"])
+        self.assertEqual(counts(SessionLocal()), baseline)
+        reopened = self.client.get(f"/pldr-api/v1/intake/{item['id']}")
+        self.assertEqual(reopened.json()["status"], "candidate_ready")
+        self.assertIsNone(reopened.json()["final_object_ids"]["event"])
 
     def test_duplicate_content_preserves_source_provenance(self):
         html = """
@@ -803,6 +846,7 @@ class P0Test(unittest.TestCase):
             '$("#import-file").disabled = !isFileMode;',
         ]:
             self.assertIn(control_state, script.text)
+        self.assertIn('href="/snapshots/${escapeHtml(final.snapshot)}"', script.text)
 
         styles = self.client.get("/assets/styles.css")
         self.assertEqual(styles.status_code, 200)
