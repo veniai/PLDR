@@ -172,24 +172,25 @@ async def request_brave_search(
     base_url = config.base_url.rstrip("/")
     resource_root = base_url if base_url.endswith("/res") else f"{base_url}/res"
     endpoint = f"{resource_root}/v1/{request.scope}/search"
-    params: dict[str, Any] = {
+    payload: dict[str, Any] = {
         "q": request.keyword,
         "count": request.limit,
         "search_lang": request.language,
         "country": "ALL",
         "safesearch": "strict",
-        "spellcheck": "false",
+        "spellcheck": False,
     }
     if request.scope == "web":
-        params["result_filter"] = "web"
-        params["decorators"] = "false"
+        payload["result_filter"] = ["web"]
+        payload["text_decorations"] = False
     headers = {
         "Accept": "application/json",
+        "Content-Type": "application/json",
         "X-Subscription-Token": config.api_key,
     }
     try:
         async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
-            response = await client.post(endpoint, params=params, headers=headers)
+            response = await client.post(endpoint, json=payload, headers=headers)
     except httpx.TimeoutException as exc:
         raise ExternalSearchError(
             f"Brave Search API timed out after {config.timeout_seconds:g}s",

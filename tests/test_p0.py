@@ -1039,8 +1039,8 @@ class P0Test(unittest.TestCase):
             async def __aexit__(self, *_):
                 return False
 
-            async def post(self, endpoint, params=None, headers=None):
-                calls.append(("POST", endpoint, params, headers))
+            async def post(self, endpoint, json=None, headers=None):
+                calls.append(("POST", endpoint, json, headers))
                 return ControlledResponse("news" if "/news/" in endpoint else "web")
 
             async def get(self, endpoint, params=None):
@@ -1070,10 +1070,20 @@ class P0Test(unittest.TestCase):
 
         self.assertEqual(calls[0][1], "https://api.search.brave.com/res/v1/news/search")
         self.assertEqual(calls[0][2]["q"], "adapter contract")
+        self.assertEqual(calls[0][2]["count"], 5)
+        self.assertEqual(calls[0][2]["search_lang"], "en")
+        self.assertEqual(calls[0][2]["country"], "ALL")
+        self.assertEqual(calls[0][2]["safesearch"], "strict")
+        self.assertIs(calls[0][2]["spellcheck"], False)
         self.assertNotIn("result_filter", calls[0][2])
+        self.assertNotIn("text_decorations", calls[0][2])
         self.assertEqual(calls[0][3]["X-Subscription-Token"], "test-key")
+        self.assertEqual(calls[0][3]["Accept"], "application/json")
+        self.assertEqual(calls[0][3]["Content-Type"], "application/json")
         self.assertEqual(calls[1][1], "https://api.search.brave.com/res/v1/web/search")
-        self.assertEqual(calls[1][2]["result_filter"], "web")
+        self.assertEqual(calls[1][2]["result_filter"], ["web"])
+        self.assertIs(calls[1][2]["text_decorations"], False)
+        self.assertNotIn("decorators", calls[1][2])
         self.assertEqual(calls[2][1], "http://127.0.0.1:8888/search")
         self.assertEqual(calls[2][2]["format"], "json")
         self.assertEqual(calls[2][2]["categories"], "news")
