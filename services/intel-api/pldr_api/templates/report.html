@@ -46,7 +46,7 @@
     <section class="event">
       <h2>{{ event.title }}</h2>
       <p class="summary">{{ event.summary }}</p>
-      <p class="meta">时间 {{ event.start_at }} · 地点 {{ event.location.name }} · 文档 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }} · 事件置信度 {{ (event.confidence * 100)|round|int }}%</p>
+      <p class="meta">时间 {{ event.start_at or "未知" }} · 地点 {{ event.location.name or "未知" }} · 文档 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }} · 事件置信度 {{ (event.confidence * 100)|round|int }}%</p>
 
       {% if event.assessment %}
       <h3>结构化研判</h3>
@@ -69,8 +69,8 @@
           <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ evidence.stance }}</strong><span>证据强度 {{ (evidence.strength * 100)|round|int }}%</span></div>
           <blockquote>{{ evidence.snippet }}</blockquote>
           <footer>
-            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>
-            <a href="{{ evidence.document.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
+            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>
+            <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
           </footer>
         </div>
         {% else %}
@@ -83,7 +83,7 @@
         <h3>关联资料</h3>
         {% for document in event.documents %}
         <div class="source-row">
-          <span>{{ document.source.name }} · {{ document.title }}</span>
+          <span>{{ document.source.name }} · {{ document.title or "未知标题" }}</span>
           <span class="hash">{{ document.content_hash[:18] }}…</span>
         </div>
         {% endfor %}

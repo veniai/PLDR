@@ -8,6 +8,10 @@ const state = {
   config: null,
   drawerTab: "overview",
   importMode: "url",
+  intakeItems: [],
+  intakeOptions: { events: [], entities: [] },
+  selectedIntakeId: null,
+  intakeDrafts: {},
   loading: false,
 };
 
@@ -26,6 +30,16 @@ const LABELS = {
   stance: { supports: "支持", contradicts: "冲突", context: "背景" },
   source: { healthy: "正常", stale: "陈旧", error: "异常", disabled: "停用" },
   mode: { "curated-demo": "人工整理演示", live: "实时专题", cached: "缓存专题" },
+  intakeStatus: {
+    parsed: "已解析",
+    candidate_ready: "候选待审",
+    generation_failed: "生成失败",
+    confirmed: "已确认入档",
+    rejected: "已驳回",
+    cancelled: "已撤销",
+    failed: "采集失败",
+  },
+  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS" },
 };
 
 function escapeHtml(value) {
@@ -59,8 +73,9 @@ function percent(value) {
 }
 
 async function api(path, options = {}) {
+  const isFormData = options.body instanceof FormData;
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: isFormData ? {} : { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
   const text = await response.text();
@@ -136,11 +151,13 @@ function renderTopic() {
 
 function renderMetrics() {
   const metrics = state.overview?.metrics || {};
+  const intake = state.overview?.intake || {};
   const items = [
     ["events", metrics.events ?? 0, "事件"],
     ["documents", metrics.documents ?? 0, "文档"],
     ["independence", metrics.independence_groups ?? 0, "独立源组"],
     ["contested", metrics.contested_claims ?? 0, "争议主张"],
+    ["intake", intake.candidate_ready ?? 0, "待审材料"],
   ];
   $("#metrics").innerHTML = items.map(([key, value, label]) => `
     <div class="metric-card ${key}">
@@ -416,7 +433,7 @@ function renderClaimsTab(event) {
           <div class="claim-meta">
             <span class="claim-status">${LABELS.claim[claim.status] || escapeHtml(claim.status)}</span>
             <span>置信度 ${percent(claim.confidence)}</span>
-            <span>${escapeHtml(claim.origin)}</span>
+            <span>${claim.origin === "human-confirmed" ? "人工确认" : escapeHtml(claim.origin)}</span>
           </div>
           <h3>${escapeHtml(claim.text)}</h3>
         </div>
@@ -432,7 +449,7 @@ function renderClaimsTab(event) {
             <blockquote>${escapeHtml(evidence.snippet)}</blockquote>
             <footer>
               <span>${escapeHtml(evidence.document.source.name)} · ${formatDate(evidence.document.published_at)}</span>
-              <a href="${escapeHtml(withEventContext(evidence.document.snapshot_url, event.id))}" target="_blank" rel="noopener">查看证据快照 ↗</a>
+              <a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document.snapshot_url, event.id))}" target="_blank" rel="noopener">查看证据快照 ↗</a>
             </footer>
           </article>`).join("") : '<p class="muted">该主张尚未连接原文证据。</p>'}
       </div>
@@ -465,7 +482,7 @@ function renderDocumentsTab(event) {
                 <span>${escapeHtml(document.language)}</span>
                 ${duplicate ? '<span class="duplicate-chip">转载折叠</span>' : ""}
               </div>
-              <h3>${escapeHtml(document.title)}</h3>
+                <h3>${escapeHtml(document.title || "未知标题")}</h3>
               <p>${formatDate(document.published_at, true)} · 抓取 ${formatDate(document.fetched_at, true)}</p>
               <small>SHA-256 ${escapeHtml(document.content_hash.slice(0, 18))}… · ${escapeHtml(document.source.independence_group)}</small>
             </div>
@@ -572,42 +589,427 @@ function closeImportModal() {
 function setImportMode(mode) {
   state.importMode = mode;
   $$(".import-tab").forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
+  const isUrlMode = mode === "url" || mode === "rss";
+  const isTextMode = mode === "text";
+  const isFileMode = mode === "file";
   $("#import-url-label").textContent = mode === "rss" ? "RSS / Atom 地址" : "公开网页地址";
   $("#import-url").placeholder = mode === "rss" ? "https://example.org/feed.xml" : "https://example.org/article";
-  $("#import-title-field").hidden = mode === "rss";
+  $("#import-url").required = isUrlMode;
+  $("#import-url").disabled = !isUrlMode;
+  $("#import-url-field").hidden = !isUrlMode;
+  $("#import-text").required = isTextMode;
+  $("#import-text").disabled = !isTextMode;
+  $("#import-text-field").hidden = !isTextMode;
+  $("#import-file").required = isFileMode;
+  $("#import-file").disabled = !isFileMode;
+  $("#import-file-field").hidden = !isFileMode;
+  $("#import-title-field").hidden = mode === "rss" || mode === "file";
+  $("#import-published-field").hidden = mode !== "text";
+  $("#import-source-label").textContent = mode === "url" || mode === "rss" ? "来源说明" : "来源说明（必填）";
+  $("#import-source").required = isTextMode || isFileMode;
 }
 
 async function submitImport(event) {
   event.preventDefault();
+  const mode = state.importMode;
   const url = $("#import-url").value.trim();
   const sourceName = $("#import-source").value.trim();
   const language = $("#import-language").value;
   const title = $("#import-title").value.trim();
+  const published = $("#import-published").value;
   const submit = $("#import-submit");
   submit.disabled = true;
   submit.textContent = "正在抓取";
   $("#import-result").className = "import-result";
-  $("#import-result").textContent = "正在校验地址并提取正文…";
+  $("#import-result").textContent = "正在保存材料并生成可核验候选…";
 
   try {
-    const endpoint = state.importMode === "rss"
-      ? "/pldr-api/v1/import/rss"
-      : "/pldr-api/v1/import/url";
-    const body = state.importMode === "rss"
-      ? { url, source_name: sourceName || "Imported RSS", language }
-      : { url, source_name: sourceName || null, title: title || null, language };
-    const result = await api(endpoint, { method: "POST", body: JSON.stringify(body) });
-    const count = state.importMode === "rss" ? result.count : 1;
+    let result;
+    if (mode === "file") {
+      const file = $("#import-file").files[0];
+      if (!file) throw new Error("请选择一个本地文件。");
+      const body = new FormData();
+      body.append("file", file);
+      body.append("source_description", sourceName);
+      body.append("language", language);
+      result = await api("/pldr-api/v1/intake/files", { method: "POST", body });
+    } else if (mode === "text") {
+      const body = {
+        text: $("#import-text").value,
+        source_description: sourceName,
+        title: title || null,
+        published_at: published ? new Date(published).toISOString() : null,
+        language,
+      };
+      result = await api("/pldr-api/v1/intake/text", { method: "POST", body: JSON.stringify(body) });
+    } else if (mode === "rss") {
+      const body = { url, source_name: sourceName || "Imported RSS", language };
+      result = await api("/pldr-api/v1/import/rss", { method: "POST", body: JSON.stringify(body) });
+    } else {
+      const body = { url, source_name: sourceName || null, title: title || null, language };
+      result = await api("/pldr-api/v1/import/url", { method: "POST", body: JSON.stringify(body) });
+    }
+    const items = result.intake_items || [result.intake_item].filter(Boolean);
+    const count = items.length;
     $("#import-result").className = "import-result success";
-    $("#import-result").textContent = `已入库 ${count} 篇资料。当前资料等待人工归并到事件。`;
-    toast(`资料导入成功：${count} 篇`, "success");
+    $("#import-result").textContent = `已形成 ${count} 个采集箱条目；候选和正式区保持隔离。`;
+    toast(`材料已进入待处理采集箱：${count} 条`, "success");
     await refreshData({ keepSelection: true, quiet: true });
+    if (items[0]) await openIntakeModal(items[0].id, true);
   } catch (error) {
     $("#import-result").className = "import-result error";
     $("#import-result").textContent = error.message;
   } finally {
     submit.disabled = false;
-    submit.textContent = "抓取并入库";
+    submit.textContent = "提交到采集箱";
+  }
+}
+
+function intakeStatusClass(status) {
+  if (status === "candidate_ready") return "success";
+  if (status === "confirmed") return "info";
+  if (["failed", "generation_failed", "rejected"].includes(status)) return "warning";
+  return "";
+}
+
+function intakeTitle(item) {
+  return item.title || item.source?.description || item.file?.name || `${LABELS.inputType[item.input_type] || item.input_type}材料`;
+}
+
+function candidateList(item, type) {
+  return (item.candidates || []).filter((candidate) => candidate.object_type === type);
+}
+
+function renderIntakeList() {
+  const root = $("#intake-list");
+  if (!root) return;
+  const activeCount = state.intakeItems.filter((item) => ["parsed", "candidate_ready", "generation_failed"].includes(item.status)).length;
+  const badge = $("#intake-count");
+  if (badge) badge.textContent = String(activeCount);
+  $("#intake-summary").textContent = `${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`;
+  root.innerHTML = state.intakeItems.length ? state.intakeItems.map((item) => `
+    <button class="intake-item ${item.id === state.selectedIntakeId ? "active" : ""}" type="button" role="listitem" data-intake-id="${escapeHtml(item.id)}">
+      <span class="intake-type">${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</span>
+      <strong>${escapeHtml(intakeTitle(item))}</strong>
+      <small>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)} · ${formatDate(item.created_at, true)}</small>
+      ${item.error ? `<em>${escapeHtml(item.error)}</em>` : ""}
+    </button>
+  `).join("") : '<p class="muted intake-empty">采集箱暂无条目。</p>';
+}
+
+function renderIntakeDetail(item = null) {
+  const root = $("#intake-detail");
+  if (!root) return;
+  if (!item) {
+    root.innerHTML = '<div class="panel-empty">请选择一个采集箱条目查看材料、候选和人工处置。</div>';
+    return;
+  }
+  if (item.status === "candidate_ready") {
+    root.innerHTML = renderIntakeReview(item);
+    return;
+  }
+  const machineCandidates = (item.candidates || []).map((candidate) => `
+    <article class="candidate-card readonly">
+      <header><b>${escapeHtml(candidate.object_type)}</b><span>${escapeHtml(candidate.source_mode)}</span></header>
+      <pre>${escapeHtml(JSON.stringify(candidate.machine, null, 2))}</pre>
+      ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}</p>` : ""}
+    </article>
+  `).join("");
+  const final = item.final_object_ids || {};
+  root.innerHTML = `
+    <article class="intake-status-card ${intakeStatusClass(item.status)}">
+      <div>
+        <span>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)}</span>
+        <strong>${escapeHtml(intakeTitle(item))}</strong>
+      </div>
+      ${item.error || item.candidate_generation?.error ? `<p>${escapeHtml(item.error || item.candidate_generation.error)}</p>` : ""}
+      ${item.status === "generation_failed" ? '<div class="trace-links"><button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新生成候选</button></div>' : ""}
+    </article>
+    ${renderIntakeFacts(item)}
+    ${renderIntakeSnapshots(item)}
+    ${machineCandidates ? `<section class="candidate-stack"><h3>机器候选保留</h3>${machineCandidates}</section>` : ""}
+    ${item.status === "confirmed" ? renderConfirmedRecord(item, final) : ""}
+    ${item.rejection_reason ? `<p class="validation-error">驳回原因：${escapeHtml(item.rejection_reason)}</p>` : ""}
+  `;
+}
+
+function renderIntakeFacts(item) {
+  return `
+    <dl class="intake-facts">
+      <div><dt>输入类型</dt><dd>${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</dd></div>
+      <div><dt>来源说明</dt><dd>${escapeHtml(item.source?.description || "未知来源")}</dd></div>
+      <div><dt>原始地址</dt><dd>${escapeHtml(item.source?.canonical_url || item.source?.url || "未知地址")}</dd></div>
+      <div><dt>标题</dt><dd>${escapeHtml(item.title || "未知标题")}</dd></div>
+      <div><dt>发布时间</dt><dd>${formatDate(item.published_at, true)}</dd></div>
+      <div><dt>材料指纹</dt><dd>${escapeHtml(item.material?.extracted_hash || "未生成")}</dd></div>
+      ${item.file?.name ? `<div><dt>文件</dt><dd>${escapeHtml(item.file.name)} · ${escapeHtml(item.file.media_type)} · ${item.file.size_bytes || 0} bytes</dd></div>` : ""}
+    </dl>`;
+}
+
+function renderIntakeSnapshots(item) {
+  const raw = item.material?.raw_snapshot || "";
+  const extracted = item.material?.extracted_snapshot || "";
+  return `
+    <details class="snapshot-box" open>
+      <summary>提取文本快照（SHA-256 ${escapeHtml(item.material?.extracted_hash || "未知")}）</summary>
+      <pre>${escapeHtml(extracted)}</pre>
+    </details>
+    <details class="snapshot-box">
+      <summary>原始输入快照（SHA-256 ${escapeHtml(item.material?.raw_hash || "未知")}${item.material?.raw_encoding ? ` · ${escapeHtml(item.material.raw_encoding)}` : ""}）</summary>
+      <pre>${escapeHtml(raw)}</pre>
+    </details>`;
+}
+
+function renderConfirmedRecord(item, final) {
+  return `
+    <section class="confirmed-trace">
+      <h3>人工确认与回链</h3>
+      <p>处置：${escapeHtml(item.disposition)} · 分析员：${escapeHtml(item.reviewed_by)} · 时间：${formatDate(item.reviewed_at, true)}</p>
+      <div class="trace-links">
+        <button class="text-btn" type="button" data-intake-action="open-event" data-event-target="${escapeHtml(final.event)}">打开正式事件</button>
+        <a href="/snapshots/${escapeHtml(final.snapshot)}" target="_blank" rel="noopener">打开正式快照</a>
+      </div>
+      <pre>${escapeHtml(JSON.stringify(item.confirmation_result, null, 2))}</pre>
+    </section>`;
+}
+
+function renderIntakeReview(item) {
+  const event = candidateList(item, "event")[0]?.machine?.fields || {};
+  const entities = candidateList(item, "entity");
+  const claims = candidateList(item, "claim");
+  const evidence = candidateList(item, "evidence");
+  const eventOptions = state.intakeOptions.events || [];
+  const entityOptions = state.intakeOptions.entities || [];
+  return `
+    ${renderIntakeFacts(item)}
+    ${renderIntakeSnapshots(item)}
+    <form class="review-form" data-review-form="${escapeHtml(item.id)}">
+      <section class="review-section">
+        <h3>人工处置</h3>
+        <div class="review-grid">
+          <label><span>处置方式</span>
+            <select id="intake-disposition">
+              <option value="create">新建正式事件</option>
+              <option value="merge">合并到既有事件</option>
+              <option value="modify">修改候选后新建</option>
+            </select>
+          </label>
+          <label><span>合并目标事件</span>
+            <select id="intake-merge-event"><option value="">请选择既有事件</option>${eventOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.title)}</option>`).join("")}</select>
+          </label>
+          <label><span>分析员</span><input id="intake-analyst" value="analyst" maxlength="160"></label>
+        </div>
+      </section>
+      <section class="review-section">
+        <h3>候选事件修改</h3>
+        <div class="review-grid">
+          <label><span>标题（未知必须由人工补实）</span><input id="intake-event-title" value="${escapeHtml(event.title || "")}" maxlength="500"></label>
+          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(event.event_time || item.published_at || "")}" placeholder="YYYY-MM-DDTHH:MM:SSZ"></label>
+          <label><span>地点（未知留空）</span><input id="intake-event-location" value="${escapeHtml(event.location_name || "")}" maxlength="200"></label>
+          <label><span>重要性</span><select id="intake-event-importance"><option value="medium">中</option><option value="high">高</option><option value="critical">极高</option><option value="low">低</option></select></label>
+        </div>
+        <label><span>摘要</span><textarea id="intake-event-summary" rows="4">${escapeHtml(event.summary || "")}</textarea></label>
+      </section>
+      ${entities.length ? `<section class="review-section"><h3>候选实体</h3>${entities.map((candidate) => `
+        <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
+          <div class="review-grid">
+            <label><span>名称</span><input data-entity-field="name" value="${escapeHtml(candidate.machine?.fields?.name || "")}"></label>
+            <label><span>类型</span><input data-entity-field="entity_type" value="${escapeHtml(candidate.machine?.fields?.entity_type || "organization")}"></label>
+            <label><span>角色</span><input data-entity-field="role" value="${escapeHtml(candidate.machine?.fields?.role || "related")}"></label>
+            <label><span>处置</span><select data-entity-field="action"><option value="create">新建</option><option value="merge">合并</option><option value="exclude">排除</option></select></label>
+            <label><span>合并目标实体</span><select data-entity-field="merge_entity_id"><option value="">请选择实体</option>${entityOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.name)}</option>`).join("")}</select></label>
+          </div>
+        </div>`).join("")}</section>` : ""}
+      <section class="review-section"><h3>候选主张</h3>${claims.map((candidate) => `
+        <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
+          <label><span>主张文本</span><textarea data-claim-field="text" rows="3">${escapeHtml(candidate.machine?.fields?.text || "")}</textarea></label>
+          <div class="review-grid">
+            <label><span>状态</span><select data-claim-field="status"><option value="unverified">待核实</option><option value="supported">有支持</option><option value="contested">存在冲突</option></select></label>
+            <label><span>处置</span><select data-claim-field="action"><option value="create">新建</option><option value="exclude">排除</option></select></label>
+          </div>
+        </div>`).join("") || '<p class="muted">机器未提出主张候选；未知保持未知。</p>'}</section>
+      <section class="review-section"><h3>候选证据（必须精确命中原句）</h3>${evidence.map((candidate) => `
+        <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
+          <label><span>原文片段</span><textarea data-evidence-field="snippet" rows="3">${escapeHtml(candidate.machine?.fields?.snippet || "")}</textarea></label>
+          <div class="review-grid">
+            <label><span>立场</span><select data-evidence-field="stance"><option value="context">背景</option><option value="supports">支持</option><option value="contradicts">冲突</option></select></label>
+            <label><span>处置</span><select data-evidence-field="action"><option value="include">纳入</option><option value="exclude">排除</option></select></label>
+          </div>
+          ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${candidate.machine?.fields?.start_offset}-${candidate.machine?.fields?.end_offset}</p>`}
+        </div>`).join("")}</section>
+      <section class="review-section">
+        <h3>驳回</h3>
+        <label><span>驳回原因</span><textarea id="intake-reject-reason" rows="2" placeholder="填写原因后执行驳回"></textarea></label>
+      </section>
+      <div id="intake-preview" class="intake-preview" aria-live="polite"></div>
+      <div class="review-actions">
+        <button class="btn btn-ghost" type="button" data-intake-action="preview">预览入档</button>
+        <button class="btn btn-ghost warning" type="button" data-intake-action="cancel">撤销处理</button>
+        <button class="btn btn-danger" type="button" data-intake-action="reject">驳回</button>
+        <button class="btn btn-primary" type="button" data-intake-action="confirm">确认入档</button>
+      </div>
+    </form>`;
+}
+
+async function refreshIntakeData() {
+  const [list, options] = await Promise.all([
+    api("/pldr-api/v1/intake?limit=200"),
+    api("/pldr-api/v1/intake/options"),
+  ]);
+  state.intakeItems = list.items || [];
+  state.intakeOptions = options || { events: [], entities: [] };
+  renderIntakeList();
+  renderIntakeDetail(state.intakeItems.find((item) => item.id === state.selectedIntakeId) || state.intakeItems[0]);
+}
+
+async function openIntakeModal(itemId = null, quiet = false) {
+  const modal = $("#intake-modal");
+  if (!quiet && typeof modal.showModal === "function") modal.showModal();
+  else if (!quiet) modal.setAttribute("open", "");
+  await refreshIntakeData();
+  const target = itemId || state.selectedIntakeId || state.intakeItems.find((item) => item.status === "candidate_ready")?.id || state.intakeItems[0]?.id;
+  state.selectedIntakeId = target || null;
+  renderIntakeList();
+  renderIntakeDetail(state.intakeItems.find((item) => item.id === target));
+}
+
+function closeIntakeModal() {
+  const modal = $("#intake-modal");
+  if (typeof modal.close === "function") modal.close();
+  else modal.removeAttribute("open");
+}
+
+function selectedIntakeItem() {
+  return state.intakeItems.find((item) => item.id === state.selectedIntakeId) || null;
+}
+
+function buildConfirmation(item) {
+  const value = (selector) => ($(selector)?.value || "").trim();
+  const entityGroups = new Map();
+  if ($$("[data-entity-field]").length) {
+    $$("[data-entity-field]").forEach((input) => {
+      const root = input.closest("[data-candidate]");
+      const key = root.dataset.candidate;
+      entityGroups.set(key, { ...(entityGroups.get(key) || {}), [input.dataset.entityField]: input.value });
+    });
+  }
+  const entities = [...entityGroups.entries()].map(([candidate_key, fields]) => ({
+      candidate_key,
+      action: fields.action || "create",
+      name: fields.name || "",
+      entity_type: fields.entity_type || "organization",
+      aliases: [],
+      role: fields.role || "related",
+      merge_entity_id: fields.merge_entity_id || null,
+  }));
+  const claimGroups = new Map();
+  $$("[data-claim-field]").forEach((input) => {
+    const key = input.closest("[data-candidate]")?.dataset.candidate;
+    claimGroups.set(key, { ...(claimGroups.get(key) || {}), [input.dataset.claimField]: input.value });
+  });
+  const evidenceGroups = new Map();
+  $$("[data-evidence-field]").forEach((input) => {
+    const key = input.closest("[data-candidate]")?.dataset.candidate;
+    evidenceGroups.set(key, { ...(evidenceGroups.get(key) || {}), [input.dataset.evidenceField]: input.value });
+  });
+  return {
+    disposition: value("#intake-disposition") || "create",
+    analyst: value("#intake-analyst") || "analyst",
+    merge_event_id: value("#intake-merge-event") || null,
+    event: {
+      title: value("#intake-event-title"),
+      summary: value("#intake-event-summary"),
+      event_type: "incident",
+      start_at: value("#intake-event-start") || null,
+      location_name: value("#intake-event-location") || "Unknown",
+      importance: value("#intake-event-importance") || "medium",
+    },
+    entities,
+    claims: [...claimGroups.entries()].map(([candidate_key, fields]) => ({
+      candidate_key,
+      action: fields.action || "create",
+      text: fields.text || "",
+      status: fields.status || "unverified",
+      confidence: 0.5,
+      temporal_scope: "",
+      merge_claim_id: null,
+    })),
+    evidence: [...evidenceGroups.entries()].map(([candidate_key, fields]) => ({
+      candidate_key,
+      action: fields.action || "include",
+      snippet: fields.snippet || "",
+      stance: fields.stance || "context",
+      strength: 0.7,
+      note: "",
+    })),
+  };
+}
+
+async function handleIntakeAction(action, domEvent = null) {
+  const item = selectedIntakeItem();
+  if (!item) return;
+  if (action === "open-event") {
+    const eventId = domEvent?.target?.dataset?.eventTarget;
+    closeIntakeModal();
+    await selectEvent(eventId, { open: true });
+    return;
+  }
+  if (action === "regenerate") {
+    try {
+      await api(`/pldr-api/v1/intake/${item.id}/regenerate`, { method: "POST" });
+      toast("候选已重新生成。", "success");
+      await refreshIntakeData();
+      renderIntakeDetail(selectedIntakeItem());
+    } catch (error) {
+      toast(`候选重新生成失败：${error.message}`, "error", 7000);
+    }
+    return;
+  }
+  if (item.status !== "candidate_ready") return;
+  try {
+    if (action === "preview") {
+      const preview = await api(`/pldr-api/v1/intake/${item.id}/preview`, {
+        method: "POST",
+        body: JSON.stringify(buildConfirmation(item)),
+      });
+      const root = $("#intake-preview");
+      root.className = `intake-preview ${preview.confirmable ? "ok" : "error"}`;
+      root.innerHTML = `
+        <strong>${preview.confirmable ? "可以确认入档" : "当前不可确认"}</strong>
+        ${preview.errors?.length ? `<ul>${preview.errors.map((error) => `<li>${escapeHtml(error)}</li>`).join("")}</ul>` : ""}
+        <pre>${escapeHtml(JSON.stringify(preview.formal, null, 2))}</pre>`;
+      return;
+    }
+    if (action === "confirm") {
+      const result = await api(`/pldr-api/v1/intake/${item.id}/confirm`, {
+        method: "POST",
+        body: JSON.stringify(buildConfirmation(item)),
+      });
+      toast(`已原子入档：${result.result.formal_object_ids.event}`, "success");
+      await refreshData({ keepSelection: false, quiet: true, preferredEventId: result.result.formal_object_ids.event });
+      await refreshIntakeData();
+      renderIntakeDetail(selectedIntakeItem());
+      return;
+    }
+    if (action === "reject") {
+      const reason = $("#intake-reject-reason")?.value.trim();
+      if (!reason) throw new Error("请填写驳回原因。");
+      await api(`/pldr-api/v1/intake/${item.id}/reject`, {
+        method: "POST",
+        body: JSON.stringify({ analyst: $("#intake-analyst")?.value.trim() || "analyst", reason }),
+      });
+      toast("候选已驳回，未写入正式区。", "success");
+    } else if (action === "cancel") {
+      await api(`/pldr-api/v1/intake/${item.id}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ analyst: $("#intake-analyst")?.value.trim() || "analyst", reason: "Analyst cancelled before confirmation" }),
+      });
+      toast("处理已撤销，未写入正式区。", "success");
+    }
+    await refreshData({ keepSelection: true, quiet: true });
+    await refreshIntakeData();
+  } catch (error) {
+    toast(`采集箱操作失败：${error.message}`, "error", 7000);
   }
 }
 
@@ -641,15 +1043,21 @@ async function refreshData({
   const previousSelection = keepSelection ? state.selectedId : null;
   if (!quiet) setBusy(true, "正在刷新专题");
   try {
-    const [overview, sources, config] = await Promise.all([
+    const [overview, sources, config, intakeList] = await Promise.all([
       api("/pldr-api/v1/overview"),
       api("/pldr-api/v1/sources/health"),
       api("/pldr-api/v1/config").catch(() => null),
+      api("/pldr-api/v1/intake?limit=200").catch(() => ({ items: [] })),
     ]);
     state.overview = overview;
     state.events = overview.events || [];
     state.sources = sources.items || [];
     state.config = config;
+    state.intakeItems = intakeList.items || [];
+    if (!state.selectedIntakeId) {
+      state.selectedIntakeId = state.intakeItems.find((item) => item.status === "candidate_ready")?.id || null;
+    }
+    renderIntakeList();
     renderTopic();
     renderMetrics();
     renderSources();
@@ -693,6 +1101,7 @@ function bindEvents() {
   $("#btn-refresh").addEventListener("click", () => refreshData());
   $("#btn-report").addEventListener("click", () => generateReport());
   $("#btn-import").addEventListener("click", openImportModal);
+  $("#btn-intake").addEventListener("click", () => openIntakeModal());
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer-backdrop").addEventListener("click", closeDrawer);
   $("#drawer-report").addEventListener("click", () => generateReport());
@@ -700,8 +1109,21 @@ function bindEvents() {
   $("#import-close").addEventListener("click", closeImportModal);
   $("#import-cancel").addEventListener("click", closeImportModal);
   $("#import-form").addEventListener("submit", submitImport);
+  $("#intake-close").addEventListener("click", closeIntakeModal);
 
   document.addEventListener("click", (event) => {
+    const intakeNode = event.target.closest("[data-intake-id]");
+    if (intakeNode) {
+      state.selectedIntakeId = intakeNode.dataset.intakeId;
+      renderIntakeList();
+      renderIntakeDetail(selectedIntakeItem());
+      return;
+    }
+    const intakeAction = event.target.closest("[data-intake-action]");
+    if (intakeAction) {
+      handleIntakeAction(intakeAction.dataset.intakeAction, event);
+      return;
+    }
     const eventNode = event.target.closest("[data-event-id]");
     if (eventNode) {
       selectEvent(eventNode.dataset.eventId, { open: true });
@@ -728,6 +1150,7 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       if ($("#event-drawer").classList.contains("open")) closeDrawer();
+      else if ($("#intake-modal").open) closeIntakeModal();
       else if ($("#import-modal").open) closeImportModal();
     }
     const card = event.target.closest?.(".event-card");
