@@ -1,0 +1,24 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "PLDR P1 Reliable Collection Workbench": {
+      "versions": [
+        {
+          "path": "prototype.html",
+          "createdAt": "2026-08-29T07:03:42.251Z",
+          "status": "approved",
+          "subtitle": "Evidence-first attention queue, source runs, snapshot diff and human review",
+          "viewport": {
+            "width": 1440,
+            "height": 900
+          },
+          "section": "Product Prototypes"
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-08-29T07:03:42.251Z",
+  "updatedAt": "2026-08-29T07:03:42.251Z"
+}

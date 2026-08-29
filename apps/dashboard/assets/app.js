@@ -16,6 +16,15 @@ const state = {
   searchResults: [],
   searchError: "",
   searchBusy: false,
+  collectionSummary: null,
+  collectionTargets: [],
+  selectedCollectionTargetId: null,
+  selectedCollectionTarget: null,
+  collectionDiff: null,
+  collectionBusy: false,
+  collectionRequestSerial: 0,
+  collectionDiffRequestSerial: 0,
+  collectionPollTimer: null,
   loading: false,
 };
 
@@ -43,8 +52,29 @@ const LABELS = {
     cancelled: "已撤销",
     failed: "采集失败",
   },
-  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果" },
+  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果", collection: "固定网页版本" },
   searchScope: { news: "新闻", web: "一般公开网页" },
+  collectionStatus: {
+    healthy: "正常",
+    new: "待首次运行",
+    degraded: "连续失败",
+    error: "异常",
+    paused: "已暂停",
+    pending: "待首次运行",
+    stale: "逾期未采集",
+  },
+  collectionRun: {
+    queued: "等待运行",
+    running: "正在抓取",
+    succeeded: "抓取成功",
+    failed: "抓取失败",
+  },
+  collectionOutcome: {
+    baseline: "首次版本",
+    changed: "正文变化",
+    unchanged: "正文未变",
+    failed: "抓取失败",
+  },
 };
 
 function escapeHtml(value) {
@@ -157,13 +187,17 @@ function renderTopic() {
 function renderMetrics() {
   const metrics = state.overview?.metrics || {};
   const intake = state.overview?.intake || {};
+  const collection = state.collectionSummary?.metrics || state.collectionSummary || {};
+  const changed = collection.changed_pending ?? collection.pending_changes ?? collection.pending_review ?? collection.changed ?? 0;
   const items = [
     ["events", metrics.events ?? 0, "事件"],
     ["documents", metrics.documents ?? 0, "文档"],
     ["independence", metrics.independence_groups ?? 0, "独立源组"],
     ["contested", metrics.contested_claims ?? 0, "争议主张"],
     ["intake", intake.candidate_ready ?? 0, "待审材料"],
+    ["collection", changed, "监测待审"],
   ];
+  $("#collection-alert-count").textContent = String(changed);
   $("#metrics").innerHTML = items.map(([key, value, label]) => `
     <div class="metric-card ${key}">
       <strong>${escapeHtml(value)}</strong>
@@ -917,6 +951,15 @@ function renderIntakeDetail(item = null) {
 }
 
 function renderIntakeFacts(item) {
+  const collection = item.collection || item.review?.collection || null;
+  const collectionBoundary = {
+    confirmed: "已由人工确认并进入正式档案；证据固定到本版本快照。",
+    rejected: "已由人工驳回，未进入正式档案。",
+    cancelled: "已由人工撤销，未进入正式档案。",
+    generation_failed: "材料已保存，但候选生成失败；尚未进入正式档案，可重新生成。",
+    parsed: "材料已保存，尚未生成可审核候选；未进入正式档案。",
+    failed: "本材料处理失败，未进入正式档案。",
+  }[item.status] || "机器候选，尚未人工确认；修改表示修改候选后新建，不会直接改写既有正式事件。";
   return `
     <dl class="intake-facts">
       <div><dt>输入类型</dt><dd>${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</dd></div>
@@ -926,6 +969,11 @@ function renderIntakeFacts(item) {
       <div><dt>发布时间</dt><dd>${formatDate(item.published_at, true)}</dd></div>
       <div><dt>材料指纹</dt><dd>${escapeHtml(item.material?.extracted_hash || "未生成")}</dd></div>
       ${item.file?.name ? `<div><dt>文件</dt><dd>${escapeHtml(item.file.name)} · ${escapeHtml(item.file.media_type)} · ${item.file.size_bytes || 0} bytes</dd></div>` : ""}
+      ${collection ? `
+        <div><dt>固定来源版本</dt><dd>${escapeHtml(collection.target_name || collection.target_id || "未知来源")} · V${escapeHtml(collection.version_number ?? "?")}</dd></div>
+        <div><dt>采集运行</dt><dd>${escapeHtml(collection.run_id || "未知运行")} · ${escapeHtml(LABELS.collectionOutcome[collection.outcome] || collection.outcome || "正文变化")}</dd></div>
+        <div><dt>版本边界</dt><dd>${escapeHtml(collectionBoundary)}</dd></div>
+      ` : ""}
       ${item.search ? `
         <div><dt>发现关键词</dt><dd>${escapeHtml(item.search.keyword || "未知")}</dd></div>
         <div><dt>检索范围 / 渠道</dt><dd>${escapeHtml(LABELS.searchScope[item.search.scope] || item.search.scope || "未知")} · ${escapeHtml(item.search.channel || item.search.provider || "未知")}</dd></div>
@@ -1042,26 +1090,43 @@ function renderIntakeReview(item) {
     </form>`;
 }
 
-async function refreshIntakeData() {
+async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
   const [list, options] = await Promise.all([
     api("/pldr-api/v1/intake?limit=200"),
     api("/pldr-api/v1/intake/options"),
   ]);
   state.intakeItems = list.items || [];
   state.intakeOptions = options || { events: [], entities: [] };
+  let preferredError = null;
+  if (preferredItemId && !state.intakeItems.some((item) => item.id === preferredItemId)) {
+    try {
+      const olderItem = await api(`/pldr-api/v1/intake/${encodeURIComponent(preferredItemId)}`);
+      state.intakeItems = [olderItem, ...state.intakeItems];
+    } catch (error) {
+      preferredError = error;
+    }
+  }
+  const target = (preferredItemId && state.intakeItems.some((item) => item.id === preferredItemId)
+    ? preferredItemId
+    : null)
+    || state.intakeItems.find((item) => item.status === "candidate_ready")?.id
+    || state.intakeItems[0]?.id
+    || null;
+  state.selectedIntakeId = target;
   renderIntakeList();
-  renderIntakeDetail(state.intakeItems.find((item) => item.id === state.selectedIntakeId) || state.intakeItems[0]);
+  renderIntakeDetail(state.intakeItems.find((item) => item.id === target) || null);
+  return { found: !preferredItemId || target === preferredItemId, error: preferredError };
 }
 
 async function openIntakeModal(itemId = null, quiet = false) {
   const modal = $("#intake-modal");
   if (!quiet && typeof modal.showModal === "function") modal.showModal();
   else if (!quiet) modal.setAttribute("open", "");
-  await refreshIntakeData();
-  const target = itemId || state.selectedIntakeId || state.intakeItems.find((item) => item.status === "candidate_ready")?.id || state.intakeItems[0]?.id;
-  state.selectedIntakeId = target || null;
-  renderIntakeList();
-  renderIntakeDetail(state.intakeItems.find((item) => item.id === target));
+  const preferred = itemId || state.selectedIntakeId;
+  const result = await refreshIntakeData(preferred);
+  if (itemId && !result.found) {
+    toast(`指定版本无法打开：${result.error?.message || "材料不存在"}`, "error", 7000);
+  }
 }
 
 function closeIntakeModal() {
@@ -1149,7 +1214,7 @@ async function handleIntakeAction(action, domEvent = null) {
     try {
       await api(`/pldr-api/v1/intake/${item.id}/regenerate`, { method: "POST" });
       toast("候选已重新生成。", "success");
-      await refreshIntakeData();
+      await refreshIntakeData(item.id);
       renderIntakeDetail(selectedIntakeItem());
     } catch (error) {
       toast(`候选重新生成失败：${error.message}`, "error", 7000);
@@ -1165,7 +1230,7 @@ async function handleIntakeAction(action, domEvent = null) {
     try {
       const result = await api(`/pldr-api/v1/search/results/${encodeURIComponent(searchResultId)}/retry`, { method: "POST" });
       toast(result.intake_status === "failed" ? `重试仍失败：${result.error || "未知错误"}` : "原始页重试完成，等待候选审核。", result.intake_status === "failed" ? "error" : "success", 7000);
-      await refreshIntakeData();
+      await refreshIntakeData(item.id);
     } catch (error) {
       toast(`原始页重试失败：${error.message}`, "error", 7000);
     }
@@ -1193,7 +1258,7 @@ async function handleIntakeAction(action, domEvent = null) {
       });
       toast(`已原子入档：${result.result.formal_object_ids.event}`, "success");
       await refreshData({ keepSelection: false, quiet: true, preferredEventId: result.result.formal_object_ids.event });
-      await refreshIntakeData();
+      await refreshIntakeData(item.id);
       renderIntakeDetail(selectedIntakeItem());
       return;
     }
@@ -1213,9 +1278,417 @@ async function handleIntakeAction(action, domEvent = null) {
       toast("处理已撤销，未写入正式区。", "success");
     }
     await refreshData({ keepSelection: true, quiet: true });
-    await refreshIntakeData();
+    await refreshIntakeData(item.id);
   } catch (error) {
     toast(`采集箱操作失败：${error.message}`, "error", 7000);
+  }
+}
+
+function collectionMetrics() {
+  return state.collectionSummary?.metrics || state.collectionSummary || {};
+}
+
+function collectionIntervalMinutes(target) {
+  if (target.interval_minutes != null) return Number(target.interval_minutes);
+  if (target.interval_seconds != null) return Math.max(1, Math.round(Number(target.interval_seconds) / 60));
+  return null;
+}
+
+function collectionRunError(run) {
+  if (!run?.error) return run?.error_message || "";
+  if (typeof run.error === "string") return run.error;
+  return run.error.message || run.error.class || "";
+}
+
+function collectionTargetStatus(target) {
+  if (target.enabled === false || target.status === "paused") return "paused";
+  if (["error", "degraded"].includes(target.health || target.status)) return target.health || target.status;
+  if (target.overdue === true) return "stale";
+  return target.health || target.status || (target.last_success_at ? "healthy" : "pending");
+}
+
+function renderCollectionSummary() {
+  const metrics = collectionMetrics();
+  const targets = metrics.targets || {};
+  const runs = metrics.runs || {};
+  const cards = [
+    [targets.total ?? metrics.total_targets ?? state.collectionTargets.length, "固定来源"],
+    [targets.healthy ?? metrics.healthy ?? 0, "运行正常"],
+    [metrics.changed_pending ?? metrics.pending_changes ?? metrics.pending_review ?? 0, "版本待审"],
+    [(targets.degraded ?? 0) + (targets.error ?? metrics.error ?? 0) + (targets.stale ?? 0), "需要恢复"],
+    [(runs.queued ?? metrics.queued ?? 0) + (runs.running ?? metrics.running ?? 0), "队列中"],
+  ];
+  $("#collection-summary").innerHTML = cards.map(([value, label]) => `
+    <div><strong>${escapeHtml(value ?? 0)}</strong><span>${escapeHtml(label)}</span></div>
+  `).join("");
+}
+
+function renderCollectionTargets() {
+  const root = $("#collection-target-list");
+  if (!state.collectionTargets.length) {
+    root.innerHTML = `
+      <div class="collection-empty">
+        <strong>还没有固定来源</strong>
+        <p>在上方添加一个无需登录的公共网页。PLDR 不会用演示运行记录填充这里。</p>
+      </div>`;
+    return;
+  }
+  root.innerHTML = state.collectionTargets.map((target) => {
+    const status = collectionTargetStatus(target);
+    const active = target.id === state.selectedCollectionTargetId;
+    return `
+      <div role="listitem">
+        <button class="collection-target ${active ? "active" : ""}" type="button" data-collection-target="${escapeHtml(target.id)}">
+          <span class="collection-health ${escapeHtml(status)}"></span>
+          <span class="collection-target-copy">
+            <strong>${escapeHtml(target.name || "未命名来源")}</strong>
+            <small>${escapeHtml(target.url || target.canonical_url || "地址未知")}</small>
+            <em>${escapeHtml(LABELS.collectionStatus[status] || status)} · ${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</em>
+          </span>
+          <span class="collection-target-count">V${escapeHtml(target.version_count ?? 0)}</span>
+        </button>
+      </div>`;
+  }).join("");
+}
+
+function collectionRunLabel(run) {
+  const outcome = run.outcome ? LABELS.collectionOutcome[run.outcome] || run.outcome : "";
+  const status = LABELS.collectionRun[run.status] || run.status || "未知状态";
+  return outcome && outcome !== status ? `${status} · ${outcome}` : status;
+}
+
+function collectionRunDuration(run) {
+  if (run.status === "queued") return "尚未开始";
+  if (run.status === "running") return "进行中";
+  return run.duration_ms == null ? "耗时未知" : `${run.duration_ms} ms`;
+}
+
+function renderCollectionDiff(diff = null) {
+  if (!diff) return '<div class="collection-diff-empty">选择 V2 及以后的版本查看正文变化。</div>';
+  const stats = diff.stats || {};
+  const lines = diff.lines || diff.diff || diff.segments || (diff.unified_diff ? diff.unified_diff.split("\n") : []);
+  const rendered = lines.map((line) => {
+    const text = typeof line === "string" ? line : line.text ?? line.value ?? "";
+    const rawType = typeof line === "string" ? (line.startsWith("+") ? "add" : line.startsWith("-") ? "remove" : line.startsWith("@@") ? "hunk" : "context") : line.type || line.kind || line.operation || "context";
+    const type = { added: "add", insert: "add", "+": "add", removed: "remove", delete: "remove", "-": "remove" }[rawType] || rawType;
+    return `<div class="collection-diff-line ${escapeHtml(type)}"><span>${type === "add" ? "+" : type === "remove" ? "−" : " "}</span><code>${escapeHtml(text)}</code></div>`;
+  }).join("");
+  const limited = diff.truncated && (
+    diff.truncated.exact_word_diff === false
+    || diff.truncated.segments === true
+    || diff.truncated.unified_diff === true
+  );
+  const versionLinks = limited ? `
+    <div class="collection-diff-warning">
+      <strong>当前为有界差异视图</strong>
+      <span>为避免超大网页拖垮采集服务，部分正文会合并或截断显示；哈希和已保存的完整相邻版本不受影响。</span>
+      <span class="collection-diff-hashes">上一版 ${escapeHtml((diff.previous?.body_hash || "未知").slice(0, 12))}… · 当前版 ${escapeHtml((diff.current?.body_hash || "未知").slice(0, 12))}…</span>
+      <span class="collection-diff-links">
+        ${diff.previous?.intake_item_id ? `<button class="text-btn" type="button" data-collection-action="review" data-intake-id="${escapeHtml(diff.previous.intake_item_id)}">打开上一版完整材料</button>` : ""}
+        ${diff.current?.intake_item_id ? `<button class="text-btn" type="button" data-collection-action="review" data-intake-id="${escapeHtml(diff.current.intake_item_id)}">打开当前版完整材料</button>` : ""}
+      </span>
+    </div>` : "";
+  return `
+    <div class="collection-diff-head">
+      <div><span>对比</span><strong>V${escapeHtml(diff.from?.version_number ?? diff.from_version ?? Math.max(0, Number(diff.version_number || 1) - 1))} → V${escapeHtml(diff.to?.version_number ?? diff.to_version ?? diff.version_number ?? "?")}</strong></div>
+      <div class="collection-diff-stats"><span class="add">+${escapeHtml(stats.added ?? stats.added_lines ?? stats.added_words ?? 0)}</span><span class="remove">−${escapeHtml(stats.removed ?? stats.removed_lines ?? stats.removed_words ?? 0)}</span></div>
+    </div>
+    ${versionLinks}
+    <div class="collection-diff-body">${rendered || '<div class="collection-diff-empty">正文没有可显示的行级变化。</div>'}</div>`;
+}
+
+function renderCollectionDetail(detail = state.selectedCollectionTarget) {
+  const root = $("#collection-detail");
+  if (!detail) {
+    root.innerHTML = '<div class="panel-empty">选择一个来源，查看运行记录、版本变化和恢复动作。</div>';
+    return;
+  }
+  const target = detail.target || detail;
+  const runs = detail.runs || target.runs || [];
+  const versions = detail.versions || target.versions || [];
+  const runTotal = Number(detail.run_count ?? target.run_count ?? runs.length);
+  const versionTotal = Number(detail.version_count ?? target.version_count ?? versions.length);
+  const status = collectionTargetStatus(target);
+  const paused = target.enabled === false || status === "paused";
+  root.innerHTML = `
+    <div class="collection-detail-head">
+      <div>
+        <span class="collection-status-chip ${escapeHtml(status)}">${escapeHtml(LABELS.collectionStatus[status] || status)}</span>
+        <h3>${escapeHtml(target.name || "未命名来源")}</h3>
+        <a href="${escapeHtml(target.url || target.canonical_url || "#")}" target="_blank" rel="noopener noreferrer">${escapeHtml(target.url || target.canonical_url || "地址未知")}</a>
+      </div>
+      <div class="collection-detail-actions">
+        <button class="btn btn-primary" type="button" data-collection-action="run" data-target-id="${escapeHtml(target.id)}" ${paused ? 'disabled title="请先恢复周期"' : ""}>立即检查</button>
+        <button class="btn btn-ghost" type="button" data-collection-action="${paused ? "resume" : "pause"}" data-target-id="${escapeHtml(target.id)}">${paused ? "恢复周期" : "暂停周期"}</button>
+      </div>
+    </div>
+    <dl class="collection-facts">
+      <div><dt>检查周期</dt><dd>${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</dd></div>
+      <div><dt>上次成功</dt><dd>${formatDate(target.last_success_at, true)}</dd></div>
+      <div><dt>下次运行</dt><dd>${target.enabled === false ? "已暂停" : formatDate(target.next_run_at, true)}</dd></div>
+      <div><dt>连续失败</dt><dd>${escapeHtml(target.consecutive_failures ?? 0)}</dd></div>
+      ${target.last_error ? `<div class="wide"><dt>最近错误</dt><dd>${escapeHtml(target.last_error)}</dd></div>` : ""}
+    </dl>
+    <div class="collection-detail-grid">
+      <section>
+        <div class="collection-section-heading"><div><span class="panel-kicker">RUN HISTORY</span><h3>运行记录</h3></div><span>已载入 ${runs.length} / 共 ${runTotal} 次</span></div>
+        <div class="collection-run-list">
+          ${runs.length ? runs.map((run) => `
+            <article class="collection-run ${escapeHtml(run.status || "unknown")}">
+              <span class="collection-run-dot"></span>
+              <div>
+                <strong>${escapeHtml(collectionRunLabel(run))}</strong>
+                <small>${formatDate(run.started_at || run.created_at || run.queued_at, true)} · ${escapeHtml(run.trigger || "manual")} · ${escapeHtml(collectionRunDuration(run))}</small>
+                ${collectionRunError(run) ? `<p>${escapeHtml(collectionRunError(run))}</p>` : ""}
+              </div>
+              ${run.status === "failed" ? `<button class="text-btn warning" type="button" data-collection-action="retry" data-run-id="${escapeHtml(run.id)}" ${paused ? 'disabled title="请先恢复周期"' : ""}>重试</button>` : ""}
+            </article>`).join("") : '<div class="collection-empty"><p>尚无运行记录。</p></div>'}
+          ${runs.length < runTotal ? `<button class="text-btn collection-load-more" type="button" data-collection-action="more-runs" data-target-id="${escapeHtml(target.id)}">加载更早运行</button>` : ""}
+        </div>
+      </section>
+      <section>
+        <div class="collection-section-heading"><div><span class="panel-kicker">IMMUTABLE VERSIONS</span><h3>正文版本</h3></div><span>已载入 ${versions.length} / 共 ${versionTotal} 个</span></div>
+        <div class="collection-version-list">
+          ${versions.length ? versions.map((version) => {
+            const runId = version.run_id || version.id;
+            const intakeId = version.intake_item_id || version.current_intake_item_id || version.intake_chain?.current || version.intake?.id;
+            const intakeStatus = version.intake_status || version.intake?.status;
+            return `
+              <article class="collection-version">
+                <button type="button" data-collection-action="diff" data-run-id="${escapeHtml(runId)}" ${Number(version.version_number || 0) < 2 ? "disabled" : ""}>
+                  <strong>V${escapeHtml(version.version_number ?? "?")}</strong>
+                  <span>${escapeHtml(version.outcome === "baseline" ? "首次版本" : "查看与上一版差异")}</span>
+                  <small>${formatDate(version.captured_at || version.completed_at || version.finished_at || version.created_at, true)}</small>
+                </button>
+                ${intakeId ? `<button class="text-btn" type="button" data-collection-action="review" data-intake-id="${escapeHtml(intakeId)}">${escapeHtml(LABELS.intakeStatus[intakeStatus] || intakeStatus || "打开版本材料")}</button>` : ""}
+              </article>`;
+          }).join("") : '<div class="collection-empty"><p>成功抓取后才会出现第一个正文版本。</p></div>'}
+          ${versions.length < versionTotal ? `<button class="text-btn collection-load-more" type="button" data-collection-action="more-versions" data-target-id="${escapeHtml(target.id)}">加载更早版本</button>` : ""}
+        </div>
+        <div id="collection-diff" class="collection-diff">${renderCollectionDiff(state.collectionDiff)}</div>
+      </section>
+    </div>`;
+}
+
+async function loadCollectionTarget(targetId, { preserveDiff = false } = {}) {
+  const requestSerial = ++state.collectionRequestSerial;
+  if (!targetId) {
+    state.collectionDiffRequestSerial += 1;
+    state.collectionDiff = null;
+    state.selectedCollectionTarget = null;
+    renderCollectionDetail(null);
+    return;
+  }
+  state.selectedCollectionTargetId = targetId;
+  if (!preserveDiff) {
+    state.collectionDiffRequestSerial += 1;
+    state.collectionDiff = null;
+  }
+  renderCollectionTargets();
+  $("#collection-detail").innerHTML = '<div class="panel-empty">正在加载来源运行与版本…</div>';
+  try {
+    const detail = await api(`/pldr-api/v1/collection/targets/${encodeURIComponent(targetId)}`);
+    if (requestSerial !== state.collectionRequestSerial || targetId !== state.selectedCollectionTargetId) return;
+    state.selectedCollectionTarget = detail;
+    renderCollectionDetail();
+  } catch (error) {
+    if (requestSerial !== state.collectionRequestSerial) return;
+    state.selectedCollectionTarget = null;
+    $("#collection-detail").innerHTML = `<div class="collection-error"><strong>来源详情加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
+  }
+}
+
+function scheduleCollectionPoll(delayOverrideMs = null) {
+  if (state.collectionPollTimer) window.clearTimeout(state.collectionPollTimer);
+  state.collectionPollTimer = null;
+  const modal = $("#collection-modal");
+  const detail = state.selectedCollectionTarget;
+  const runs = detail?.runs || detail?.target?.runs || [];
+  const hasPending = (detail?.enabled !== false && runs.some((run) => run.status === "queued" || run.status === "running"))
+    || Number(collectionMetrics().runs?.queued || 0) > 0
+    || Number(collectionMetrics().runs?.running || 0) > 0;
+  if (!modal?.open) return;
+  state.collectionPollTimer = window.setTimeout(async () => {
+    await refreshCollectionData();
+  }, Number.isFinite(delayOverrideMs) ? delayOverrideMs : (hasPending ? 2500 : 15000));
+}
+
+async function refreshCollectionData(preferredTargetId = null) {
+  if (state.collectionBusy) {
+    scheduleCollectionPoll();
+    return;
+  }
+  state.collectionBusy = true;
+  let collectionRetryDelayMs = null;
+  const previousTargetId = state.selectedCollectionTargetId;
+  try {
+    const [summary, targets] = await Promise.all([
+      api("/pldr-api/v1/collection/summary"),
+      api("/pldr-api/v1/collection/targets"),
+    ]);
+    state.collectionSummary = summary;
+    state.collectionTargets = targets.items || targets.targets || [];
+    renderCollectionSummary();
+    const targetId = preferredTargetId
+      || (state.collectionTargets.some((target) => target.id === state.selectedCollectionTargetId) ? state.selectedCollectionTargetId : null)
+      || state.collectionTargets[0]?.id
+      || null;
+    state.selectedCollectionTargetId = targetId;
+    renderCollectionTargets();
+    await loadCollectionTarget(targetId, { preserveDiff: targetId === previousTargetId });
+    renderMetrics();
+  } catch (error) {
+    collectionRetryDelayMs = 15000;
+    state.selectedCollectionTarget = null;
+    $("#collection-summary").innerHTML = `<div class="collection-error"><strong>来源监测不可用</strong><p>${escapeHtml(error.message)}</p></div>`;
+    $("#collection-target-list").innerHTML = '<div class="collection-empty"><p>没有伪造运行记录；请检查后端服务。</p></div>';
+    $("#collection-detail").innerHTML = '<div class="collection-error"><strong>无法读取运行与版本</strong><p>请恢复后端连接后重试。</p></div>';
+  } finally {
+    state.collectionBusy = false;
+    scheduleCollectionPoll(collectionRetryDelayMs);
+  }
+}
+
+async function openCollectionModal() {
+  const modal = $("#collection-modal");
+  if (typeof modal.showModal === "function") modal.showModal();
+  else modal.setAttribute("open", "");
+  await refreshCollectionData();
+}
+
+function closeCollectionModal() {
+  const modal = $("#collection-modal");
+  if (typeof modal.close === "function") modal.close();
+  else modal.removeAttribute("open");
+  if (state.collectionPollTimer) window.clearTimeout(state.collectionPollTimer);
+  state.collectionPollTimer = null;
+}
+
+async function submitCollectionTarget(event) {
+  event.preventDefault();
+  if (state.collectionBusy) return;
+  state.collectionBusy = true;
+  const button = $("#collection-add");
+  button.disabled = true;
+  button.textContent = "正在保存并加入队列…";
+  try {
+    const result = await api("/pldr-api/v1/collection/targets", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#collection-name").value.trim(),
+        url: $("#collection-url").value.trim(),
+        interval_seconds: Number($("#collection-interval").value) * 60,
+        language: $("#collection-language").value,
+        run_immediately: $("#collection-run-immediately").checked,
+      }),
+    });
+    const run = result.run || result.queued_run || null;
+    const runFailed = run?.status === "failed";
+    toast(runFailed ? `来源已保存，但首次抓取失败：${collectionRunError(run) || "未知错误"}` : run?.status === "queued" ? "固定来源已保存，首次试抓已进入持久队列。" : "固定来源已保存。变化只会进入待审箱。", runFailed ? "error" : "success", 7000);
+    $("#collection-source-form").reset();
+    $("#collection-run-immediately").checked = true;
+    state.collectionBusy = false;
+    await refreshCollectionData(result.target?.id);
+    try {
+      await refreshData({ keepSelection: true, quiet: true });
+    } catch (error) {
+      toast(`来源已保存，但专题指标刷新失败：${error.message}`, "warning", 7000);
+    }
+  } catch (error) {
+    toast(`添加来源失败：${error.message}`, "error", 7000);
+  } finally {
+    state.collectionBusy = false;
+    button.disabled = false;
+    button.textContent = "添加来源";
+  }
+}
+
+async function handleCollectionAction(action, node) {
+  if (state.collectionBusy) return;
+  if (action === "review") {
+    const intakeId = node.dataset.intakeId;
+    closeCollectionModal();
+    await openIntakeModal(intakeId);
+    return;
+  }
+  if (action === "diff") {
+    const targetId = state.selectedCollectionTargetId;
+    const runId = node.dataset.runId;
+    const requestSerial = ++state.collectionDiffRequestSerial;
+    try {
+      const diff = await api(`/pldr-api/v1/collection/runs/${encodeURIComponent(runId)}/diff`);
+      if (
+        requestSerial !== state.collectionDiffRequestSerial
+        || targetId !== state.selectedCollectionTargetId
+        || diff.target_id !== targetId
+        || diff.run_id !== runId
+      ) return;
+      state.collectionDiff = diff;
+      const diffRoot = $("#collection-diff");
+      if (diffRoot) diffRoot.innerHTML = renderCollectionDiff(state.collectionDiff);
+    } catch (error) {
+      toast(`版本对比失败：${error.message}`, "error", 7000);
+    }
+    return;
+  }
+  if (action === "more-runs" || action === "more-versions") {
+    const targetId = node.dataset.targetId || state.selectedCollectionTargetId;
+    const detail = state.selectedCollectionTarget;
+    if (!targetId || !detail || targetId !== state.selectedCollectionTargetId) return;
+    const key = action === "more-runs" ? "runs" : "versions";
+    const currentItems = detail[key] || [];
+    const knownTotal = Number(detail[action === "more-runs" ? "run_count" : "version_count"] || currentItems.length);
+    state.collectionBusy = true;
+    node.disabled = true;
+    try {
+      const page = await api(`/pldr-api/v1/collection/targets/${encodeURIComponent(targetId)}/${key}?offset=${currentItems.length}&limit=100`);
+      if (targetId !== state.selectedCollectionTargetId) return;
+      if (Number(page.count) !== knownTotal) {
+        toast("采集历史刚刚发生变化，已刷新后请再次加载。", "warning", 5000);
+        await loadCollectionTarget(targetId, { preserveDiff: true });
+        return;
+      }
+      const seen = new Set(currentItems.map((item) => item.id));
+      detail[key] = [...currentItems, ...(page.items || []).filter((item) => !seen.has(item.id))];
+      renderCollectionDetail(detail);
+    } catch (error) {
+      toast(`加载历史失败：${error.message}`, "error", 7000);
+    } finally {
+      state.collectionBusy = false;
+      scheduleCollectionPoll();
+    }
+    return;
+  }
+  const targetId = node.dataset.targetId || state.selectedCollectionTargetId;
+  const path = action === "retry"
+    ? `/pldr-api/v1/collection/runs/${encodeURIComponent(node.dataset.runId)}/retry`
+    : `/pldr-api/v1/collection/targets/${encodeURIComponent(targetId)}/${action}`;
+  state.collectionBusy = true;
+  node.disabled = true;
+  let actionSucceeded = false;
+  try {
+    const result = await api(path, { method: "POST" });
+    actionSucceeded = true;
+    const run = result.run || result;
+    if (run.status === "failed") {
+      toast(`运行失败：${collectionRunError(run) || "未知错误"}`, "error", 7000);
+    } else if (action === "run" && result.created === false) {
+      toast("该来源已有排队或运行中的任务，本次未重复创建。", "warning", 5000);
+    } else {
+      toast(action === "pause" ? "已暂停周期运行。" : action === "resume" ? "已恢复周期运行。" : "采集运行已记录。", "success");
+    }
+  } catch (error) {
+    toast(`来源操作失败：${error.message}`, "error", 7000);
+  } finally {
+    state.collectionBusy = false;
+    await refreshCollectionData(targetId);
+    try {
+      await refreshData({ keepSelection: true, quiet: true });
+    } catch (error) {
+      if (actionSucceeded) {
+        toast(`来源操作已完成，但专题指标刷新失败：${error.message}`, "warning", 7000);
+      }
+    }
   }
 }
 
@@ -1249,16 +1722,18 @@ async function refreshData({
   const previousSelection = keepSelection ? state.selectedId : null;
   if (!quiet) setBusy(true, "正在刷新专题");
   try {
-    const [overview, sources, config, intakeList] = await Promise.all([
+    const [overview, sources, config, intakeList, collectionSummary] = await Promise.all([
       api("/pldr-api/v1/overview"),
       api("/pldr-api/v1/sources/health"),
       api("/pldr-api/v1/config").catch(() => null),
       api("/pldr-api/v1/intake?limit=200").catch(() => ({ items: [] })),
+      api("/pldr-api/v1/collection/summary").catch(() => null),
     ]);
     state.overview = overview;
     state.events = overview.events || [];
     state.sources = sources.items || [];
     state.config = config;
+    state.collectionSummary = collectionSummary;
     renderSearchProvider();
     state.intakeItems = intakeList.items || [];
     if (!state.selectedIntakeId) {
@@ -1307,6 +1782,7 @@ function bindEvents() {
   $("#contested-filter").addEventListener("change", applyFilters);
   $("#btn-refresh").addEventListener("click", () => refreshData());
   $("#btn-report").addEventListener("click", () => generateReport());
+  $("#btn-collection").addEventListener("click", openCollectionModal);
   $("#btn-search").addEventListener("click", openExternalSearchModal);
   $("#btn-import").addEventListener("click", openImportModal);
   $("#btn-intake").addEventListener("click", () => openIntakeModal());
@@ -1320,9 +1796,22 @@ function bindEvents() {
   $("#search-close").addEventListener("click", closeExternalSearchModal);
   $("#search-form").addEventListener("submit", submitExternalSearch);
   $("#search-select").addEventListener("click", submitSelectedSearchResults);
+  $("#collection-close").addEventListener("click", closeCollectionModal);
+  $("#collection-refresh").addEventListener("click", () => refreshCollectionData());
+  $("#collection-source-form").addEventListener("submit", submitCollectionTarget);
   $("#intake-close").addEventListener("click", closeIntakeModal);
 
   document.addEventListener("click", (event) => {
+    const collectionTarget = event.target.closest("[data-collection-target]");
+    if (collectionTarget) {
+      loadCollectionTarget(collectionTarget.dataset.collectionTarget);
+      return;
+    }
+    const collectionAction = event.target.closest("[data-collection-action]");
+    if (collectionAction) {
+      handleCollectionAction(collectionAction.dataset.collectionAction, collectionAction);
+      return;
+    }
     const searchRetry = event.target.closest("[data-search-retry]");
     if (searchRetry) {
       retryExternalSearchResult(searchRetry.dataset.searchRetry);
@@ -1366,6 +1855,7 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       if ($("#event-drawer").classList.contains("open")) closeDrawer();
+      else if ($("#collection-modal").open) closeCollectionModal();
       else if ($("#search-modal").open) closeExternalSearchModal();
       else if ($("#intake-modal").open) closeIntakeModal();
       else if ($("#import-modal").open) closeImportModal();

@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 
+from .collection_routes import router as collection_router
 from .database import Base, REPO_ROOT, SessionLocal, engine, get_session
 from .intake import (
     build_confirmation_preview,
@@ -94,6 +95,50 @@ def ensure_compatible_schema() -> None:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE evidence ADD COLUMN snapshot_id VARCHAR(64)"))
                 connection.execute(text("CREATE INDEX IF NOT EXISTS idx_evidence_snapshot_id ON evidence (snapshot_id)"))
+    if "snapshots" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("snapshots")}
+        if "metadata_json" not in columns:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE snapshots ADD COLUMN metadata_json JSON"))
+    if "collection_runs" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("collection_runs")}
+        if "active_key" not in columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text("ALTER TABLE collection_runs ADD COLUMN active_key VARCHAR(80)")
+                )
+        # Repair only a half-finished migration. Rewriting every historical run on
+        # every startup would take an unnecessary SQLite write lock, while a clean
+        # schema already has either the named unique index or an equivalent unique
+        # constraint covering active_key.
+        collection_inspector = inspect(engine)
+        unique_constraints = collection_inspector.get_unique_constraints("collection_runs")
+        unique_indexes = collection_inspector.get_indexes("collection_runs")
+        has_active_guard = any(
+            set(constraint.get("column_names") or []) == {"active_key"}
+            for constraint in unique_constraints
+        ) or any(
+            index.get("unique")
+            and set(index.get("column_names") or []) == {"active_key"}
+            for index in unique_indexes
+        )
+        if not has_active_guard:
+            with engine.begin() as connection:
+                connection.execute(text("UPDATE collection_runs SET active_key = NULL"))
+                connection.execute(
+                    text(
+                        "UPDATE collection_runs SET active_key = target_id "
+                        "WHERE status IN ('queued', 'running') AND id IN ("
+                        "SELECT MIN(id) FROM collection_runs "
+                        "WHERE status IN ('queued', 'running') GROUP BY target_id)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX uq_collection_run_active_key "
+                        "ON collection_runs (active_key)"
+                    )
+                )
 
 
 def backfill_evidence_snapshots() -> None:
@@ -145,6 +190,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-PLDR-Admin-Token"],
 )
+app.include_router(collection_router)
 app.mount("/assets", StaticFiles(directory=ASSET_DIR), name="assets")
 app.mount("/reports", StaticFiles(directory=REPORT_DIR), name="reports")
 
@@ -560,13 +606,47 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
         )
     back_link = f"/?event={html_lib.escape(event_id)}" if event_id else "/"
     document_metadata = document.metadata_json or {}
-    title_display = "未知标题" if document_metadata.get("title_known") is False else document.title
-    published_known = document_metadata.get("published_at_known", True) is not False
-    published_display = (
-        document.published_at.isoformat().replace("+00:00", "Z")
-        if document.published_at and published_known
-        else "未知"
-    )
+    snapshot_metadata = (selected_snapshot.metadata_json or {}) if selected_snapshot else {}
+    if selected_snapshot is not None:
+        latest_snapshot_id = document_metadata.get("latest_snapshot_id")
+        selected_is_head = latest_snapshot_id == selected_snapshot.id or (
+            not latest_snapshot_id
+            and selected_snapshot.content_hash == document.content_hash
+            and selected_snapshot.excerpt == document.body
+        )
+        if "title_known" not in snapshot_metadata and selected_is_head:
+            title_display = (
+                "未知标题" if document_metadata.get("title_known") is False else document.title
+            )
+            published_display = (
+                document.published_at.isoformat().replace("+00:00", "Z")
+                if document.published_at
+                and document_metadata.get("published_at_known", True) is not False
+                else "未知"
+            )
+        else:
+            snapshot_title = snapshot_metadata.get("title")
+            title_display = (
+                str(snapshot_title)
+                if snapshot_metadata.get("title_known") is True and snapshot_title
+                else "历史快照（该版本标题未记录）"
+            )
+            snapshot_published = snapshot_metadata.get("published_at")
+            published_display = (
+                str(snapshot_published)
+                if snapshot_metadata.get("published_at_known") is True and snapshot_published
+                else "未知"
+            )
+    else:
+        title_display = (
+            "未知标题" if document_metadata.get("title_known") is False else document.title
+        )
+        published_known = document_metadata.get("published_at_known", True) is not False
+        published_display = (
+            document.published_at.isoformat().replace("+00:00", "Z")
+            if document.published_at and published_known
+            else "未知"
+        )
     source_url = document.canonical_url if not document.canonical_url.startswith("pldr:") else ""
     source_url_display = (
         f"<a href='{html_lib.escape(source_url, quote=True)}' target='_blank' rel='noopener'>{html_lib.escape(source_url)}</a>"
@@ -580,7 +660,7 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
         selected_snapshot.content_hash if selected_snapshot is not None else document.content_hash
     )
     snapshot_id_display = selected_snapshot.id if selected_snapshot is not None else "未知"
-    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{captured_at} · 正文 SHA-256：{snapshot_hash}<br>Snapshot：{html_lib.escape(snapshot_id_display)}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
+    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}h1,.meta,article{{overflow-wrap:anywhere}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}@media(max-width:580px){{main{{padding:24px 16px}}article{{padding:18px}}}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{captured_at} · 正文 SHA-256：{snapshot_hash}<br>Snapshot：{html_lib.escape(snapshot_id_display)}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
 
 
 @app.get("/api/v1/timeline", include_in_schema=False)
@@ -634,6 +714,7 @@ def runtime_config() -> dict[str, Any]:
             "human_confirmation",
             "file_intake",
             "external_keyword_discovery",
+            "reliable_collection",
         ],
         "external_search": provider_metadata(),
     }
