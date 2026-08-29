@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -184,8 +185,14 @@ async def run_model_task(task: str, payload: dict[str, Any]) -> dict[str, Any]:
     endpoint = f"{config.base_url}/chat/completions"
     body={"model":config.model,"temperature":0.1,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":json.dumps(model_request_payload(task,payload),ensure_ascii=False)}]}
     headers={"Authorization":f"Bearer {config.api_key}","Content-Type":"application/json"}
-    async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
-        response=await client.post(endpoint,headers=headers,json=body); response.raise_for_status(); data=response.json()
+    try:
+        async with asyncio.timeout(config.timeout_seconds):
+            async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+                response=await client.post(endpoint,headers=headers,json=body); response.raise_for_status(); data=response.json()
+    except TimeoutError as exc:
+        raise httpx.ReadTimeout(
+            f"Model request exceeded {config.timeout_seconds:g} second total deadline"
+        ) from exc
     content=data["choices"][0]["message"]["content"]
     return {"mode":"api","task":task,"model":config.model,"result":normalize_model_result(task,json.loads(content))}
 

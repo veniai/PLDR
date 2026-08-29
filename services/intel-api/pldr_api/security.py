@@ -12,6 +12,7 @@ class UnsafeUrlError(ValueError):
 def validate_public_http_url(url: str, *, resolve: bool = True) -> str:
     parsed=urlparse(url)
     if parsed.scheme not in {"http","https"} or not parsed.hostname: raise UnsafeUrlError("Only public http/https URLs are allowed")
+    if parsed.username is not None or parsed.password is not None: raise UnsafeUrlError("Embedded URL credentials are not allowed")
     host=parsed.hostname.lower()
     if host in {"localhost","localhost.localdomain"} or host.endswith(".local"): raise UnsafeUrlError("Local addresses are blocked")
     try: literal_ip=ipaddress.ip_address(host)

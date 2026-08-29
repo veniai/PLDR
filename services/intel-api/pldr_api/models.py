@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -59,6 +59,7 @@ class Snapshot(Base):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     excerpt: Mapped[str] = mapped_column(Text, nullable=False)
     storage_path: Mapped[str] = mapped_column(String(500), default="inline")
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
     document: Mapped[Document] = relationship(back_populates="snapshots")
 
 
@@ -218,6 +219,86 @@ class IntakeCandidate(Base):
     final_object_id: Mapped[str | None] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     item: Mapped[IntakeItem] = relationship(back_populates="candidates")
+
+
+class CollectionTarget(Base):
+    """A fixed public page monitored by the reliable-collection worker."""
+
+    __tablename__ = "collection_targets"
+    __table_args__ = (UniqueConstraint("url", name="uq_collection_target_url"),)
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    url: Mapped[str] = mapped_column(String(900), nullable=False)
+    language: Mapped[str] = mapped_column(String(20), default="en")
+    interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    health: Mapped[str] = mapped_column(String(30), default="new", index=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    runs: Mapped[list["CollectionRun"]] = relationship(
+        back_populates="target",
+        cascade="all, delete-orphan",
+        order_by="CollectionRun.queued_at.desc()",
+    )
+
+
+class CollectionRun(Base):
+    """One durable collection attempt; only changed versions point at a new intake."""
+
+    __tablename__ = "collection_runs"
+    __table_args__ = (
+        Index("uq_collection_run_active_key", "active_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("collection_targets.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    # Equals target_id while queued/running and becomes NULL on completion. The
+    # unique constraint closes the API race between two simultaneous manual queues.
+    active_key: Mapped[str | None] = mapped_column(String(80))
+    outcome: Mapped[str | None] = mapped_column(String(30), index=True)
+    trigger: Mapped[str] = mapped_column(String(30), default="scheduled", index=True)
+    retry_of_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("collection_runs.id"), index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(160), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_recoveries: Mapped[int] = mapped_column(Integer, default=0)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    error_class: Mapped[str | None] = mapped_column(String(80), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    resolved_url: Mapped[str | None] = mapped_column(String(900))
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    media_type: Mapped[str | None] = mapped_column(String(160))
+    size_bytes: Mapped[int | None] = mapped_column(Integer)
+    raw_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    body_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    version_number: Mapped[int | None] = mapped_column(Integer, index=True)
+    previous_intake_item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("intake_items.id"), index=True
+    )
+    current_intake_item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("intake_items.id"), index=True
+    )
+    target: Mapped[CollectionTarget] = relationship(back_populates="runs")
+    previous_intake_item: Mapped[IntakeItem | None] = relationship(
+        foreign_keys=[previous_intake_item_id]
+    )
+    current_intake_item: Mapped[IntakeItem | None] = relationship(
+        foreign_keys=[current_intake_item_id]
+    )
 
 
 class SearchQueryRun(Base):

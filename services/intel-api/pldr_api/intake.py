@@ -105,7 +105,6 @@ def _failed_item(
     item.error = str(error)
     session.add(item)
     session.commit()
-    session.refresh(item)
     return item
 
 
@@ -158,8 +157,13 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
         item.status = "generation_failed"
         item.candidate_mode = "failed"
         item.candidate_error = str(exc)
+    # _store_candidates writes child rows by foreign key, so a relationship that
+    # was loaded as empty before generation would otherwise stay stale when
+    # expire_on_commit=False. Expire it while the transaction is still open: the
+    # response can then lazy-load the committed rows without a fallible refresh in
+    # the post-commit durability window.
+    session.expire(item, ["candidates"])
     session.commit()
-    session.refresh(item)
     return item
 
 
@@ -361,7 +365,6 @@ async def submit_web_intake(
         )
         session.add(item)
         session.commit()
-        session.refresh(item)
         return await generate_candidates(session, item)
     except Exception as exc:
         failure_html = html or ""
@@ -892,44 +895,185 @@ def _get_or_create_intake_source(session: Session, item: IntakeItem) -> Source:
     return source
 
 
+def _intake_capture_time(item: IntakeItem) -> datetime:
+    """Return the time represented by the submitted material, with a safe fallback."""
+    material = (item.review or {}).get("material")
+    fetched_at = material.get("fetched_at") if isinstance(material, dict) else None
+    if isinstance(fetched_at, str):
+        try:
+            return parse_datetime(fetched_at) or item.created_at
+        except ValueError:
+            # Review metadata is trace data, not a reason to make an otherwise valid
+            # human confirmation impossible.
+            pass
+    return item.created_at
+
+
+def _latest_document_snapshot(document: Document) -> Snapshot | None:
+    metadata = document.metadata_json or {}
+    latest_id = metadata.get("latest_snapshot_id")
+    if isinstance(latest_id, str):
+        latest = next((snapshot for snapshot in document.snapshots if snapshot.id == latest_id), None)
+        if latest is not None:
+            return latest
+    return max(
+        document.snapshots,
+        key=lambda snapshot: (iso(snapshot.captured_at) or "", snapshot.id),
+        default=None,
+    )
+
+
+def _snapshot_metadata(
+    item: IntakeItem,
+    *,
+    duplicate_of_document_id: str | None = None,
+) -> dict[str, Any]:
+    metadata = {
+        "intake_item_id": item.id,
+        "input_type": item.input_type,
+        "confirmation_stage": "P0.3-human-confirmed",
+        "title": item.title,
+        "title_known": bool(item.title),
+        "published_at": iso(item.published_at),
+        "published_at_known": item.published_at is not None,
+        "language": item.language,
+        "source_description": item.source_description,
+        "source_url": item.source_url,
+        "canonical_url": item.canonical_url,
+        "collection": (item.review or {}).get("collection"),
+    }
+    if duplicate_of_document_id is not None:
+        metadata["duplicate_of_document_id"] = duplicate_of_document_id
+    return metadata
+
+
+def _aware_datetime(value: datetime) -> datetime:
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _collection_order(value: Any) -> tuple[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    target_id = value.get("target_id")
+    version_number = value.get("version_number")
+    if not isinstance(target_id, str) or not isinstance(version_number, int):
+        return None
+    return target_id, version_number
+
+
+def _should_advance_document_head(
+    document: Document,
+    item: IntakeItem,
+    snapshot: Snapshot,
+    current: Snapshot | None,
+) -> bool:
+    if current is None:
+        return True
+    current_order = _collection_order((document.metadata_json or {}).get("latest_collection"))
+    candidate_order = _collection_order((item.review or {}).get("collection"))
+    if (
+        current_order is not None
+        and candidate_order is not None
+        and current_order[0] == candidate_order[0]
+        and current_order[1] != candidate_order[1]
+    ):
+        return candidate_order[1] > current_order[1]
+    # Manual/imported material has no collector version number. Capture time is the
+    # only stable ordering available; equal timestamps keep the existing head rather
+    # than letting review order arbitrarily replace it.
+    return _aware_datetime(snapshot.captured_at) > _aware_datetime(current.captured_at)
+
+
+def _updated_document_metadata(
+    document: Document,
+    item: IntakeItem,
+    snapshot: Snapshot,
+    *,
+    advance_head: bool,
+) -> dict[str, Any]:
+    metadata = dict(document.metadata_json or {})
+    intake_ids = list(metadata.get("intake_item_ids", []))
+    original_intake_id = metadata.get("intake_item_id")
+    if original_intake_id is not None and original_intake_id not in intake_ids:
+        intake_ids.insert(0, original_intake_id)
+    if item.id not in intake_ids:
+        intake_ids.append(item.id)
+    metadata["confirmation_stage"] = "P0.3-human-confirmed"
+    metadata["intake_item_ids"] = intake_ids
+    if advance_head:
+        metadata.update(
+            {
+                "input_type": item.input_type,
+                "title_known": bool(item.title),
+                "published_at_known": item.published_at is not None,
+                "source_description": item.source_description,
+                "raw_hash": item.raw_hash,
+                "latest_intake_item_id": item.id,
+                "latest_snapshot_id": snapshot.id,
+            }
+        )
+        collection = (item.review or {}).get("collection")
+        if collection is not None:
+            metadata["latest_collection"] = collection
+        else:
+            metadata.pop("latest_collection", None)
+        duplicate_of = (snapshot.metadata_json or {}).get("duplicate_of_document_id")
+        if duplicate_of is not None:
+            metadata["duplicate_of_document_id"] = duplicate_of
+        else:
+            metadata.pop("duplicate_of_document_id", None)
+    return metadata
+
+
 def _create_formal_document(session: Session, item: IntakeItem) -> Document:
     canonical_url = item.canonical_url or item.source_url or f"pldr:intake/{item.id}"
     existing = session.scalar(select(Document).where(Document.canonical_url == canonical_url))
     if existing is not None:
-        if existing.content_hash != item.extracted_hash:
-            raise ValueError("Canonical URL already has a different formal snapshot; resolve the conflict before confirmation")
-        if existing.body != item.extracted_snapshot:
-            raise ValueError("Canonical URL snapshot body differs from the submitted extracted text")
-        # A repeated submission of the same canonical URL and snapshot must associate the
-        # existing formal provenance rather than create an orphan Source. The intake item
-        # remains the durable trace from this review decision back to that Document.
-        snapshot = session.scalar(
-            select(Snapshot)
-            .where(Snapshot.document_id == existing.id)
-            .order_by(Snapshot.captured_at.desc())
-            .limit(1)
-        )
-        if snapshot is None or snapshot.excerpt != item.extracted_snapshot:
-            snapshot_id = "snap_intake_" + hashlib.sha1(f"{existing.id}:{item.id}".encode("utf-8")).hexdigest()[:16]
-            snapshot = Snapshot(
-                id=snapshot_id,
-                document_id=existing.id,
-                captured_at=item.created_at,
-                content_hash=item.extracted_hash,
-                excerpt=item.extracted_snapshot,
-                storage_path="inline-intake-reused",
+        # One canonical URL identifies one formal Document. Every newly confirmed
+        # Intake is its own immutable capture (even if the body is identical), while
+        # Evidence points to exactly that capture. Review order must not make an older
+        # collector version replace a newer formal head.
+        current_head = _latest_document_snapshot(existing)
+        duplicate = session.scalar(
+            select(Document)
+            .where(
+                Document.id != existing.id,
+                Document.content_hash == item.extracted_hash,
             )
-            session.add(snapshot)
-            session.flush()
-        reuse_metadata = dict(existing.metadata_json or {})
-        intake_ids = list(reuse_metadata.get("intake_item_ids", []))
-        original_intake_id = reuse_metadata.get("intake_item_id")
-        if original_intake_id is not None and original_intake_id not in intake_ids:
-            intake_ids.insert(0, original_intake_id)
-        if item.id not in intake_ids:
-            intake_ids.append(item.id)
-        reuse_metadata["intake_item_ids"] = intake_ids
-        existing.metadata_json = reuse_metadata
+            .order_by(Document.fetched_at.asc())
+        )
+        snapshot_id = "snap_intake_" + hashlib.sha1(
+            f"{existing.id}:{item.id}:{item.extracted_hash}".encode("utf-8")
+        ).hexdigest()[:20]
+        snapshot = Snapshot(
+            id=snapshot_id,
+            document_id=existing.id,
+            captured_at=_intake_capture_time(item),
+            content_hash=item.extracted_hash,
+            excerpt=item.extracted_snapshot,
+            storage_path="inline-intake-version",
+            metadata_json=_snapshot_metadata(
+                item,
+                duplicate_of_document_id=duplicate.id if duplicate else None,
+            ),
+        )
+        session.add(snapshot)
+        session.flush()
+        advance_head = _should_advance_document_head(existing, item, snapshot, current_head)
+        if advance_head:
+            existing.title = item.title or UNKNOWN_TITLE
+            existing.body = item.extracted_snapshot
+            existing.published_at = item.published_at or UNKNOWN_DATETIME
+            existing.fetched_at = _intake_capture_time(item)
+            existing.language = item.language
+            existing.content_hash = item.extracted_hash
+            existing.is_cached = True
+        existing.metadata_json = _updated_document_metadata(
+            existing,
+            item,
+            snapshot,
+            advance_head=advance_head,
+        )
         item.final_document_id = existing.id
         item.final_snapshot_id = snapshot.id
         return existing
@@ -940,6 +1084,7 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         .where(Document.content_hash == item.extracted_hash)
         .order_by(Document.fetched_at.asc())
     )
+    snapshot_id = "snap_intake_" + hashlib.sha1(document_id.encode("utf-8")).hexdigest()[:16]
     metadata = {
         "intake_item_id": item.id,
         "input_type": item.input_type,
@@ -949,7 +1094,11 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         "raw_hash": item.raw_hash,
         "confirmation_stage": "P0.3-human-confirmed",
         "intake_item_ids": [item.id],
+        "latest_intake_item_id": item.id,
+        "latest_snapshot_id": snapshot_id,
     }
+    if (item.review or {}).get("collection") is not None:
+        metadata["latest_collection"] = item.review["collection"]
     if duplicate is not None:
         metadata["duplicate_of_document_id"] = duplicate.id
     document = Document(
@@ -959,7 +1108,7 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         title=item.title or UNKNOWN_TITLE,
         body=item.extracted_snapshot,
         published_at=item.published_at or UNKNOWN_DATETIME,
-        fetched_at=item.created_at,
+        fetched_at=_intake_capture_time(item),
         language=item.language,
         content_hash=item.extracted_hash,
         upstream_story_id="",
@@ -968,15 +1117,18 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
     )
     session.add(document)
     session.flush()
-    snapshot_id = "snap_intake_" + hashlib.sha1(document.id.encode("utf-8")).hexdigest()[:16]
     session.add(
         Snapshot(
             id=snapshot_id,
             document_id=document.id,
-            captured_at=item.created_at,
+            captured_at=_intake_capture_time(item),
             content_hash=item.extracted_hash,
             excerpt=item.extracted_snapshot,
             storage_path="inline-intake",
+            metadata_json=_snapshot_metadata(
+                item,
+                duplicate_of_document_id=duplicate.id if duplicate else None,
+            ),
         )
     )
     session.flush()
@@ -1017,6 +1169,31 @@ def confirm_intake(
     errors = validate_confirmation(session, item, request)
     if errors:
         raise ValueError("; ".join(errors))
+
+    try:
+        return _confirm_validated_intake(
+            session,
+            item,
+            request,
+            fingerprint=fingerprint,
+            failure_hook=failure_hook,
+        )
+    except Exception:
+        # Confirmation is one promotion transaction. In particular, advancing a
+        # Document and appending its Snapshot must not leak through when any later
+        # Event/Claim/Evidence operation fails.
+        session.rollback()
+        raise
+
+
+def _confirm_validated_intake(
+    session: Session,
+    item: IntakeItem,
+    request: IntakeConfirmationRequest,
+    *,
+    fingerprint: str,
+    failure_hook: Callable[[], None] | None,
+) -> tuple[IntakeItem, dict[str, Any], bool]:
 
     document = _create_formal_document(session, item)
     if request.merge_event_id:
@@ -1149,6 +1326,17 @@ def confirm_intake(
     differences = {
         "event": _difference(machine_event, request.event.model_dump(mode="json")),
     }
+    trace = {
+        "intake_item_id": item.id,
+        "input_type": item.input_type,
+        "external_search": item.review.get("external_search"),
+        "machine_candidate_source": item.candidate_mode,
+        "human_disposition": request.disposition,
+        "analyst": request.analyst,
+    }
+    collection = item.review.get("collection")
+    if collection is not None:
+        trace["collection"] = collection
     result = {
         "status": "confirmed",
         "disposition": request.disposition,
@@ -1165,14 +1353,7 @@ def confirm_intake(
             "evidence": sorted(evidence_ids.values()),
         },
         "human_changes": differences,
-        "trace": {
-            "intake_item_id": item.id,
-            "input_type": item.input_type,
-            "external_search": item.review.get("external_search"),
-            "machine_candidate_source": item.candidate_mode,
-            "human_disposition": request.disposition,
-            "analyst": request.analyst,
-        },
+        "trace": trace,
     }
     item.status = "confirmed"
     item.error = None
@@ -1182,13 +1363,16 @@ def confirm_intake(
     item.confirmation_fingerprint = fingerprint
     item.confirmation_result = result
     item.final_event_id = event.id
-    item.review["confirmation"] = {
+    review = dict(item.review or {})
+    review["confirmation"] = {
         "request": request.model_dump(mode="json"),
         "machine_event": machine_event,
         "differences": differences,
     }
-    session.commit()
+    item.review = review
+    session.flush()
     session.refresh(item)
+    session.commit()
     return item, result, True
 
 

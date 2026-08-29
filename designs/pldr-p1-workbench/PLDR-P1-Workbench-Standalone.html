@@ -1,0 +1,3793 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>PLDR · P1 可靠采集工作台（Standalone）</title>
+    <style>
+:root {
+  --bg: #050b10;
+  --surface-0: #071017;
+  --surface-1: #0a151d;
+  --surface-2: #0e1c26;
+  --surface-3: #122530;
+  --line: #1b3544;
+  --line-strong: #2b5366;
+  --text: #e2edf2;
+  --text-soft: #b8cad4;
+  --muted: #7f9aaa;
+  --cyan: #64d9fb;
+  --cyan-soft: rgba(100, 217, 251, 0.12);
+  --green: #60d995;
+  --green-soft: rgba(96, 217, 149, 0.12);
+  --amber: #f3bd64;
+  --amber-soft: rgba(243, 189, 100, 0.13);
+  --red: #ff7379;
+  --red-soft: rgba(255, 107, 114, 0.12);
+  --purple: #c892ed;
+  --purple-soft: rgba(200, 146, 237, 0.12);
+  --blue: #83aaff;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 16px 42px rgba(0, 0, 0, 0.26);
+  --sidebar: 226px;
+  --topbar: 66px;
+  --font-sans: Inter, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 84% -10%, rgba(56, 146, 184, 0.09), transparent 30%),
+    var(--bg);
+  line-height: 1.6;
+}
+
+button,
+input,
+select,
+textarea {
+  color: inherit;
+  font: inherit;
+}
+
+button {
+  border: 0;
+  background: transparent;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+.boot-screen {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  justify-items: center;
+  color: var(--muted);
+}
+
+.brand-mark {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 12px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font: 700 18px/1 var(--font-mono);
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 30;
+  display: flex;
+  width: var(--sidebar);
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  background: rgba(6, 15, 21, 0.97);
+}
+
+.sidebar-brand {
+  display: flex;
+  height: var(--topbar);
+  align-items: center;
+  gap: 11px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sidebar-brand strong {
+  display: block;
+  letter-spacing: 0.08em;
+  font-size: 14px;
+}
+
+.sidebar-brand small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.nav-section {
+  padding: 17px 12px 8px;
+}
+
+.nav-label {
+  margin: 0 8px 8px;
+  color: #668394;
+  font: 600 10px/1.2 var(--font-mono);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.nav-button {
+  position: relative;
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 11px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: 140ms ease;
+}
+
+.nav-button:hover {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-soft);
+}
+
+.nav-button.active {
+  background: var(--cyan-soft);
+  color: var(--cyan);
+}
+
+.nav-button.active::before {
+  position: absolute;
+  inset: 9px auto 9px 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--cyan);
+  content: "";
+}
+
+.nav-icon {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  font: 600 10px/1 var(--font-mono);
+}
+
+.nav-button .nav-count {
+  min-width: 22px;
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: currentColor;
+  font: 600 11px/1.6 var(--font-mono);
+  text-align: center;
+}
+
+.sidebar-context {
+  margin: auto 12px 14px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-1);
+}
+
+.context-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.context-line + .context-line {
+  margin-top: 8px;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(96, 217, 149, 0.1);
+}
+
+.status-dot.amber {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(243, 189, 100, 0.1);
+}
+
+.sidebar-version {
+  margin: 0 12px 18px;
+  color: #597485;
+  font: 10px/1.5 var(--font-mono);
+}
+
+.topbar {
+  position: fixed;
+  inset: 0 0 auto var(--sidebar);
+  z-index: 20;
+  display: flex;
+  height: var(--topbar);
+  align-items: center;
+  gap: 14px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(5, 11, 16, 0.88);
+  backdrop-filter: blur(16px);
+}
+
+.topic-switcher {
+  display: flex;
+  min-width: 250px;
+  align-items: center;
+  gap: 10px;
+}
+
+.topic-kicker {
+  color: var(--muted);
+  font: 10px/1.2 var(--font-mono);
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.topic-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.topic-chevron {
+  color: var(--muted);
+}
+
+.range-pill {
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.topbar-spacer {
+  flex: 1;
+}
+
+.command-trigger,
+.ghost-button,
+.primary-button,
+.danger-button,
+.segmented button,
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-soft);
+  cursor: pointer;
+  transition: 140ms ease;
+}
+
+.command-trigger {
+  min-width: 178px;
+  justify-content: flex-start;
+  color: var(--muted);
+}
+
+.command-trigger kbd {
+  margin-left: auto;
+}
+
+kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font: 10px/1.5 var(--font-mono);
+}
+
+.ghost-button:hover,
+.icon-button:hover,
+.command-trigger:hover,
+.segmented button:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.primary-button {
+  border-color: rgba(100, 217, 251, 0.42);
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font-weight: 650;
+}
+
+.primary-button:hover {
+  border-color: var(--cyan);
+  background: rgba(100, 217, 251, 0.18);
+}
+
+.primary-button:disabled,
+.ghost-button:disabled {
+  border-color: var(--line);
+  background: var(--surface-1);
+  color: #58717f;
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+
+.danger-button {
+  border-color: rgba(255, 115, 121, 0.35);
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.button-small {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.main {
+  min-height: 100vh;
+  margin-left: var(--sidebar);
+  padding: calc(var(--topbar) + 24px) 24px 48px;
+}
+
+.screen {
+  max-width: 1510px;
+  margin: 0 auto;
+  animation: screen-in 180ms ease-out;
+}
+
+@keyframes screen-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.page-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 19px;
+}
+
+.page-eyebrow {
+  margin: 0 0 5px;
+  color: var(--cyan);
+  font: 600 10px/1.4 var(--font-mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.page-heading h1 {
+  margin: 0;
+  color: #eef7fa;
+  font-size: clamp(23px, 2vw, 30px);
+  font-weight: 680;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+
+.page-heading p {
+  max-width: 650px;
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.heading-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.surface {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(10, 21, 29, 0.86);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.08);
+}
+
+.surface-header {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.surface-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.surface-title::before {
+  width: 3px;
+  height: 14px;
+  border-radius: 3px;
+  background: var(--cyan);
+  content: "";
+}
+
+.surface-subtitle {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.surface-body {
+  padding: 14px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.stat-card {
+  position: relative;
+  min-height: 118px;
+  overflow: hidden;
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(145deg, rgba(13, 27, 37, 0.95), rgba(8, 18, 25, 0.95));
+  cursor: pointer;
+  text-align: left;
+}
+
+.stat-card::after {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 64px;
+  height: 2px;
+  background: var(--stat-color, var(--cyan));
+  content: "";
+  opacity: 0.8;
+}
+
+.stat-card:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.stat-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stat-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.stat-value {
+  color: var(--text);
+  font: 650 32px/1.2 var(--font-mono);
+  letter-spacing: -0.05em;
+}
+
+.stat-delta {
+  color: var(--stat-color, var(--cyan));
+  font-size: 11px;
+}
+
+.stat-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+  color: #6f8a99;
+  font-size: 11px;
+}
+
+.today-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.7fr) minmax(300px, 0.8fr);
+  gap: 14px;
+}
+
+.today-layout > *,
+.sources-layout > *,
+.change-layout > *,
+.events-layout > * {
+  min-width: 0;
+}
+
+.right-rail {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+}
+
+.attention-list {
+  display: grid;
+}
+
+.attention-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 16px 14px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  text-align: left;
+}
+
+.attention-card:last-child {
+  border-bottom: 0;
+}
+
+.attention-card:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.priority-rail {
+  width: 3px;
+  height: 100%;
+  min-height: 42px;
+  border-radius: 3px;
+  background: var(--amber);
+}
+
+.priority-rail.medium { background: var(--blue); }
+.priority-rail.low { background: var(--muted); }
+
+.attention-main h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 630;
+  line-height: 1.5;
+}
+
+.attention-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin: 4px 0 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.attention-reason {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+.badge,
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+  white-space: nowrap;
+}
+
+.status-pill::before {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.tone-cyan { color: var(--cyan); border-color: rgba(100, 217, 251, 0.28); background: var(--cyan-soft); }
+.tone-green { color: var(--green); border-color: rgba(96, 217, 149, 0.28); background: var(--green-soft); }
+.tone-amber { color: var(--amber); border-color: rgba(243, 189, 100, 0.28); background: var(--amber-soft); }
+.tone-red { color: var(--red); border-color: rgba(255, 115, 121, 0.28); background: var(--red-soft); }
+.tone-purple { color: var(--purple); border-color: rgba(200, 146, 237, 0.28); background: var(--purple-soft); }
+.tone-muted { color: var(--muted); }
+
+.attention-go {
+  align-self: center;
+  color: #597889;
+  font-size: 18px;
+}
+
+.health-list {
+  display: grid;
+  gap: 12px;
+}
+
+.health-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 5px 12px;
+}
+
+.health-row strong {
+  font-size: 12px;
+  font-weight: 580;
+}
+
+.health-row span {
+  color: var(--muted);
+  font: 11px/1.6 var(--font-mono);
+}
+
+.health-track {
+  grid-column: 1 / -1;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--surface-3);
+}
+
+.health-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+}
+
+.model-meter {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.model-metric {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+
+.model-metric small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.model-metric strong {
+  display: block;
+  margin-top: 3px;
+  font: 600 14px/1.5 var(--font-mono);
+}
+
+.coverage-note {
+  margin-top: 11px;
+  padding: 10px 11px;
+  border-left: 2px solid var(--amber);
+  background: var(--amber-soft);
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.mini-map {
+  position: relative;
+  height: 168px;
+  overflow: hidden;
+  border-radius: 8px;
+  background:
+    linear-gradient(rgba(100, 217, 251, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(100, 217, 251, 0.04) 1px, transparent 1px),
+    radial-gradient(ellipse at 61% 48%, rgba(48, 102, 120, 0.28), transparent 18%),
+    radial-gradient(ellipse at 33% 45%, rgba(48, 102, 120, 0.22), transparent 24%),
+    #07141c;
+  background-size: 24px 24px, 24px 24px, auto, auto, auto;
+}
+
+.mini-map::before,
+.mini-map::after {
+  position: absolute;
+  border: 1px solid rgba(100, 217, 251, 0.16);
+  border-radius: 48% 52% 45% 55%;
+  background: rgba(52, 104, 118, 0.12);
+  content: "";
+  transform: rotate(-9deg);
+}
+
+.mini-map::before {
+  inset: 26px 42% 38px 13%;
+}
+
+.mini-map::after {
+  inset: 35px 12% 27px 61%;
+  transform: rotate(12deg);
+}
+
+.map-pin {
+  position: absolute;
+  z-index: 2;
+  left: 57%;
+  top: 47%;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 7px rgba(243, 189, 100, 0.1);
+}
+
+.map-label {
+  position: absolute;
+  z-index: 2;
+  left: calc(57% + 16px);
+  top: calc(47% - 5px);
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(5, 11, 16, 0.9);
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.map-caption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.filter-button {
+  min-height: 31px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.filter-button.active {
+  border-color: rgba(100, 217, 251, 0.38);
+  background: var(--cyan-soft);
+  color: var(--cyan);
+}
+
+.sources-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(330px, 0.65fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.table-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  min-width: 850px;
+  border-collapse: collapse;
+}
+
+.data-table th {
+  height: 38px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  color: #6f8d9e;
+  font: 600 10px/1.4 var(--font-mono);
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.data-table td {
+  height: 59px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(27, 53, 68, 0.7);
+  color: var(--text-soft);
+  font-size: 11px;
+  vertical-align: middle;
+}
+
+.data-table tbody tr {
+  cursor: pointer;
+}
+
+.data-table tbody tr:hover,
+.data-table tbody tr.selected {
+  background: rgba(100, 217, 251, 0.035);
+}
+
+.data-table tbody tr.selected td:first-child {
+  box-shadow: inset 2px 0 0 var(--cyan);
+}
+
+.source-name strong {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.source-name small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.source-detail {
+  position: sticky;
+  top: calc(var(--topbar) + 20px);
+}
+
+.detail-hero {
+  padding: 17px 16px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-hero h2 {
+  margin: 8px 0 2px;
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.detail-hero p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 11px 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-field small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.detail-field strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-soft);
+  font: 550 11px/1.6 var(--font-mono);
+}
+
+.run-list {
+  display: grid;
+}
+
+.run-row {
+  display: grid;
+  grid-template-columns: 72px 76px minmax(0, 1fr);
+  gap: 9px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(27, 53, 68, 0.65);
+  align-items: start;
+}
+
+.run-row:last-child {
+  border-bottom: 0;
+}
+
+.run-time {
+  color: var(--muted);
+  font: 10px/1.7 var(--font-mono);
+}
+
+.run-detail {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.run-detail small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font: 10px/1.5 var(--font-mono);
+}
+
+.change-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr) 310px;
+  gap: 14px;
+  align-items: start;
+}
+
+.version-list {
+  padding: 7px;
+}
+
+.version-item {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 11px 11px 11px 27px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.version-item::before {
+  position: absolute;
+  left: 11px;
+  top: 17px;
+  width: 7px;
+  height: 7px;
+  border: 2px solid var(--surface-1);
+  border-radius: 50%;
+  background: var(--line-strong);
+  box-shadow: 0 0 0 1px var(--line-strong);
+  content: "";
+}
+
+.version-item::after {
+  position: absolute;
+  left: 14px;
+  top: 26px;
+  bottom: -8px;
+  width: 1px;
+  background: var(--line);
+  content: "";
+}
+
+.version-item:last-child::after {
+  display: none;
+}
+
+.version-item.active {
+  background: var(--cyan-soft);
+  color: var(--cyan);
+}
+
+.version-item.active::before {
+  background: var(--cyan);
+  box-shadow: 0 0 0 2px rgba(100, 217, 251, 0.16);
+}
+
+.version-item strong {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font: 600 12px/1.4 var(--font-mono);
+}
+
+.version-item small {
+  display: block;
+  margin-top: 3px;
+  color: inherit;
+  opacity: 0.7;
+  font-size: 10px;
+}
+
+.diff-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+}
+
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+
+.segmented button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+}
+
+.segmented button.active {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.check-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.check-control input {
+  accent-color: var(--cyan);
+}
+
+.diff-document {
+  padding: 12px;
+  counter-reset: diffline;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 34px 22px minmax(0, 1fr);
+  min-height: 42px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  counter-increment: diffline;
+}
+
+.diff-line::before {
+  padding: 9px 7px;
+  color: #526f7e;
+  font: 10px/1.7 var(--font-mono);
+  text-align: right;
+  content: counter(diffline);
+}
+
+.diff-symbol {
+  padding: 9px 4px;
+  font: 600 12px/1.7 var(--font-mono);
+}
+
+.diff-copy {
+  padding: 9px 10px;
+  color: var(--text-soft);
+  font: 12px/1.75 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.diff-line.added {
+  border-color: rgba(96, 217, 149, 0.16);
+  background: var(--green-soft);
+}
+
+.diff-line.added .diff-symbol { color: var(--green); }
+.diff-line.removed {
+  border-color: rgba(255, 115, 121, 0.15);
+  background: var(--red-soft);
+}
+.diff-line.removed .diff-symbol { color: var(--red); }
+.diff-line.same { opacity: 0.7; }
+
+.split-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  min-width: 0;
+}
+
+.split-column {
+  min-width: 0;
+  border-right: 1px solid var(--line);
+}
+
+.split-column:last-child {
+  border-right: 0;
+}
+
+.split-heading {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font: 10px/1.6 var(--font-mono);
+}
+
+.split-line {
+  min-height: 68px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(27, 53, 68, 0.45);
+  color: var(--text-soft);
+  font: 11px/1.75 var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.split-line.added { background: var(--green-soft); }
+.split-line.removed { background: var(--red-soft); }
+.split-line.empty { color: #526f7e; }
+
+.impact-list {
+  display: grid;
+  gap: 10px;
+}
+
+.impact-card {
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+
+.impact-card small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.impact-card strong {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.evidence-check {
+  margin-top: 12px;
+  padding: 11px;
+  border: 1px solid rgba(96, 217, 149, 0.22);
+  border-radius: 8px;
+  background: var(--green-soft);
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.review-shell {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.62fr) minmax(340px, 1.08fr) minmax(360px, 1fr);
+  height: calc(100vh - var(--topbar) - 124px);
+  min-height: 620px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+}
+
+.review-pane {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  background: rgba(7, 16, 23, 0.45);
+}
+
+.review-pane:last-child {
+  border-right: 0;
+}
+
+.pane-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  min-height: 51px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(10, 21, 29, 0.96);
+  backdrop-filter: blur(10px);
+}
+
+.pane-header strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pane-header small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-queue {
+  padding: 7px;
+}
+
+.queue-item {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin-bottom: 5px;
+  padding: 11px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.queue-item:hover { background: rgba(255,255,255,.025); }
+.queue-item.active {
+  border-color: rgba(200, 146, 237, 0.25);
+  background: var(--purple-soft);
+}
+
+.queue-item.disabled {
+  opacity: 0.65;
+}
+
+.queue-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.queue-type {
+  color: var(--purple);
+  font: 600 10px/1.4 var(--font-mono);
+}
+
+.queue-time {
+  color: var(--muted);
+  font: 10px/1.4 var(--font-mono);
+}
+
+.queue-item h3 {
+  margin: 7px 0 2px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.queue-item p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.queue-match {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px solid rgba(27, 53, 68, 0.6);
+  color: #8ea5b2;
+  font-size: 10px;
+}
+
+.material-meta {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.material-meta > div {
+  min-width: 0;
+}
+
+.material-meta small {
+  display: block;
+  color: var(--muted);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.material-meta strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--text-soft);
+  font: 10px/1.6 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.document-copy {
+  padding: 22px clamp(15px, 3vw, 30px) 34px;
+}
+
+.document-copy .doc-label {
+  color: var(--muted);
+  font: 600 10px/1.5 var(--font-mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.document-copy h2 {
+  max-width: 720px;
+  margin: 7px 0 14px;
+  color: #ecf5f8;
+  font-size: 21px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.document-copy p {
+  color: var(--text-soft);
+  font: 13px/1.85 var(--font-mono);
+}
+
+.evidence-highlight {
+  margin: 15px -8px;
+  padding: 10px 8px 10px 12px;
+  border-left: 3px solid var(--purple);
+  background: var(--purple-soft);
+  color: #e7d7f2 !important;
+}
+
+.evidence-marker {
+  display: inline-flex;
+  margin-right: 7px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--purple);
+  color: #160f1d;
+  font: 700 9px/1.5 var(--font-mono);
+  vertical-align: 1px;
+}
+
+.candidate-pane {
+  background: rgba(14, 16, 27, 0.46);
+}
+
+.candidate-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 11px;
+  padding: 10px 11px;
+  border: 1px dashed rgba(200, 146, 237, 0.5);
+  border-radius: 8px;
+  background: var(--purple-soft);
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.candidate-banner strong {
+  display: block;
+  color: var(--purple);
+  font-size: 11px;
+}
+
+.candidate-section {
+  margin: 0 11px 11px;
+  border: 1px solid rgba(200, 146, 237, 0.22);
+  border-radius: 9px;
+  background: rgba(10, 15, 24, 0.62);
+}
+
+.candidate-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(200, 146, 237, 0.17);
+}
+
+.candidate-section-header strong {
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.machine-label,
+.human-label,
+.formal-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--purple);
+  font: 600 9px/1.4 var(--font-mono);
+  letter-spacing: 0.05em;
+}
+
+.human-label { color: var(--amber); }
+.formal-label { color: var(--green); }
+
+.candidate-fields {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+}
+
+.field label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.field input,
+.field textarea,
+.field select,
+.search-input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-0);
+  color: var(--text-soft);
+}
+
+.field input,
+.field select,
+.search-input {
+  height: 34px;
+  padding: 0 9px;
+}
+
+.field textarea {
+  min-height: 64px;
+  padding: 8px 9px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+.field.modified input,
+.field.modified textarea {
+  border-color: rgba(243, 189, 100, 0.45);
+  background: rgba(243, 189, 100, 0.05);
+}
+
+.claim-card {
+  margin: 0 10px 9px;
+  padding: 9px;
+  border: 1px dashed rgba(200, 146, 237, 0.36);
+  border-radius: 8px;
+  background: rgba(200, 146, 237, 0.035);
+}
+
+.claim-card:last-child { margin-bottom: 10px; }
+
+.entity-list {
+  display: grid;
+  padding: 4px 10px;
+}
+
+.entity-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(200, 146, 237, 0.13);
+}
+
+.entity-row:last-child { border-bottom: 0; }
+.entity-row strong { display: block; color: var(--text-soft); font-size: 10px; }
+.entity-row small { display: block; color: var(--muted); font: 9px/1.5 var(--font-mono); }
+
+.claim-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.claim-id {
+  color: var(--purple);
+  font: 600 10px/1.4 var(--font-mono);
+}
+
+.confidence {
+  color: var(--muted);
+  font: 10px/1.4 var(--font-mono);
+}
+
+.evidence-quote {
+  margin-top: 7px;
+  padding: 8px;
+  border-left: 2px solid var(--cyan);
+  background: var(--cyan-soft);
+  color: #b9dbe5;
+  font: 10px/1.7 var(--font-mono);
+}
+
+.machine-original {
+  margin-top: 7px;
+  padding: 7px 8px;
+  border: 1px solid rgba(200, 146, 237, 0.18);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.6;
+}
+
+.machine-original .machine-label {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.disposition {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  padding: 10px 11px 12px;
+  border-top: 1px solid var(--line);
+  background: rgba(10, 21, 29, 0.97);
+  box-shadow: 0 -12px 24px rgba(0,0,0,.16);
+}
+
+.disposition-options {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.disposition-option {
+  min-height: 31px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.disposition-option.active {
+  border-color: rgba(243, 189, 100, 0.45);
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.disposition-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.rejection-input {
+  width: 100%;
+  height: 33px;
+  margin-bottom: 8px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 115, 121, 0.35);
+  border-radius: 7px;
+  background: var(--red-soft);
+  color: var(--text-soft);
+  font-size: 10px;
+}
+
+.preview-box {
+  margin: 0 11px 11px;
+  border: 1px solid rgba(96, 217, 149, 0.25);
+  border-radius: 9px;
+  background: var(--green-soft);
+}
+
+.preview-box header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(96, 217, 149, 0.18);
+}
+
+.preview-box header strong {
+  color: var(--green);
+  font-size: 11px;
+}
+
+.preview-copy {
+  padding: 10px;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.preview-copy ul {
+  margin: 7px 0 0;
+  padding-left: 18px;
+}
+
+.preview-copy li + li { margin-top: 4px; }
+
+.mobile-review-steps {
+  display: none;
+}
+
+.mobile-next {
+  display: none;
+}
+
+.events-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(310px, 0.65fr);
+  gap: 14px;
+}
+
+.event-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(135deg, rgba(15, 38, 48, 0.96), rgba(8, 18, 25, 0.94));
+}
+
+.event-hero::after {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: linear-gradient(90deg, var(--green), transparent 65%);
+  content: "";
+}
+
+.event-id {
+  color: var(--cyan);
+  font: 600 10px/1.5 var(--font-mono);
+  letter-spacing: .09em;
+}
+
+.event-hero h1 {
+  margin: 7px 0 5px;
+  font-size: 25px;
+  font-weight: 680;
+  line-height: 1.35;
+}
+
+.event-hero > p {
+  max-width: 760px;
+  margin: 0;
+  color: var(--text-soft);
+}
+
+.event-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 18px;
+  margin-top: 15px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.event-tabs {
+  display: flex;
+  gap: 3px;
+  margin-top: 14px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+
+.event-tab {
+  flex: 1;
+  min-height: 31px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.event-tab.active {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.claims-table {
+  display: grid;
+}
+
+.claim-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1.3fr) minmax(180px, .7fr) 92px;
+  gap: 10px;
+  align-items: start;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.claim-row:last-child { border-bottom: 0; }
+
+.claim-check {
+  display: grid;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 11px;
+}
+
+.claim-text {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.claim-source {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.claim-source strong {
+  display: block;
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 580;
+}
+
+.timeline {
+  padding: 14px;
+}
+
+.timeline-item {
+  position: relative;
+  padding: 0 0 17px 22px;
+}
+
+.timeline-item::before {
+  position: absolute;
+  left: 2px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cyan);
+  content: "";
+}
+
+.timeline-item::after {
+  position: absolute;
+  left: 5px;
+  top: 16px;
+  bottom: 1px;
+  width: 1px;
+  background: var(--line);
+  content: "";
+}
+
+.timeline-item:last-child::after { display: none; }
+.timeline-item small { color: var(--muted); font: 10px/1.5 var(--font-mono); }
+.timeline-item strong { display: block; color: var(--text-soft); font-size: 11px; font-weight: 580; }
+
+.command-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: start center;
+  padding-top: 12vh;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(4px);
+}
+
+.command-palette {
+  width: min(620px, calc(100vw - 28px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: #0a151d;
+  box-shadow: var(--shadow);
+}
+
+.capture-dialog {
+  width: min(720px, calc(100vw - 28px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 13px;
+  background: #0a151d;
+  box-shadow: var(--shadow);
+}
+
+.capture-dialog > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 19px 20px 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.capture-dialog h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 660;
+}
+
+.capture-dialog header p:last-child {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.capture-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 14px;
+}
+
+.capture-option {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 76px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-0);
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.capture-option:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+}
+
+.capture-option.featured {
+  grid-column: 1 / -1;
+  border-color: rgba(100, 217, 251, 0.28);
+  background: var(--cyan-soft);
+}
+
+.capture-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--cyan);
+  font: 650 12px/1 var(--font-mono);
+}
+
+.capture-option strong,
+.capture-option small {
+  display: block;
+}
+
+.capture-option strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.capture-option small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.capture-dialog > footer {
+  padding: 11px 18px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-0);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.search-discovery {
+  padding: 14px;
+}
+
+.search-form-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.search-scope-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 10px 42px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.search-empty {
+  display: grid;
+  min-height: 220px;
+  place-content: center;
+  justify-items: center;
+  color: var(--muted);
+  text-align: center;
+}
+
+.search-empty > span {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 9px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--cyan);
+  font-size: 18px;
+}
+
+.search-empty strong { color: var(--text-soft); font-size: 12px; }
+.search-empty p { max-width: 390px; margin: 5px 0 0; font-size: 10px; }
+
+.discovery-results {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.discovery-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-0);
+}
+
+.discovery-summary strong { color: var(--text-soft); font-size: 11px; }
+.discovery-summary span { color: var(--muted); font-size: 9px; }
+
+.discovery-result {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 11px;
+  border-bottom: 1px solid var(--line);
+}
+
+.discovery-result:last-child { border-bottom: 0; }
+.result-index { color: var(--cyan); font: 600 10px/1.5 var(--font-mono); }
+.discovery-result small { color: var(--cyan); font: 9px/1.5 var(--font-mono); }
+.discovery-result strong { display: block; color: var(--text); font-size: 11px; line-height: 1.5; }
+.discovery-result p { margin: 2px 0 0; color: var(--muted); font-size: 9px; }
+
+.command-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px;
+  border-bottom: 1px solid var(--line);
+}
+
+.command-search span { color: var(--cyan); }
+.command-search input {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  outline: none;
+  font-size: 14px;
+}
+
+.command-results {
+  max-height: 360px;
+  overflow: auto;
+  padding: 6px;
+}
+
+.command-result {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+
+.command-result:hover { background: var(--surface-3); }
+.command-result small { margin-left: auto; color: var(--muted); }
+
+.toast {
+  position: fixed;
+  z-index: 110;
+  right: 22px;
+  bottom: 22px;
+  display: flex;
+  max-width: 420px;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(96, 217, 149, 0.32);
+  border-radius: 9px;
+  background: #0b1d19;
+  box-shadow: var(--shadow);
+  color: var(--text-soft);
+  animation: toast-in 180ms ease-out;
+}
+
+.toast-mark {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 10px;
+}
+
+.toast strong { display: block; color: var(--text); font-size: 11px; }
+.toast span { color: var(--muted); font-size: 10px; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.bottom-nav {
+  display: none;
+}
+
+.empty-state {
+  padding: 42px 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-state strong {
+  display: block;
+  color: var(--text-soft);
+}
+
+@media (max-width: 1180px) {
+  :root { --sidebar: 202px; }
+  .change-layout { grid-template-columns: 190px minmax(0, 1fr); }
+  .change-layout > :last-child { grid-column: 1 / -1; }
+  .review-shell { grid-template-columns: 210px minmax(330px, 1fr) minmax(330px, .95fr); }
+  .command-trigger { min-width: 38px; width: 38px; }
+  .command-trigger span { display: none; }
+}
+
+@media (max-width: 930px) {
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .today-layout, .sources-layout, .events-layout { grid-template-columns: 1fr; }
+  .source-detail { position: static; }
+  .right-rail { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  .right-rail > :last-child { grid-column: 1 / -1; }
+  .review-shell { grid-template-columns: 200px minmax(320px, 1fr); }
+  .review-pane.candidate-pane { grid-column: 1 / -1; border-top: 1px solid var(--line); }
+}
+
+@media (max-width: 820px) {
+  :root { --topbar: 58px; }
+  body { padding-bottom: 66px; }
+  .sidebar { display: none; }
+  .topbar { left: 0; padding: 0 13px; }
+  .topic-switcher { min-width: 0; }
+  .topic-kicker, .range-pill, .topbar .ghost-button { display: none; }
+  .topic-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .command-trigger kbd { display: none; }
+  .command-trigger::before { color: var(--cyan); content: "⌕"; font-size: 16px; }
+  .main { margin-left: 0; padding: calc(var(--topbar) + 16px) 12px 22px; }
+  .page-heading { align-items: flex-start; margin-bottom: 14px; }
+  .page-heading p { font-size: 12px; }
+  .heading-actions .ghost-button { display: none; }
+  .bottom-nav {
+    position: fixed;
+    inset: auto 0 0;
+    z-index: 50;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    height: 64px;
+    border-top: 1px solid var(--line);
+    background: rgba(7, 16, 23, 0.97);
+    backdrop-filter: blur(16px);
+  }
+  .bottom-nav button {
+    display: grid;
+    place-content: center;
+    gap: 2px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 9px;
+  }
+  .bottom-nav button span:first-child { font: 600 12px/1.3 var(--font-mono); }
+  .bottom-nav button.active { color: var(--cyan); }
+  .review-shell {
+    display: block;
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+    border: 0;
+    background: transparent;
+  }
+  .review-pane {
+    display: none;
+    overflow: visible;
+    border: 1px solid var(--line) !important;
+    border-radius: var(--radius);
+  }
+  .review-pane.mobile-active { display: block; }
+  .pane-header { top: var(--topbar); }
+  .mobile-review-steps {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 5px;
+    margin-bottom: 10px;
+    padding: 4px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--surface-0);
+  }
+  .mobile-review-steps button {
+    min-height: 36px;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 10px;
+  }
+  .mobile-review-steps button.active { background: var(--surface-3); color: var(--cyan); }
+  .mobile-next {
+    position: sticky;
+    bottom: 72px;
+    z-index: 5;
+    display: flex;
+    justify-content: flex-end;
+    padding: 10px;
+    border-top: 1px solid var(--line);
+    background: rgba(10, 21, 29, 0.97);
+  }
+  .toast { right: 12px; bottom: 76px; left: 12px; }
+}
+
+@media (max-width: 600px) {
+  html { font-size: 13px; }
+  .topbar .primary-button { padding: 0 9px; font-size: 11px; }
+  .page-heading { gap: 10px; }
+  .page-heading h1 { font-size: 22px; }
+  .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-card { min-height: 100px; padding: 12px; }
+  .stat-value { font-size: 26px; }
+  .stat-hint { margin-top: 6px; }
+  .today-layout { gap: 10px; }
+  .attention-card { grid-template-columns: 6px minmax(0, 1fr); padding: 13px 11px; }
+  .attention-go { display: none; }
+  .right-rail { grid-template-columns: 1fr; }
+  .right-rail > :last-child { grid-column: auto; }
+  .heading-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .change-layout { grid-template-columns: 1fr; }
+  .change-layout > :last-child { grid-column: auto; }
+  .version-list { display: flex; overflow-x: auto; }
+  .version-item { min-width: 148px; padding-left: 24px; }
+  .version-item::after { display: none; }
+  .split-diff { grid-template-columns: 1fr; }
+  .split-column { border-right: 0; border-bottom: 1px solid var(--line); }
+  .material-meta { grid-template-columns: 1fr 1fr; }
+  .document-copy { padding: 18px 15px 28px; }
+  .document-copy h2 { font-size: 18px; }
+  .document-copy p { font-size: 12px; }
+  .disposition-options { grid-template-columns: 1fr 1fr; }
+  .event-hero { padding: 16px; }
+  .event-hero h1 { font-size: 21px; }
+  .claim-row { grid-template-columns: 28px minmax(0,1fr); }
+  .claim-source, .claim-row > .status-pill { grid-column: 2; }
+  .capture-grid { grid-template-columns: 1fr; }
+  .capture-option.featured { grid-column: auto; }
+  .search-form-row { grid-template-columns: 34px minmax(0, 1fr); }
+  .search-form-row .primary-button { grid-column: 2; }
+  .search-scope-row { padding: 10px 0; }
+  .discovery-summary { align-items: flex-start; flex-direction: column; }
+  .discovery-result { grid-template-columns: 25px minmax(0, 1fr); }
+  .discovery-result .ghost-button { grid-column: 2; justify-self: start; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+</style>
+    <script>
+      window.__prototypeErrors = [];
+      window.addEventListener("error", (event) => {
+        window.__prototypeErrors.push(event.message || "Unknown error");
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        window.__prototypeErrors.push(String(event.reason || "Unhandled rejection"));
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot-screen">
+        <div class="brand-mark" aria-hidden="true">P</div>
+        <p>正在打开 PLDR 工作台…</p>
+      </div>
+    </div>
+
+    <script
+      crossorigin="anonymous"
+      src="https://unpkg.com/react@18.3.1/umd/react.development.js"
+      integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L"
+    ></script>
+    <script
+      crossorigin="anonymous"
+      src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"
+      integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm"
+    ></script>
+    <script
+      crossorigin="anonymous"
+      src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"
+      integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y"
+    ></script>
+    <script type="text/babel" data-presets="env,react">
+const PLDR_MOCK_DATA = {
+  stats: [
+    { id: "new", label: "新材料", value: 7, delta: "3 项可审", tone: "cyan", route: "review", filter: "new" },
+    { id: "changed", label: "网页变化", value: 3, delta: "2 项重要", tone: "amber", route: "changes" },
+    { id: "review", label: "待处理", value: 5, delta: "3 可审 · 2 故障", tone: "purple", route: "review" },
+    { id: "failed", label: "来源失败", value: 2, delta: "均在重试", tone: "red", route: "sources", filter: "failed" },
+  ],
+  attention: [
+    {
+      id: "att-sca",
+      kind: "change",
+      priority: "high",
+      title: "苏伊士运河管理局通告发生实质变化",
+      source: "Suez Canal Authority",
+      time: "18 分钟前",
+      detail: "V3 → V4 · 新增 2 段 · 删除 1 段",
+      reason: "涉及恢复通航窗口，可能更新既有事件 EVT-2026-014。",
+      badges: ["重要来源", "已有事件", "证据可定位"],
+      action: "review",
+    },
+    {
+      id: "att-port",
+      kind: "new",
+      priority: "medium",
+      title: "Port Said 发布新的等待船舶统计",
+      source: "Port Said Authority RSS",
+      time: "42 分钟前",
+      detail: "新文档 · 1 个独立来源 · 3 个候选主张",
+      reason: "可能补充事件 EVT-2026-014 的影响规模，尚无第二来源印证。",
+      badges: ["新材料", "待交叉验证"],
+      action: "review",
+    },
+    {
+      id: "att-reuters",
+      kind: "conflict",
+      priority: "high",
+      title: "两份材料对恢复时间表述不一致",
+      source: "Reuters / SCA",
+      time: "1 小时前",
+      detail: "2 个独立来源 · 1 条冲突主张",
+      reason: "一个来源称“24 小时内”，另一个只确认“正在评估”。",
+      badges: ["冲突主张", "需要研判"],
+      action: "events",
+    },
+    {
+      id: "att-failure",
+      kind: "failure",
+      priority: "medium",
+      title: "Marine Traffic Bulletin 连续抓取失败",
+      source: "Marine Traffic Bulletin",
+      time: "2 小时前",
+      detail: "连续失败 3 次 · 下一次重试 11:30",
+      reason: "原站返回 403。当前专题覆盖不完整，但不会生成伪造数据。",
+      badges: ["采集故障", "覆盖缺口"],
+      action: "sources",
+    },
+  ],
+  sources: [
+    {
+      id: "src-sca",
+      name: "Suez Canal Authority",
+      host: "suezcanal.gov.eg",
+      type: "网页",
+      method: "HTTP",
+      cadence: "30 分钟",
+      lastSuccess: "10:42",
+      lastChange: "10:42",
+      nextRun: "11:12",
+      status: "changed",
+      health: "healthy",
+      lastResult: "changed",
+      versions: 4,
+      successRate: 98.6,
+      failures: 0,
+      independence: "官方机构",
+      language: "阿拉伯语 / 英语",
+    },
+    {
+      id: "src-port",
+      name: "Port Said Authority RSS",
+      host: "portsaid.gov.eg",
+      type: "RSS",
+      method: "RSS + 原页",
+      cadence: "15 分钟",
+      lastSuccess: "10:39",
+      lastChange: "10:18",
+      nextRun: "10:54",
+      status: "healthy",
+      health: "healthy",
+      lastResult: "no_change",
+      versions: 12,
+      successRate: 99.4,
+      failures: 0,
+      independence: "港口管理方",
+      language: "阿拉伯语",
+    },
+    {
+      id: "src-bts",
+      name: "BTS Data Spotlight",
+      host: "bts.gov",
+      type: "网页",
+      method: "HTTP",
+      cadence: "6 小时",
+      lastSuccess: "08:05",
+      lastChange: "昨天 17:20",
+      nextRun: "14:05",
+      status: "healthy",
+      health: "healthy",
+      lastResult: "no_change",
+      versions: 8,
+      successRate: 100,
+      failures: 0,
+      independence: "政府数据",
+      language: "英语",
+    },
+    {
+      id: "src-marine",
+      name: "Marine Traffic Bulletin",
+      host: "marine.example.org",
+      type: "网页",
+      method: "Browser",
+      cadence: "1 小时",
+      lastSuccess: "昨天 23:10",
+      lastChange: "昨天 18:04",
+      nextRun: "11:30",
+      status: "failed",
+      health: "failed",
+      lastResult: "failed",
+      versions: 6,
+      successRate: 82.1,
+      failures: 3,
+      independence: "行业媒体",
+      language: "英语",
+    },
+    {
+      id: "src-logistics",
+      name: "Logistics Delay API",
+      host: "api.logistics.example",
+      type: "API",
+      method: "JSON API",
+      cadence: "1 小时",
+      lastSuccess: "08:02",
+      lastChange: "今天 07:00",
+      nextRun: "11:18",
+      status: "retrying",
+      health: "retrying",
+      lastResult: "no_change",
+      versions: 21,
+      successRate: 91.8,
+      failures: 1,
+      independence: "商业数据",
+      language: "英语",
+    },
+  ],
+  sourceRuns: [
+    { id: "run-041", time: "10:42:18", result: "changed", duration: "1.8s", bytes: "84 KB", detail: "V4 已保存，已生成待审项" },
+    { id: "run-040", time: "10:12:06", result: "no_change", duration: "1.1s", bytes: "82 KB", detail: "内容哈希未变化" },
+    { id: "run-039", time: "09:42:11", result: "no_change", duration: "1.3s", bytes: "82 KB", detail: "内容哈希未变化" },
+    { id: "run-038", time: "09:12:04", result: "success", duration: "1.0s", bytes: "82 KB", detail: "V3 已保存" },
+  ],
+  versions: [
+    { id: "V4", time: "今天 10:42", hash: "a93e…72c1", status: "current", run: "run-041" },
+    { id: "V3", time: "今天 09:12", hash: "b061…f9a3", status: "previous", run: "run-038" },
+    { id: "V2", time: "昨天 18:04", hash: "c8ff…94b0", status: "archived", run: "run-022" },
+    { id: "V1", time: "昨天 11:10", hash: "11ae…8c40", status: "archived", run: "run-007" },
+  ],
+  diff: [
+    { type: "same", old: "The Authority confirmed that navigation through the canal remains under controlled coordination.", next: "The Authority confirmed that navigation through the canal remains under controlled coordination." },
+    { type: "removed", old: "A full reopening schedule will be announced after the technical assessment is complete.", next: "" },
+    { type: "added", old: "", next: "The Authority expects the first northbound convoy to resume within 24 hours, subject to final safety checks." },
+    { type: "added", old: "", next: "Priority will be given to vessels carrying medical supplies and perishable cargo." },
+    { type: "same", old: "Tug assistance and channel inspections are continuing.", next: "Tug assistance and channel inspections are continuing." },
+  ],
+  reviewItems: [
+    {
+      id: "intake-sca-v4",
+      status: "candidate_ready",
+      type: "内容变化",
+      source: "Suez Canal Authority",
+      title: "通航恢复时间表更新",
+      time: "10:43",
+      eventMatch: "EVT-2026-014 · 苏伊士航道恢复评估",
+      priority: "high",
+      hasSnapshot: true,
+      hasCandidate: true,
+    },
+    {
+      id: "intake-port-28",
+      status: "candidate_ready",
+      type: "新材料",
+      source: "Port Said Authority RSS",
+      title: "等待船舶统计更新",
+      time: "10:19",
+      eventMatch: "可能关联 EVT-2026-014",
+      priority: "medium",
+      hasSnapshot: true,
+      hasCandidate: true,
+    },
+    {
+      id: "intake-search-12",
+      status: "candidate_ready",
+      type: "搜索发现",
+      source: "BTS Data Spotlight",
+      title: "供应链延迟背景材料",
+      time: "09:54",
+      eventMatch: "建议新建背景事件",
+      priority: "low",
+      hasSnapshot: true,
+      hasCandidate: true,
+    },
+    {
+      id: "intake-model-fail",
+      status: "generation_failed",
+      type: "生成失败",
+      source: "Logistics Delay API",
+      title: "模型返回结构无效",
+      time: "08:08",
+      eventMatch: "尚未生成候选",
+      priority: "medium",
+      hasSnapshot: true,
+      hasCandidate: false,
+      failureStage: "generation",
+    },
+    {
+      id: "intake-fetch-fail",
+      status: "failed",
+      type: "抓取失败",
+      source: "Marine Traffic Bulletin",
+      title: "原页面返回 403",
+      time: "08:01",
+      eventMatch: "正式区未变化",
+      priority: "medium",
+      hasSnapshot: false,
+      hasCandidate: false,
+      failureStage: "fetch",
+    },
+  ],
+  candidate: {
+    event: {
+      title: "苏伊士航道恢复评估",
+      summary: "管理局通告新增了受安全检查约束的 24 小时恢复窗口。",
+      eventTime: "2026-08-29",
+      location: "Suez Canal",
+      match: "EVT-2026-014",
+    },
+    entities: [
+      { name: "Suez Canal Authority", type: "organization", role: "发布方" },
+      { name: "northbound convoy", type: "operation", role: "受影响对象" },
+    ],
+    claims: [
+      {
+        id: "claim-1",
+        text: "管理局预计首批北向船队将在 24 小时内恢复通行，但仍取决于最终安全检查。",
+        evidence: "The Authority expects the first northbound convoy to resume within 24 hours, subject to final safety checks.",
+        stance: "supports",
+        strength: 0.86,
+        valid: true,
+      },
+      {
+        id: "claim-2",
+        text: "医疗物资和易腐货物运输船将被优先安排。",
+        evidence: "Priority will be given to vessels carrying medical supplies and perishable cargo.",
+        stance: "supports",
+        strength: 0.81,
+        valid: true,
+      },
+    ],
+    model: {
+      name: "glm-5.3-flash",
+      latency: "7.4s",
+      tokens: "2,184",
+      cost: "¥0.04",
+      schema: "intake-candidate/v2",
+      callId: "llm_01J72D8P",
+    },
+  },
+  reviewDetails: {
+    "intake-sca-v4": {
+      snapshot: "V4 · a93e…72c1",
+      capturedAt: "10:42:18 CST",
+      kicker: "Suez Canal Authority · Navigation Update",
+      documentTitle: "Statement on the phased resumption of northbound transit",
+      intro: "The Authority confirmed that navigation through the canal remains under controlled coordination.",
+      outro: "Tug assistance and channel inspections are continuing. Further updates will be published through official channels.",
+      diff: "sca",
+    },
+    "intake-port-28": {
+      snapshot: "V1 · d481…0ab2",
+      capturedAt: "10:18:44 CST",
+      kicker: "Port Said Authority RSS · Vessel Update",
+      documentTitle: "Northbound waiting vessel statistics updated",
+      intro: "The port authority published an updated operational count for vessels awaiting northbound transit.",
+      outro: "The figures are a point-in-time operational count and may change as clearances are issued.",
+      candidate: {
+        event: {
+          title: "苏伊士航道恢复评估",
+          summary: "Port Said 的新统计显示，北向等待船舶为 37 艘，其中 9 艘运输易腐货物。",
+          eventTime: "2026-08-29",
+          location: "Port Said",
+          match: "EVT-2026-014",
+        },
+        entities: [
+          { name: "Port Said Authority", type: "organization", role: "发布方" },
+          { name: "37 waiting vessels", type: "measurement", role: "影响规模" },
+        ],
+        claims: [
+          {
+            id: "port-claim-1",
+            text: "Port Said 管理方记录到 37 艘船等待北向通行。",
+            evidence: "A total of 37 vessels were recorded waiting for northbound transit at 10:00 local time.",
+            stance: "supports",
+            strength: 0.84,
+            valid: true,
+          },
+          {
+            id: "port-claim-2",
+            text: "等待船舶中有 9 艘运输易腐货物。",
+            evidence: "Nine of the waiting vessels were carrying perishable cargo.",
+            stance: "supports",
+            strength: 0.82,
+            valid: true,
+          },
+        ],
+        model: {
+          name: "glm-5.3-flash",
+          latency: "6.8s",
+          tokens: "1,746",
+          cost: "¥0.03",
+          schema: "intake-candidate/v2",
+          callId: "llm_01J72E1M",
+        },
+      },
+    },
+    "intake-search-12": {
+      snapshot: "V1 · 5c11…92fe",
+      capturedAt: "09:53:26 CST",
+      kicker: "BTS Data Spotlight · Search Discovery",
+      documentTitle: "Canal disruptions and downstream freight delay",
+      intro: "Historical transportation data shows that canal disruptions can affect downstream freight schedules beyond the initial closure window.",
+      outro: "This material provides background context and does not independently confirm the current Suez event.",
+      candidate: {
+        event: {
+          title: "航道中断后的下游物流延迟",
+          summary: "背景材料说明航道扰动可能在恢复通行后继续影响下游班期；它不直接证明当前事件的实际延迟。",
+          eventTime: "2026-08-29",
+          location: "Global maritime routes",
+          match: "建议新建背景事件",
+        },
+        entities: [
+          { name: "Bureau of Transportation Statistics", type: "organization", role: "数据发布方" },
+          { name: "downstream freight schedules", type: "concept", role: "背景对象" },
+        ],
+        claims: [
+          {
+            id: "bts-claim-1",
+            text: "历史数据表明，航道恢复后，下游货运班期仍可能继续受到影响。",
+            evidence: "Downstream freight schedules may remain affected after traffic through a constrained waterway resumes.",
+            stance: "context",
+            strength: 0.72,
+            valid: true,
+          },
+        ],
+        model: {
+          name: "glm-5.3-flash",
+          latency: "5.9s",
+          tokens: "1,208",
+          cost: "¥0.02",
+          schema: "intake-candidate/v2",
+          callId: "llm_01J72E4Q",
+        },
+      },
+    },
+    "intake-model-fail": {
+      snapshot: "V21 · f621…119d",
+      capturedAt: "08:02:19 CST",
+      kicker: "Logistics Delay API · Validated JSON",
+      documentTitle: "Latest logistics delay measurements",
+      intro: "The upstream API response passed schema validation and was stored as snapshot V21.",
+      outro: "Candidate generation failed because the model response did not match intake-candidate/v2. The source snapshot remains available for inspection.",
+      evidence: ["Average reported delay: 18.4 hours across the selected maritime corridor."],
+    },
+  },
+  event: {
+    id: "EVT-2026-014",
+    title: "苏伊士航道恢复评估",
+    status: "已确认 · 持续更新",
+    summary: "在完成拖带与航道检查后，管理局开始评估分阶段恢复北向船队的条件。",
+    time: "2026-08-28 — 进行中",
+    location: "Suez Canal, Egypt",
+    documents: 6,
+    sources: 4,
+    claims: 5,
+    evidence: 11,
+    confidence: "中等",
+  },
+};
+
+window.PLDR_MOCK_DATA = PLDR_MOCK_DATA;
+
+</script>
+    <script type="text/babel" data-presets="env,react">
+const TONE_LABELS = {
+  changed: ["有变化", "amber"],
+  healthy: ["正常", "green"],
+  failed: ["失败", "red"],
+  retrying: ["重试中", "amber"],
+  current: ["当前", "cyan"],
+  candidate_ready: ["候选就绪", "purple"],
+  generation_failed: ["生成失败", "red"],
+  rejected: ["已驳回", "muted"],
+  confirmed: ["已入档", "green"],
+  no_change: ["无变化", "muted"],
+  success: ["已保存", "green"],
+  archived: ["已归档", "muted"],
+};
+
+function StatusPill({ status, label, tone }) {
+  const config = TONE_LABELS[status] || [label || status, tone || "muted"];
+  return (
+    <span className={`status-pill tone-${tone || config[1]}`}>
+      {label || config[0]}
+    </span>
+  );
+}
+
+function NavButton({ item, active, onClick }) {
+  return (
+    <button className={`nav-button ${active ? "active" : ""}`} onClick={onClick} type="button">
+      <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+      <span>{item.label}</span>
+      {item.count !== undefined && <span className="nav-count">{item.count}</span>}
+    </button>
+  );
+}
+
+function PageHeading({ eyebrow, title, description, actions }) {
+  return (
+    <header className="page-heading">
+      <div>
+        <p className="page-eyebrow">{eyebrow}</p>
+        <h1>{title}</h1>
+        {description && <p>{description}</p>}
+      </div>
+      {actions && <div className="heading-actions">{actions}</div>}
+    </header>
+  );
+}
+
+function Surface({ title, subtitle, actions, children, className = "" }) {
+  return (
+    <section className={`surface ${className}`}>
+      {(title || actions) && (
+        <header className="surface-header">
+          <div>
+            {title && <div className="surface-title">{title}</div>}
+            {subtitle && <div className="surface-subtitle">{subtitle}</div>}
+          </div>
+          {actions}
+        </header>
+      )}
+      {children}
+    </section>
+  );
+}
+
+function StatCard({ stat, onClick }) {
+  const color = {
+    cyan: "var(--cyan)",
+    amber: "var(--amber)",
+    purple: "var(--purple)",
+    red: "var(--red)",
+  }[stat.tone];
+  return (
+    <button
+      className="stat-card"
+      style={{ "--stat-color": color }}
+      type="button"
+      onClick={onClick}
+      aria-label={`${stat.label} ${stat.value}，打开详情`}
+    >
+      <div className="stat-label">{stat.label}</div>
+      <div className="stat-value-row">
+        <strong className="stat-value">{stat.value}</strong>
+        <span className="stat-delta">{stat.delta}</span>
+      </div>
+      <div className="stat-hint"><span>所选 24 小时</span><span>查看 →</span></div>
+    </button>
+  );
+}
+
+function AttentionCard({ item, onOpen }) {
+  return (
+    <button className="attention-card" type="button" onClick={() => onOpen(item)}>
+      <span className={`priority-rail ${item.priority}`} aria-label={`优先级 ${item.priority}`}></span>
+      <span className="attention-main">
+        <h3>{item.title}</h3>
+        <span className="attention-meta">
+          <span>{item.source}</span><span>{item.time}</span><span>{item.detail}</span>
+        </span>
+        <p className="attention-reason">{item.reason}</p>
+        <span className="badge-row">
+          {item.badges.map((badge) => <span className="badge" key={badge}>{badge}</span>)}
+        </span>
+      </span>
+      <span className="attention-go" aria-hidden="true">›</span>
+    </button>
+  );
+}
+
+function HealthRow({ label, detail, value, tone = "green" }) {
+  const barColor = tone === "amber" ? "var(--amber)" : tone === "red" ? "var(--red)" : "var(--green)";
+  return (
+    <div className="health-row">
+      <strong>{label}</strong>
+      <span>{detail}</span>
+      <div className="health-track"><i style={{ width: `${value}%`, background: barColor }} /></div>
+    </div>
+  );
+}
+
+function Filters({ items, value, onChange }) {
+  return (
+    <div className="filters" role="group" aria-label="状态筛选">
+      {items.map((item) => (
+        <button
+          className={`filter-button ${value === item.value ? "active" : ""}`}
+          key={item.value}
+          onClick={() => onChange(item.value)}
+          type="button"
+        >
+          {item.label}{item.count !== undefined ? ` ${item.count}` : ""}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function SourceTable({ sources, selectedId, onSelect }) {
+  return (
+    <div className="table-scroll">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>来源</th><th>运行健康</th><th>最近结果</th><th>采集方式</th><th>周期</th>
+            <th>上次成功</th><th>最近变化</th><th>下次运行</th><th>版本</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sources.map((source) => (
+            <tr
+              className={selectedId === source.id ? "selected" : ""}
+              key={source.id}
+              onClick={() => onSelect(source.id)}
+              tabIndex="0"
+              onKeyDown={(event) => event.key === "Enter" && onSelect(source.id)}
+            >
+              <td className="source-name"><strong>{source.name}</strong><small>{source.host}</small></td>
+              <td><StatusPill status={source.health} /></td>
+              <td><StatusPill status={source.lastResult} /></td>
+              <td>{source.method}</td><td>{source.cadence}</td><td>{source.lastSuccess}</td>
+              <td>{source.lastChange}</td><td>{source.nextRun}</td><td>{source.versions}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {!sources.length && <div className="empty-state"><strong>没有符合条件的来源</strong>换一个状态筛选试试。</div>}
+    </div>
+  );
+}
+
+function RunList({ runs }) {
+  return (
+    <div className="run-list">
+      {runs.map((run) => (
+        <div className="run-row" key={run.id}>
+          <span className="run-time">{run.time}</span>
+          <StatusPill status={run.result} />
+          <div className="run-detail">{run.detail}<small>{run.id} · {run.duration} · {run.bytes}</small></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VersionList({ versions, selected, onSelect }) {
+  return (
+    <div className="version-list">
+      {versions.map((version) => (
+        <button
+          className={`version-item ${selected === version.id ? "active" : ""}`}
+          key={version.id}
+          onClick={() => onSelect(version.id)}
+          type="button"
+        >
+          <strong><span>{version.id}</span>{version.status === "current" && <span>当前</span>}</strong>
+          <small>{version.time}</small><small>{version.hash}</small>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function DiffViewer({ chunks, mode, onlyChanges, oldLabel = "上一版本", newLabel = "当前版本" }) {
+  const visible = onlyChanges ? chunks.filter((chunk) => chunk.type !== "same") : chunks;
+  if (mode === "split") {
+    return (
+      <div className="split-diff">
+        <div className="split-column">
+          <div className="split-heading">{oldLabel}</div>
+          {visible.map((chunk, index) => (
+            <div className={`split-line ${chunk.type === "removed" ? "removed" : ""} ${!chunk.old ? "empty" : ""}`} key={`old-${index}`}>
+              {chunk.old || "—"}
+            </div>
+          ))}
+        </div>
+        <div className="split-column">
+          <div className="split-heading">{newLabel}</div>
+          {visible.map((chunk, index) => (
+            <div className={`split-line ${chunk.type === "added" ? "added" : ""} ${!chunk.next ? "empty" : ""}`} key={`new-${index}`}>
+              {chunk.next || "—"}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="diff-document">
+      {visible.map((chunk, index) => (
+        <React.Fragment key={index}>
+          {chunk.type === "removed" && (
+            <div className="diff-line removed"><span className="diff-symbol">−</span><span className="diff-copy">{chunk.old}</span></div>
+          )}
+          {chunk.type === "added" && (
+            <div className="diff-line added"><span className="diff-symbol">+</span><span className="diff-copy">{chunk.next}</span></div>
+          )}
+          {chunk.type === "same" && (
+            <div className="diff-line same"><span className="diff-symbol">·</span><span className="diff-copy">{chunk.next}</span></div>
+          )}
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+function ReviewQueue({ items, selectedId, onSelect }) {
+  return (
+    <div className="review-queue">
+      {items.map((item) => (
+        <button
+          className={`queue-item ${item.id === selectedId ? "active" : ""} ${!item.hasCandidate ? "disabled" : ""}`}
+          key={item.id}
+          onClick={() => onSelect(item.id)}
+          type="button"
+        >
+          <span className="queue-topline">
+            <span className="queue-type">{item.type}</span><span className="queue-time">{item.time}</span>
+          </span>
+          <h3>{item.title}</h3><p>{item.source}</p>
+          <div className="queue-match">{item.eventMatch}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function DocumentPane({ item, candidate, detail, view, setView }) {
+  const evidence = candidate?.claims?.map((claim) => claim.evidence) || detail.evidence || [];
+  const hasDiff = detail.diff === "sca";
+  return (
+    <>
+      <div className="material-meta">
+        <div><small>来源</small><strong>{item.source}</strong></div>
+        <div><small>快照</small><strong>{detail.snapshot}</strong></div>
+        <div><small>采集时间</small><strong>{detail.capturedAt}</strong></div>
+      </div>
+      <div className="document-toolbar">
+        <div className="segmented">
+          <button className={view === "material" ? "active" : ""} onClick={() => setView("material")}>提取正文</button>
+          {hasDiff && <button className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}>V3 / V4 Diff</button>}
+        </div>
+        <StatusPill label="原始材料" tone="cyan" />
+      </div>
+      {view === "material" ? (
+        <article className="document-copy">
+          <div className="doc-label">{detail.kicker}</div>
+          <h2>{detail.documentTitle}</h2>
+          <p>{detail.intro}</p>
+          {evidence.map((quote, index) => <p className="evidence-highlight" key={quote}><span className="evidence-marker">E{index + 1}</span>{quote}</p>)}
+          <p>{detail.outro}</p>
+        </article>
+      ) : (
+        <DiffViewer chunks={window.PLDR_MOCK_DATA.diff} mode="inline" onlyChanges={false} />
+      )}
+    </>
+  );
+}
+
+function CandidatePane({ candidate, disposition, setDisposition, edits, setEdits, onPreview, previewOpen, onConfirm, rejectionReason, setRejectionReason }) {
+  const change = (key, value) => setEdits((old) => ({ ...old, [key]: value }));
+  const targetText = {
+    "新建": `将新建事件“${edits.title}”`,
+    "合并": `将合并到 ${candidate.event.match}`,
+    "修改": `将修改 ${candidate.event.match} 的摘要与已选主张`,
+    "驳回": "不会改变任何正式事件、主张或证据",
+  }[disposition];
+  const confirmLabel = disposition === "驳回" ? "确认驳回候选" : `确认${disposition}并入档`;
+  return (
+    <>
+      <div className="candidate-banner">
+        <span aria-hidden="true">◇</span>
+        <span><strong>AI 候选 · 尚未进入正式档案</strong>{candidate.model.name} · {candidate.model.latency} · {candidate.model.tokens} tokens · {candidate.model.cost}</span>
+      </div>
+
+      <section className="candidate-section">
+        <header className="candidate-section-header"><strong>候选事件</strong><span className="machine-label">MACHINE</span></header>
+        <div className="candidate-fields">
+          <div className={`field ${edits.title !== candidate.event.title ? "modified" : ""}`}>
+            <label><span>事件标题</span>{edits.title !== candidate.event.title && <span className="human-label">人工修改</span>}</label>
+            <input value={edits.title} onChange={(e) => change("title", e.target.value)} />
+          </div>
+          <div className={`field ${edits.summary !== candidate.event.summary ? "modified" : ""}`}>
+            <label><span>摘要</span>{edits.summary !== candidate.event.summary && <span className="human-label">人工修改</span>}</label>
+            <textarea value={edits.summary} onChange={(e) => change("summary", e.target.value)} />
+          </div>
+          <div className="field"><label><span>建议归档</span><span className="machine-label">92% 匹配</span></label><input value={candidate.event.match} readOnly /></div>
+        </div>
+      </section>
+
+      <section className="candidate-section">
+        <header className="candidate-section-header"><strong>候选实体</strong><span className="machine-label">{candidate.entities.length} 项</span></header>
+        <div className="entity-list">
+          {candidate.entities.map((entity) => <div className="entity-row" key={`${entity.name}-${entity.role}`}><span><strong>{entity.name}</strong><small>{entity.type}</small></span><span className="badge">{entity.role}</span></div>)}
+        </div>
+      </section>
+
+      <section className="candidate-section">
+        <header className="candidate-section-header"><strong>候选主张与证据</strong><span className="machine-label">{candidate.claims.length} 项</span></header>
+        {candidate.claims.map((claim, index) => (
+          <article className="claim-card" key={claim.id}>
+            <div className="claim-head"><span className="claim-id">C{index + 1}</span><span>{edits[`claim${index}`] !== claim.text && <span className="human-label">人工修改</span>} <span className="confidence">模型置信 {Math.round(claim.strength * 100)}%</span></span></div>
+            <div className="field"><textarea value={edits[`claim${index}`]} onChange={(e) => change(`claim${index}`, e.target.value)} /></div>
+            {edits[`claim${index}`] !== claim.text && <div className="machine-original"><span className="machine-label">机器原值</span>{claim.text}</div>}
+            <div className="evidence-quote"><span className="evidence-marker">E{index + 1}</span>{claim.evidence}</div>
+          </article>
+        ))}
+      </section>
+
+      {previewOpen && (
+        <section className="preview-box">
+          <header><strong>确认后的可见变化</strong><span className="formal-label">FORMAL</span></header>
+          <div className="preview-copy">
+            <strong>{targetText}</strong>；原材料与机器原值都保持不可变。
+            {disposition === "驳回" ? (
+              <ul><li>驳回原因：{rejectionReason}</li><li>候选标记为已驳回，并保留人工决定。</li><li>正式事件档案和报告区不会出现这些内容。</li></ul>
+            ) : (
+              <ul>
+                <li>写入 {candidate.claims.length} 条人工确认主张，并分别回链原句。</li>
+                <li>采用当前人工编辑值；机器原值继续保留用于审计。</li>
+                <li>正式报告区可引用这些主张；原材料本身保持不可变。</li>
+              </ul>
+            )}
+          </div>
+        </section>
+      )}
+
+      <footer className="disposition">
+        <div className="disposition-options">
+          {["新建", "合并", "修改", "驳回"].map((option) => (
+            <button className={`disposition-option ${disposition === option ? "active" : ""}`} key={option} onClick={() => setDisposition(option)}>{option}</button>
+          ))}
+        </div>
+        {disposition === "驳回" && <input className="rejection-input" value={rejectionReason} onChange={(event) => setRejectionReason(event.target.value)} placeholder="填写驳回原因（必填）" aria-label="驳回原因" />}
+        <div className="disposition-actions">
+          <button className="ghost-button button-small" disabled={disposition === "驳回" && !rejectionReason.trim()} onClick={onPreview}>{previewOpen ? "收起预览" : "预览影响"}</button>
+          <button className="primary-button button-small" disabled={!previewOpen} onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </footer>
+    </>
+  );
+}
+
+function CommandPalette({ open, query, setQuery, items, onChoose, onClose }) {
+  if (!open) return null;
+  const filtered = items.filter((item) => `${item.label}${item.hint}`.toLowerCase().includes(query.toLowerCase()));
+  return (
+    <div className="command-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="command-palette" role="dialog" aria-modal="true" aria-label="全局命令">
+        <div className="command-search"><span>⌕</span><input autoFocus value={query} onChange={(e) => setQuery(e.target.value)} placeholder="跳转页面、查找事件或执行操作…" /></div>
+        <div className="command-results">
+          {filtered.map((item) => <button className="command-result" key={item.id} onClick={() => onChoose(item)}><span>{item.icon}</span><span>{item.label}</span><small>{item.hint}</small></button>)}
+          {!filtered.length && <div className="empty-state">没有匹配的命令</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Toast({ toast }) {
+  if (!toast) return null;
+  return (
+    <div className="toast" role="status">
+      <span className="toast-mark">✓</span>
+      <span><strong>{toast.title}</strong><span>{toast.detail}</span></span>
+    </div>
+  );
+}
+
+window.PLDR_COMPONENTS = {
+  StatusPill,
+  NavButton,
+  PageHeading,
+  Surface,
+  StatCard,
+  AttentionCard,
+  HealthRow,
+  Filters,
+  SourceTable,
+  RunList,
+  VersionList,
+  DiffViewer,
+  ReviewQueue,
+  DocumentPane,
+  CandidatePane,
+  CommandPalette,
+  Toast,
+};
+
+</script>
+    <script type="text/babel" data-presets="env,react">
+const {
+  StatusPill,
+  NavButton,
+  PageHeading,
+  Surface,
+  StatCard,
+  AttentionCard,
+  HealthRow,
+  Filters,
+  SourceTable,
+  RunList,
+  VersionList,
+  DiffViewer,
+  ReviewQueue,
+  DocumentPane,
+  CandidatePane,
+  CommandPalette,
+  Toast,
+} = window.PLDR_COMPONENTS;
+
+const DATA = window.PLDR_MOCK_DATA;
+
+const NAV_ITEMS = [
+  { id: "today", label: "今日", icon: "01" },
+  { id: "sources", label: "采集源", icon: "02", count: 5 },
+  { id: "changes", label: "网页变化", icon: "03", count: 3 },
+  { id: "review", label: "待审箱", icon: "04", count: 5 },
+  { id: "events", label: "事件档案", icon: "05" },
+];
+
+const ROUTES = new Set(NAV_ITEMS.map((item) => item.id));
+
+function TodayScreen({ navigate, openCapture, openStat, openAttention }) {
+  return (
+    <section className="screen" data-screen-label="今日注意力队列">
+      <PageHeading
+        eyebrow="P1 · RELIABLE COLLECTION"
+        title="今天需要处理什么"
+        description="所选 24 小时内的新增、变化、待审与故障。地图只呈现有明确坐标的相关事件，不替代任务队列。"
+        actions={<><button className="ghost-button" onClick={() => navigate("sources")}>查看采集状态</button><button className="primary-button" onClick={openCapture}>＋ 添加输入</button></>}
+      />
+
+      <div className="stats-grid">
+        {DATA.stats.map((stat) => <StatCard stat={stat} key={stat.id} onClick={() => openStat(stat)} />)}
+      </div>
+
+      <div className="today-layout">
+        <Surface title="优先处理" subtitle="按影响与可信度排序 · 不是资讯流" actions={<StatusPill label="4 项需注意" tone="amber" />}>
+          <div className="attention-list">
+            {DATA.attention.map((item) => <AttentionCard item={item} key={item.id} onOpen={openAttention} />)}
+          </div>
+        </Surface>
+
+        <aside className="right-rail">
+          <Surface title="采集覆盖" subtitle="42 次计划检查 · 40 次完成">
+            <div className="surface-body">
+              <div className="health-list">
+                <HealthRow label="固定来源" detail="28 / 30 正常" value={93} />
+                <HealthRow label="关键词发现" detail="4 / 4 正常" value={100} />
+                <HealthRow label="原页取证" detail="2 项降级" value={84} tone="amber" />
+              </div>
+              <div className="coverage-note"><strong>覆盖不完整：</strong>Marine Traffic Bulletin 返回 403；该缺口会持续显示，不用空白结果冒充成功。</div>
+            </div>
+          </Surface>
+
+          <Surface title="模型与成本" subtitle="候选生成，不直接写正式档案">
+            <div className="surface-body">
+              <div className="model-meter">
+                <div className="model-metric"><small>当前模型</small><strong>GLM-5.3 Flash</strong></div>
+                <div className="model-metric"><small>本时段成本</small><strong>¥ 0.38</strong></div>
+                <div className="model-metric"><small>生成成功</small><strong>8 / 9</strong></div>
+                <div className="model-metric"><small>平均等待</small><strong>7.8 s</strong></div>
+              </div>
+            </div>
+          </Surface>
+
+          <Surface title="相关地点" subtitle="仅 1 项材料有可靠坐标">
+            <div className="surface-body">
+              <div className="mini-map" aria-label="苏伊士运河位置示意">
+                <span className="map-pin"></span><span className="map-label">Suez Canal · 3 项变化</span>
+              </div>
+              <div className="map-caption"><span>坐标来自已确认事件</span><button className="ghost-button button-small" onClick={() => navigate("events")}>查看事件位置</button></div>
+            </div>
+          </Surface>
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function SourcesScreen({ filter, setFilter, selectedSourceId, setSelectedSourceId, notify, navigate, openCapture }) {
+  const filters = [
+    { value: "all", label: "全部", count: DATA.sources.length },
+    { value: "healthy", label: "正常", count: 3 },
+    { value: "changed", label: "有变化", count: 1 },
+    { value: "failed", label: "失败 / 重试", count: 2 },
+  ];
+  const visibleSources = DATA.sources.filter((source) => {
+    if (filter === "all") return true;
+    if (filter === "failed") return ["failed", "retrying"].includes(source.health);
+    if (filter === "changed") return source.lastResult === "changed";
+    return source.health === filter;
+  });
+  const selected = visibleSources.find((source) => source.id === selectedSourceId) || visibleSources[0] || DATA.sources[0];
+  const sourceAction = (title, detail) => notify(title, `${selected.name} · ${detail}`);
+  const alternateRuns = {
+    "src-port": [
+      { id: "run-rss-118", time: "10:39:07", result: "no_change", duration: "0.7s", bytes: "28 KB", detail: "RSS 无新增，原页哈希未变化" },
+      { id: "run-rss-117", time: "10:24:02", result: "success", duration: "0.9s", bytes: "31 KB", detail: "新文档与原页快照已保存" },
+    ],
+    "src-bts": [
+      { id: "run-bts-088", time: "08:05:31", result: "no_change", duration: "1.4s", bytes: "112 KB", detail: "正文提取结果未变化" },
+      { id: "run-bts-087", time: "昨天 02:05", result: "success", duration: "1.7s", bytes: "109 KB", detail: "V8 已保存" },
+    ],
+    "src-marine": [
+      { id: "run-web-066", time: "10:30:12", result: "failed", duration: "4.2s", bytes: "0 KB", detail: "原站返回 HTTP 403，未创建空快照" },
+      { id: "run-web-065", time: "09:30:08", result: "failed", duration: "4.0s", bytes: "0 KB", detail: "Browser 连接器仍被拒绝，保留故障" },
+      { id: "run-web-064", time: "08:30:05", result: "failed", duration: "3.8s", bytes: "0 KB", detail: "首次失败，已进入退避重试" },
+    ],
+    "src-logistics": [
+      { id: "run-api-221", time: "10:18:10", result: "retrying", duration: "2.0s", bytes: "2 KB", detail: "上游超时，按退避策略等待第二次重试" },
+      { id: "run-api-220", time: "09:18:02", result: "no_change", duration: "0.8s", bytes: "18 KB", detail: "结构校验通过，数据未变化" },
+    ],
+  };
+  const displayedRuns = alternateRuns[selected.id] || DATA.sourceRuns;
+
+  return (
+    <section className="screen" data-screen-label="采集源与运行">
+      <PageHeading
+        eyebrow="COLLECTION SOURCES"
+        title="采集源与运行"
+        description="看清每个来源抓取什么、何时再运行、上次是否成功，以及每一次快照版本。普通 HTTP/RSS/API 优先，复杂网页才使用浏览器连接器。"
+        actions={<><button className="ghost-button" onClick={() => sourceAction("已开始健康检查", "仅执行试抓，不生成正式对象")}>检查全部</button><button className="primary-button" onClick={openCapture}>＋ 添加输入</button></>}
+      />
+      <div className="sources-layout">
+        <Surface title="来源目录" subtitle={`${visibleSources.length} 个代表性结果 · 原型仅展示专题子集`} actions={<Filters items={filters} value={filter} onChange={setFilter} />}>
+          <SourceTable sources={visibleSources} selectedId={selected.id} onSelect={setSelectedSourceId} />
+        </Surface>
+
+        <aside className="surface source-detail">
+          <div className="detail-hero">
+            <div className="button-row"><StatusPill status={selected.health} /><StatusPill status={selected.lastResult} /></div>
+            <h2>{selected.name}</h2><p>{selected.host} · {selected.type} · {selected.language}</p>
+          </div>
+          <div className="detail-grid">
+            <div className="detail-field"><small>采集方式</small><strong>{selected.method}</strong></div>
+            <div className="detail-field"><small>计划周期</small><strong>{selected.cadence}</strong></div>
+            <div className="detail-field"><small>成功率</small><strong>{selected.successRate}%</strong></div>
+            <div className="detail-field"><small>连续失败</small><strong>{selected.failures} 次</strong></div>
+            <div className="detail-field"><small>来源独立组</small><strong>{selected.independence}</strong></div>
+            <div className="detail-field"><small>快照版本</small><strong>{selected.versions} 版</strong></div>
+          </div>
+          <div className="surface-header"><div className="surface-title">最近运行</div><button className="ghost-button button-small" onClick={() => selected.id === "src-sca" ? navigate("changes") : sourceAction("该来源的版本历史已定位", "当前原型仅展开 SCA 的完整 Diff 示例")}>版本 Diff</button></div>
+          <RunList runs={displayedRuns} />
+          <div className="surface-body">
+            <div className="button-row">
+              <button className="primary-button button-small" onClick={() => sourceAction("已加入立即检查队列", "完成后将保存新的不可变快照")}>立即检查</button>
+              <button className="ghost-button button-small" onClick={() => sourceAction("已暂停来源", "保留历史快照，不再按计划运行")}>暂停</button>
+              {selected.failures > 0 && <button className="danger-button button-small" onClick={() => sourceAction("已安排重试", "原故障记录保持可见")}>重试失败任务</button>}
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function ChangesScreen({ navigate, notify }) {
+  const [selectedVersion, setSelectedVersion] = React.useState("V4");
+  const [diffMode, setDiffMode] = React.useState("inline");
+  const [onlyChanges, setOnlyChanges] = React.useState(false);
+  const comparisons = {
+    V4: { title: "V3 → V4 正文变化", subtitle: "今天 09:12 对比 10:42", chunks: DATA.diff, scale: "新增 2 段 · 删除 1 段 · 约 48 个词", impact: "既有事件 EVT-2026-014 的恢复时间与优先级" },
+    V3: { title: "V2 → V3 正文变化", subtitle: "昨天 18:04 对比今天 09:12", chunks: [{ type: "same", old: "Navigation remains under controlled coordination.", next: "Navigation remains under controlled coordination." }, { type: "added", old: "", next: "Tug assistance and channel inspections are continuing." }], scale: "新增 1 段 · 无删除", impact: "记录航道检查仍在继续，已在昨日审核" },
+    V2: { title: "V1 → V2 正文变化", subtitle: "昨天 11:10 对比 18:04", chunks: [{ type: "removed", old: "Transit is temporarily suspended.", next: "" }, { type: "added", old: "", next: "Navigation remains under controlled coordination." }], scale: "新增 1 段 · 删除 1 段", impact: "状态从暂停调整为受控协调，已在昨日审核" },
+    V1: { title: "V1 初始快照", subtitle: "昨天 11:10 · 没有更早版本", chunks: [{ type: "same", old: "Transit is temporarily suspended pending inspection.", next: "Transit is temporarily suspended pending inspection." }], scale: "初始保存 · 无可比较版本", impact: "创建来源基线，不自动生成变化主张" },
+  };
+  const comparison = comparisons[selectedVersion];
+  return (
+    <section className="screen" data-screen-label="网页版本变化">
+      <PageHeading
+        eyebrow="IMMUTABLE SNAPSHOTS"
+        title="网页版本变化"
+        description="先固定版本，再比较正文。旧快照不会因为来源更新而被覆盖；候选证据始终指向当时看到的原句。"
+        actions={<button className="primary-button" onClick={() => { notify("已定位已有待审项", "V3 → V4 已在 10:43 生成 intake-sca-v4，不会重复创建"); navigate("review"); }}>打开已有待审项</button>}
+      />
+      <div className="change-layout">
+        <Surface title="版本历史" subtitle="Suez Canal Authority">
+          <VersionList versions={DATA.versions} selected={selectedVersion} onSelect={setSelectedVersion} />
+        </Surface>
+
+        <Surface title={comparison.title} subtitle={`${comparison.subtitle} · 正文提取器 v2`}>
+          <div className="diff-toolbar">
+            <div className="segmented">
+              <button className={diffMode === "inline" ? "active" : ""} onClick={() => setDiffMode("inline")}>行内</button>
+              <button className={diffMode === "split" ? "active" : ""} onClick={() => setDiffMode("split")}>左右</button>
+            </div>
+            <label className="check-control"><input type="checkbox" checked={onlyChanges} onChange={(e) => setOnlyChanges(e.target.checked)} />只看变化</label>
+          </div>
+          <DiffViewer chunks={comparison.chunks} mode={diffMode} onlyChanges={onlyChanges} oldLabel={selectedVersion === "V1" ? "无上一版本" : `V${Number(selectedVersion.slice(1)) - 1}`} newLabel={selectedVersion} />
+        </Surface>
+
+        <Surface title="影响判断" subtitle="规则提示 + AI 候选，仍需人工确认">
+          <div className="surface-body">
+            <div className="impact-list">
+              <div className="impact-card"><small>变化规模</small><strong>{comparison.scale}</strong></div>
+              <div className="impact-card"><small>可能影响</small><strong>{comparison.impact}</strong></div>
+              <div className="impact-card"><small>来源性质</small><strong>官方机构 · 第一方材料 · 独立组 1</strong></div>
+              <div className="impact-card"><small>下一步</small><strong>{selectedVersion === "V4" ? "打开已有待审项，逐句核对后决定是否合并" : "历史版本已处理；仅用于审计复核"}</strong></div>
+            </div>
+            <div className="evidence-check">✓ {selectedVersion === "V4" ? "两处候选证据都可在 V4 正文中精确定位；删除段落仅记录变化，不自动推导“否定”主张。" : `${selectedVersion} 已保存不可变哈希，历史审核结果不会因本次查看而改变。`}</div>
+          </div>
+        </Surface>
+      </div>
+    </section>
+  );
+}
+
+function ReviewScreen({ selectedReviewId, setSelectedReviewId, notify, navigate, onConfirmed, outcomes, onOutcome }) {
+  const reviewItems = DATA.reviewItems.map((item) => outcomes[item.id] ? { ...item, ...outcomes[item.id], hasCandidate: false } : item);
+  const selectedItem = reviewItems.find((item) => item.id === selectedReviewId) || reviewItems[0];
+  const pendingCount = reviewItems.filter((item) => !["rejected", "confirmed"].includes(item.status)).length;
+  const detail = DATA.reviewDetails[selectedItem.id] || {};
+  const candidate = detail.candidate || (selectedItem.id === "intake-sca-v4" ? DATA.candidate : null);
+  const makeEdits = (sourceCandidate) => {
+    if (!sourceCandidate) return {};
+    return sourceCandidate.claims.reduce((values, claim, index) => ({ ...values, [`claim${index}`]: claim.text }), {
+      title: sourceCandidate.event.title,
+      summary: sourceCandidate.event.summary,
+    });
+  };
+  const [documentView, setDocumentView] = React.useState("material");
+  const [disposition, setDisposition] = React.useState("合并");
+  const [previewOpen, setPreviewOpen] = React.useState(false);
+  const [rejectionReason, setRejectionReason] = React.useState("");
+  const [mobileStep, setMobileStep] = React.useState(0);
+  const [drafts, setDrafts] = React.useState({});
+  const edits = drafts[selectedItem.id] || makeEdits(candidate);
+  const setEdits = (updater) => setDrafts((allDrafts) => {
+    const current = allDrafts[selectedItem.id] || makeEdits(candidate);
+    const next = typeof updater === "function" ? updater(current) : updater;
+    return { ...allDrafts, [selectedItem.id]: next };
+  });
+
+  React.useEffect(() => {
+    setPreviewOpen(false);
+    setRejectionReason("");
+    setDocumentView("material");
+    setDisposition(candidate?.event.match?.startsWith("EVT-") ? "合并" : "新建");
+  }, [selectedReviewId]);
+
+  React.useEffect(() => setPreviewOpen(false), [disposition]);
+  React.useEffect(() => setPreviewOpen(false), [rejectionReason]);
+
+  const confirm = () => {
+    if (!previewOpen || !candidate) return;
+    if (disposition === "驳回") {
+      onOutcome(selectedItem.id, { status: "rejected", type: "已驳回", eventMatch: `原因：${rejectionReason}` });
+      notify("候选已驳回", "正式事件、主张与报告均未改变；人工决定已保留用于审计");
+      setPreviewOpen(false);
+      return;
+    }
+    onOutcome(selectedItem.id, { status: "confirmed", type: "已入档", eventMatch: `${disposition}完成 · 人工决定已记录` });
+    onConfirmed({ disposition, candidate, edits });
+    notify("人工确认已记录", `${candidate.claims.length} 条主张将以“${disposition}”方式进入正式档案`);
+    window.setTimeout(() => navigate("events"), 750);
+  };
+
+  const paneClass = (step, extra = "") => `review-pane ${extra} ${mobileStep === step ? "mobile-active" : ""}`;
+
+  return (
+    <section className="screen" data-screen-label="三栏人工审核台">
+      <PageHeading
+        eyebrow="HUMAN REVIEW BOUNDARY"
+        title="待审箱"
+        description="左边选材料，中间核对不可变原文和版本差异，右边编辑机器候选并预览正式区变化。AI 只能提议，人工确认后才入档。"
+        actions={<StatusPill label={`${pendingCount} 项待处理`} tone="purple" />}
+      />
+      <nav className="mobile-review-steps" aria-label="移动端审核步骤">
+        {["1 选择材料", "2 核对原文", "3 决定入档"].map((label, index) => <button key={label} className={mobileStep === index ? "active" : ""} onClick={() => setMobileStep(index)}>{label}</button>)}
+      </nav>
+      <div className="review-shell">
+        <aside className={paneClass(0)}>
+          <div className="pane-header"><span><strong>待审队列</strong><small>按优先级与时间排序</small></span><StatusPill label={String(pendingCount)} tone="purple" /></div>
+          <ReviewQueue items={reviewItems} selectedId={selectedItem.id} onSelect={setSelectedReviewId} />
+          <div className="mobile-next"><button className="primary-button button-small" onClick={() => setMobileStep(1)}>核对这份材料 →</button></div>
+        </aside>
+
+        <main className={paneClass(1)}>
+          <div className="pane-header"><span><strong>原始材料与证据</strong><small>{selectedItem.id}</small></span>{selectedItem.hasSnapshot ? <StatusPill label="快照已固定" tone="cyan" /> : <StatusPill label="无快照" tone="red" />}</div>
+          {selectedItem.hasSnapshot ? (
+            <DocumentPane item={selectedItem} candidate={candidate} detail={detail} view={documentView} setView={setDocumentView} />
+          ) : (
+            <div className="empty-state"><strong>{selectedItem.title}</strong>抓取阶段没有得到快照，因此不会生成候选或改动正式区。<div className="button-row" style={{ justifyContent: "center", marginTop: 12 }}><button className="danger-button button-small" onClick={() => notify("已重新排队抓取", "仍需成功固定原页快照，之后才会运行候选生成")}>重试采集</button></div></div>
+          )}
+          <div className="mobile-next"><button className="primary-button button-small" disabled={!selectedItem.hasCandidate} onClick={() => setMobileStep(2)}>查看候选 →</button></div>
+        </main>
+
+        <aside className={paneClass(2, "candidate-pane")}>
+          <div className="pane-header"><span><strong>候选与人工决定</strong><small>机器原值、人工修改、正式结果分离</small></span>{selectedItem.hasCandidate ? <StatusPill label="未确认" tone="purple" /> : <StatusPill status={selectedItem.status} />}</div>
+          {selectedItem.hasCandidate && candidate ? (
+            <CandidatePane
+              candidate={candidate}
+              disposition={disposition}
+              setDisposition={setDisposition}
+              edits={edits}
+              setEdits={setEdits}
+              onPreview={() => setPreviewOpen((open) => !open)}
+              previewOpen={previewOpen}
+              onConfirm={confirm}
+              rejectionReason={rejectionReason}
+              setRejectionReason={setRejectionReason}
+            />
+          ) : ["rejected", "confirmed"].includes(selectedItem.status) ? (
+            <div className="empty-state"><strong>{selectedItem.status === "rejected" ? "候选已驳回" : "候选已进入正式档案"}</strong>{selectedItem.eventMatch}<br />原始快照、机器原值与人工决定仍可审计。</div>
+          ) : selectedItem.failureStage === "generation" ? (
+            <div className="empty-state"><strong>快照已保存，但候选生成失败</strong>原始 API 响应仍可在中栏核对；模型结构无效不会抹掉快照，也不会写入正式档案。<div className="button-row" style={{ justifyContent: "center", marginTop: 12 }}><button className="primary-button button-small" onClick={() => notify("已重新排队生成", "复用 V21 快照，不会重新请求上游 API")}>重新生成候选</button></div></div>
+          ) : <div className="empty-state"><strong>抓取阶段尚无快照</strong>请先重试采集；只有固定原始材料后才能生成候选。</div>}
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function EventsScreen({ navigate, recentConfirmation }) {
+  const [tab, setTab] = React.useState("claims");
+  const isNewEvent = recentConfirmation?.disposition === "新建";
+  const isModifiedEvent = recentConfirmation?.disposition === "修改";
+  const appliedTitle = recentConfirmation?.edits.title || recentConfirmation?.candidate.event.title;
+  const appliedSummary = recentConfirmation?.edits.summary || recentConfirmation?.candidate.event.summary;
+  const event = recentConfirmation ? (isNewEvent ? {
+    ...DATA.event,
+    id: "EVT-2026-015",
+    title: appliedTitle,
+    status: "已确认 · 新建",
+    summary: appliedSummary,
+    time: `${recentConfirmation.candidate.event.eventTime} — 持续观察`,
+    location: recentConfirmation.candidate.event.location,
+    documents: 1,
+    sources: 1,
+    claims: recentConfirmation.candidate.claims.length,
+    evidence: recentConfirmation.candidate.claims.length,
+    confidence: "初步",
+  } : {
+    ...DATA.event,
+    title: isModifiedEvent ? appliedTitle : DATA.event.title,
+    summary: appliedSummary,
+  }) : DATA.event;
+  const defaultNewRows = [
+    { text: "管理局预计首批北向船队将在 24 小时内恢复通行，但仍取决于最终安全检查。", source: "Suez Canal Authority", count: "1 个独立来源", tone: "amber", status: "待交叉验证" },
+    { text: "医疗物资和易腐货物运输船将被优先安排。", source: "Suez Canal Authority", count: "1 个独立来源", tone: "amber", status: "待交叉验证" },
+  ];
+  const baselineRows = [
+    { text: "拖带协助与航道检查仍在继续。", source: "SCA / Port Said", count: "2 个独立来源", tone: "green", status: "已印证" },
+    { text: "不同材料对完全恢复时间仍存在表述差异。", source: "Reuters / SCA", count: "2 个独立来源", tone: "red", status: "存在争议" },
+    { text: "技术检查完成之前，恢复窗口仍可能调整。", source: "SCA / Port Said", count: "2 个独立来源", tone: "green", status: "已印证" },
+  ];
+  const confirmedRows = recentConfirmation?.candidate.claims.map((claim, index) => ({
+    text: recentConfirmation.edits[`claim${index}`] || claim.text,
+    source: recentConfirmation.candidate.entities[0]?.name || "已确认来源",
+    count: "1 个独立来源",
+    tone: "amber",
+    status: "待交叉验证",
+  })) || defaultNewRows;
+  const claimRows = isNewEvent ? confirmedRows : [...confirmedRows, ...baselineRows].slice(0, 5);
+  const impactCopy = isNewEvent
+    ? `✓ 已新建 ${event.id}，写入 ${confirmedRows.length} 条人工确认主张；原句与机器原值保持可追溯。`
+    : isModifiedEvent
+      ? `✓ 已采用人工编辑值更新事件摘要与 ${confirmedRows.length} 条主张；旧版本仍保留在历史中。`
+      : `✓ 已合并 ${confirmedRows.length} 条人工确认主张；每条都保留原句、快照哈希、机器原值与人工决定。`;
+  return (
+    <section className="screen" data-screen-label="正式事件档案">
+      <PageHeading
+        eyebrow="CONFIRMED EVENT DOSSIER"
+        title="事件档案"
+        description="这里只呈现经过人工确认的对象；每条主张仍可沿“来源—文档—快照—证据”回到当时原文。"
+        actions={<button className="ghost-button" onClick={() => navigate("review")}>返回待审箱</button>}
+      />
+      <div className="event-hero">
+        <div className="event-id">{event.id}</div>
+        <h1>{event.title}</h1><p>{event.summary}</p>
+        <div className="event-meta"><StatusPill label={event.status} tone="green" /><span>{event.time}</span><span>{event.location}</span><span>综合信心：{event.confidence}</span></div>
+      </div>
+      <div className="event-tabs" role="tablist">
+        {[{id:"overview",label:"概览"},{id:"claims",label:`主张与证据 ${event.claims}`},{id:"sources",label:`材料 ${event.documents}`},{id:"history",label:"变更历史"}].map((item) => <button role="tab" aria-selected={tab === item.id} className={`event-tab ${tab === item.id ? "active" : ""}`} key={item.id} onClick={() => setTab(item.id)}>{item.label}</button>)}
+      </div>
+
+      <div className="events-layout" style={{ marginTop: 14 }}>
+        <Surface title={tab === "claims" ? "已确认主张与证据" : "档案内容"} subtitle="来源可靠性与信息置信度分别呈现">
+          {tab === "claims" ? (
+            <div className="claims-table">
+              {claimRows.map((claim, index) => (
+                <div className="claim-row" key={index}>
+                  <span className="claim-check">✓</span>
+                  <div className="claim-text">{claim.text}</div>
+                  <div className="claim-source"><strong>{claim.source}</strong>{claim.count}</div>
+                  <StatusPill label={claim.status} tone={claim.tone} />
+                </div>
+              ))}
+            </div>
+          ) : tab === "overview" ? (
+            <div className="surface-body"><div className="impact-list"><div className="impact-card"><small>时间</small><strong>{event.time}</strong></div><div className="impact-card"><small>地点</small><strong>{event.location}</strong></div><div className="impact-card"><small>证据规模</small><strong>{event.sources} 个来源 · {event.evidence} 条证据</strong></div></div></div>
+          ) : tab === "sources" ? (
+            isNewEvent ? <div className="surface-body"><div className="impact-card"><small>当前来源</small><strong>{recentConfirmation.candidate.entities[0]?.name} · 1 个不可变快照</strong></div></div> : <div className="surface-body"><div className="impact-list"><div className="impact-card"><small>官方机构</small><strong>Suez Canal Authority · 4 个不可变快照</strong></div><div className="impact-card"><small>港口管理方</small><strong>Port Said Authority RSS · 2 个文档</strong></div><div className="impact-card"><small>媒体来源</small><strong>Reuters · 仅用于独立印证与争议记录</strong></div></div></div>
+          ) : (
+            <div className="timeline"><div className="timeline-item"><small>刚刚</small><strong>{recentConfirmation ? `人工${recentConfirmation.disposition}并采用最终编辑值` : "人工确认 2 条新主张，保留 V4 证据回链"}</strong></div>{!isNewEvent && <><div className="timeline-item"><small>今天 10:43</small><strong>V4 内容变化进入待审箱</strong></div><div className="timeline-item"><small>昨天 18:22</small><strong>创建事件并确认首批 3 条主张</strong></div></>}</div>
+          )}
+        </Surface>
+        <aside className="right-rail">
+          {recentConfirmation ? (
+            <Surface title="本次入档影响" subtitle={`来自刚才的人工“${recentConfirmation.disposition}”`}>
+              <div className="surface-body">
+                <div className="evidence-check">{impactCopy}</div>
+                <div className="coverage-note">仍需独立来源交叉验证；系统不会因为第一方来源就自动标记为多源印证。</div>
+              </div>
+            </Surface>
+          ) : (
+            <Surface title="最近正式变化" subtitle="没有本次会话内的入档操作">
+              <div className="surface-body"><div className="impact-card"><small>最近确认</small><strong>昨天 18:22 · 创建事件并确认首批主张</strong></div></div>
+            </Surface>
+          )}
+          <Surface title="证据链完整性" subtitle={`${event.evidence} 条证据`}>
+            <div className="surface-body"><div className="health-list"><HealthRow label="原句可定位" detail={`${event.evidence} / ${event.evidence}`} value={100} /><HealthRow label="快照哈希" detail={`${event.evidence} / ${event.evidence}`} value={100} /><HealthRow label="多源印证" detail={isNewEvent ? `0 / ${event.claims} 主张` : "3 / 5 主张"} value={isNewEvent ? 0 : 60} tone="amber" /></div></div>
+          </Surface>
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function CaptureDialog({ open, onClose, onChoose }) {
+  const [mode, setMode] = React.useState("inputs");
+  const [keyword, setKeyword] = React.useState("Suez Canal northbound convoy resumption");
+  const [searchRan, setSearchRan] = React.useState(false);
+  React.useEffect(() => {
+    if (open) {
+      setMode("inputs");
+      setSearchRan(false);
+    }
+  }, [open]);
+  if (!open) return null;
+  const inputs = [
+    { id: "url", icon: "↗", title: "网页 / RSS", detail: "固定 URL 定时检查，保存每次版本" },
+    { id: "api", icon: "{}", title: "确定 API", detail: "按字段映射接入结构化数据" },
+    { id: "text", icon: "¶", title: "粘贴文本", detail: "保留提交原文并生成待审候选" },
+    { id: "file", icon: "▤", title: "本地文件", detail: "PDF、HTML、Markdown 或纯文本" },
+    { id: "search", icon: "⌕", title: "关键词发现", detail: "主动搜索线索；抓取原页后才可作为证据" },
+  ];
+  return (
+    <div className="command-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="capture-dialog" role="dialog" aria-modal="true" aria-label="添加输入">
+        <header>
+          <div>
+            <p className="page-eyebrow">{mode === "search" ? "KEYWORD DISCOVERY" : "PARALLEL INPUTS"}</p>
+            <h2>{mode === "search" ? "用关键词主动发现线索" : "从哪里添加材料？"}</h2>
+            <p>{mode === "search" ? "搜索结果只是线索；必须成功抓取原页与固定快照，才能送入待审箱。" : "这些入口是并行输入；都先进入受控采集与待审边界，不会直接改正式档案。"}</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">×</button>
+        </header>
+        {mode === "inputs" ? (
+          <div className="capture-grid">
+            {inputs.map((input) => <button className={`capture-option ${input.id === "search" ? "featured" : ""}`} key={input.id} onClick={() => input.id === "search" ? setMode("search") : onChoose(input)}><span className="capture-icon">{input.icon}</span><span><strong>{input.title}</strong><small>{input.detail}</small></span>{input.id === "search" && <span className="badge tone-cyan">可主动发现</span>}</button>)}
+          </div>
+        ) : (
+          <div className="search-discovery">
+            <div className="search-form-row">
+              <button className="icon-button" onClick={() => setMode("inputs")} aria-label="返回输入选择">←</button>
+              <input className="search-input" value={keyword} onChange={(event) => setKeyword(event.target.value)} aria-label="搜索关键词" />
+              <button className="primary-button" onClick={() => setSearchRan(true)}>搜索</button>
+            </div>
+            <div className="search-scope-row"><StatusPill label="开放网页" tone="cyan" /><span>时间范围：过去 7 天</span><span>语言：自动</span><span>最多 20 条</span></div>
+            {searchRan ? (
+              <div className="discovery-results">
+                <div className="discovery-summary"><strong>发现 3 条可抓取线索</strong><span>结果已去重；尚未成为 PLDR 证据</span></div>
+                {[
+                  { host: "suezcanal.gov.eg", title: "Statement on the phased resumption of northbound transit", meta: "18 分钟前 · 官方机构", match: "与 EVT-2026-014 高度相关" },
+                  { host: "reuters.com", title: "Shipping operators await confirmed Suez transit window", meta: "51 分钟前 · 媒体来源", match: "可能提供独立印证" },
+                  { host: "portsaid.gov.eg", title: "Northbound vessel waiting statistics updated", meta: "1 小时前 · 港口管理方", match: "可能补充影响规模" },
+                ].map((result, index) => (
+                  <article className="discovery-result" key={result.host}>
+                    <div className="result-index">{String(index + 1).padStart(2, "0")}</div>
+                    <div><small>{result.host}</small><strong>{result.title}</strong><p>{result.meta} · {result.match}</p></div>
+                    <button className="ghost-button button-small" onClick={() => onChoose({ id: "search", title: "关键词发现" })}>抓取原页</button>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="search-empty"><span>⌕</span><strong>先搜索，再决定抓取哪条原页</strong><p>搜索接口不会直接生成事件、主张或证据，也不会把摘要当作原文。</p></div>
+            )}
+          </div>
+        )}
+        <footer>{mode === "search" ? "发现 → 选择结果 → 抓取原页 → 固定快照 → AI 生成候选 → 人工确认。" : "固定来源负责持续监测；关键词搜索用于补齐未知线索；两者最终都必须抓到可追溯原文。"}</footer>
+      </section>
+    </div>
+  );
+}
+
+function App() {
+  const hashRoute = window.location.hash.replace("#", "");
+  const [activeRoute, setActiveRoute] = React.useState(ROUTES.has(hashRoute) ? hashRoute : "today");
+  const [sourceFilter, setSourceFilter] = React.useState("all");
+  const [selectedSourceId, setSelectedSourceId] = React.useState("src-sca");
+  const [selectedReviewId, setSelectedReviewId] = React.useState("intake-sca-v4");
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [paletteQuery, setPaletteQuery] = React.useState("");
+  const [captureOpen, setCaptureOpen] = React.useState(false);
+  const [recentConfirmation, setRecentConfirmation] = React.useState(null);
+  const [reviewOutcomes, setReviewOutcomes] = React.useState({});
+  const [toast, setToast] = React.useState(null);
+  const remainingReviewCount = DATA.reviewItems.filter((item) => !reviewOutcomes[item.id]).length;
+  const visibleNavItems = NAV_ITEMS.map((item) => item.id === "review" ? { ...item, count: remainingReviewCount } : item);
+
+  const navigate = React.useCallback((route) => {
+    if (!ROUTES.has(route)) return;
+    setActiveRoute(route);
+    window.location.hash = route;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, []);
+
+  const notify = React.useCallback((title, detail) => {
+    setToast({ title, detail });
+    window.clearTimeout(window.__pldrToastTimer);
+    window.__pldrToastTimer = window.setTimeout(() => setToast(null), 3200);
+  }, []);
+
+  React.useEffect(() => {
+    const onHash = () => {
+      const next = window.location.hash.replace("#", "");
+      if (ROUTES.has(next)) setActiveRoute(next);
+    };
+    const onKey = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((open) => !open);
+      }
+      if (event.key === "Escape") {
+        setPaletteOpen(false);
+        setCaptureOpen(false);
+      }
+    };
+    window.addEventListener("hashchange", onHash);
+    window.addEventListener("keydown", onKey);
+    if (!window.location.hash) window.history.replaceState(null, "", "#today");
+    return () => {
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
+  const commands = [
+    ...NAV_ITEMS.map((item) => ({ id: `route-${item.id}`, icon: item.icon, label: `打开${item.label}`, hint: "页面", route: item.id })),
+    { id: "capture", icon: "+", label: "添加网页、文本、文件或搜索任务", hint: "输入", action: "capture" },
+    { id: "event", icon: "E", label: "打开 EVT-2026-014 苏伊士航道恢复评估", hint: "事件", route: "events" },
+  ];
+
+  const chooseCommand = (item) => {
+    setPaletteOpen(false);
+    setPaletteQuery("");
+    if (item.route) navigate(item.route);
+    if (item.action === "capture") setCaptureOpen(true);
+  };
+
+  const chooseCapture = (input) => {
+    setCaptureOpen(false);
+    if (input.id === "search") {
+      notify("已创建搜索发现采集项", "正在抓取所选原页；成功固定快照后才会进入待审箱");
+    } else {
+      notify(`已选择${input.title}`, "原型只演示入口；提交前会先显示试抓与证据预览");
+    }
+  };
+
+  const openStat = (stat) => {
+    if (stat.id === "new") {
+      setSelectedReviewId("intake-port-28");
+      navigate("review");
+    } else if (stat.id === "failed") {
+      setSourceFilter("failed");
+      setSelectedSourceId("src-marine");
+      navigate("sources");
+    } else {
+      navigate(stat.route);
+    }
+  };
+
+  const openAttention = (item) => {
+    if (item.id === "att-port") setSelectedReviewId("intake-port-28");
+    if (item.id === "att-sca") setSelectedReviewId("intake-sca-v4");
+    if (item.id === "att-failure") {
+      setSourceFilter("failed");
+      setSelectedSourceId("src-marine");
+    }
+    navigate(item.action || "review");
+  };
+
+  let screen;
+  if (activeRoute === "sources") screen = <SourcesScreen filter={sourceFilter} setFilter={setSourceFilter} selectedSourceId={selectedSourceId} setSelectedSourceId={setSelectedSourceId} notify={notify} navigate={navigate} openCapture={() => setCaptureOpen(true)} />;
+  else if (activeRoute === "changes") screen = <ChangesScreen navigate={navigate} notify={notify} />;
+  else if (activeRoute === "review") screen = <ReviewScreen selectedReviewId={selectedReviewId} setSelectedReviewId={setSelectedReviewId} notify={notify} navigate={navigate} onConfirmed={setRecentConfirmation} outcomes={reviewOutcomes} onOutcome={(id, outcome) => setReviewOutcomes((old) => ({ ...old, [id]: outcome }))} />;
+  else if (activeRoute === "events") screen = <EventsScreen navigate={navigate} recentConfirmation={recentConfirmation} />;
+  else screen = <TodayScreen navigate={navigate} openCapture={() => setCaptureOpen(true)} openStat={openStat} openAttention={openAttention} />;
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="sidebar-brand"><span className="brand-mark">P</span><span><strong>PLDR</strong><small>证据优先研判台</small></span></div>
+        <nav className="nav-section" aria-label="主导航">
+          <div className="nav-label">Workbench</div>
+          {visibleNavItems.map((item) => <NavButton item={item} key={item.id} active={activeRoute === item.id} onClick={() => navigate(item.id)} />)}
+        </nav>
+        <div className="sidebar-context">
+          <div className="context-line"><span className="status-dot"></span><span>采集器正常 · 28/30</span></div>
+          <div className="context-line"><span className="status-dot amber"></span><span>2 个来源覆盖缺失</span></div>
+          <div className="context-line"><span className="status-dot"></span><span>模型候选隔离正常</span></div>
+        </div>
+        <div className="sidebar-version">P1 DESIGN PROTOTYPE<br />MOCK DATA · 2026-08-29</div>
+      </aside>
+
+      <header className="topbar">
+        <div className="topic-switcher"><span><span className="topic-kicker">当前专题</span><span className="topic-name">海运关键通道与物流扰动</span></span></div>
+        <span className="range-pill">过去 24 小时</span>
+        <div className="topbar-spacer"></div>
+        <button className="command-trigger" onClick={() => setPaletteOpen(true)}><span>搜索或跳转…</span><kbd>Ctrl K</kbd></button>
+        <button className="ghost-button" onClick={() => navigate("sources")}><span className="status-dot"></span>系统状态</button>
+        <button className="primary-button" onClick={() => setCaptureOpen(true)}>＋ 添加输入</button>
+      </header>
+
+      <main className="main">{screen}</main>
+
+      <nav className="bottom-nav" aria-label="移动端主导航">
+        {visibleNavItems.map((item) => <button className={activeRoute === item.id ? "active" : ""} key={item.id} onClick={() => navigate(item.id)}><span>{item.icon}</span><span>{item.label}</span></button>)}
+      </nav>
+
+      <CommandPalette open={paletteOpen} query={paletteQuery} setQuery={setPaletteQuery} items={commands} onChoose={chooseCommand} onClose={() => setPaletteOpen(false)} />
+      <CaptureDialog open={captureOpen} onClose={() => setCaptureOpen(false)} onChoose={chooseCapture} />
+      <Toast toast={toast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+</script>
+  </body>
+</html>

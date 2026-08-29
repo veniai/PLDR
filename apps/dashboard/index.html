@@ -13,7 +13,7 @@
       <div class="brand-block">
         <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
         <div>
-          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P1.0</span></div>
+          <div class="brand-line"><strong>PLDR</strong><span class="version-badge">P1 SLICE</span></div>
           <p>开源情报证据工作台</p>
         </div>
       </div>
@@ -36,6 +36,10 @@
         </div>
       </div>
       <div class="command-actions">
+        <button class="btn btn-ghost collection-button" id="btn-collection" type="button">
+          <span aria-hidden="true">◫</span> 来源监测
+          <span id="collection-alert-count" class="count-badge warning">0</span>
+        </button>
         <button class="btn btn-ghost" id="btn-search" type="button">
           <span aria-hidden="true">⌕</span> 外部关键词发现
         </button>
@@ -292,6 +296,73 @@
         <button id="import-submit" class="btn btn-primary" type="submit">提交到采集箱</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="collection-modal" class="modal collection-modal" aria-labelledby="collection-modal-title">
+    <div class="modal-header">
+      <div>
+        <span class="panel-kicker">P1 RELIABLE COLLECTION</span>
+        <h2 id="collection-modal-title">固定网页来源监测</h2>
+      </div>
+      <button id="collection-close" class="icon-btn" type="button" aria-label="关闭来源监测">×</button>
+    </div>
+    <div class="collection-shell">
+      <section class="collection-command" aria-labelledby="collection-add-title">
+        <div class="collection-command-copy">
+          <h3 id="collection-add-title">添加固定公共网页</h3>
+          <p>按周期抓取同一网页。首次内容和正文变化进入待审箱；无变化只保留运行记录。</p>
+        </div>
+        <form id="collection-source-form" class="collection-source-form">
+          <label class="form-field">
+            <span>来源名称</span>
+            <input id="collection-name" type="text" minlength="2" maxlength="160" placeholder="例如：港口公告" required>
+          </label>
+          <label class="form-field collection-url-field">
+            <span>固定公共网页 URL</span>
+            <input id="collection-url" type="url" placeholder="https://example.org/status" required>
+          </label>
+          <label class="form-field">
+            <span>检查周期</span>
+            <select id="collection-interval">
+              <option value="15">每 15 分钟</option>
+              <option value="60" selected>每 1 小时</option>
+              <option value="360">每 6 小时</option>
+              <option value="1440">每天</option>
+            </select>
+          </label>
+          <label class="form-field">
+            <span>语言</span>
+            <select id="collection-language">
+              <option value="en">英语</option>
+              <option value="zh">中文</option>
+              <option value="ar">阿拉伯语</option>
+              <option value="fr">法语</option>
+            </select>
+          </label>
+          <label class="collection-run-now">
+            <input id="collection-run-immediately" type="checkbox" checked>
+            <span>保存后立即试抓</span>
+          </label>
+          <button id="collection-add" class="btn btn-primary" type="submit">添加来源</button>
+        </form>
+        <div class="form-notice collection-notice">
+          当前首切片只支持无需登录、且 URL 不含凭据的公共 HTTP(S) 网页。监测配置和运行记录不是正式 Source/Evidence；抓取成功不等于 AI 成功，只有人工确认才进入正式事件档案。
+        </div>
+      </section>
+      <div id="collection-summary" class="collection-summary" aria-live="polite"></div>
+      <div class="collection-layout">
+        <section class="collection-target-panel" aria-label="监测来源列表">
+          <div class="collection-section-heading">
+            <div><span class="panel-kicker">WATCHES</span><h3>受管来源</h3></div>
+            <button id="collection-refresh" class="icon-btn" type="button" aria-label="刷新来源监测">↻</button>
+          </div>
+          <div id="collection-target-list" class="collection-target-list" role="list"></div>
+        </section>
+        <section id="collection-detail" class="collection-detail">
+          <div class="panel-empty">选择一个来源，查看运行记录、版本变化和恢复动作。</div>
+        </section>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="intake-modal" class="modal intake-modal" aria-labelledby="intake-modal-title">

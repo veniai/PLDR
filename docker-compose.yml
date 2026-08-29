@@ -17,6 +17,35 @@ services:
       PLDR_SEARCH_BASE_URL: ${PLDR_SEARCH_BASE_URL:-https://api.search.brave.com}
       PLDR_SEARCH_API_KEY: ${PLDR_SEARCH_API_KEY:-}
       PLDR_SEARCH_TIMEOUT_SECONDS: ${PLDR_SEARCH_TIMEOUT_SECONDS:-12}
+      PLDR_MAX_FETCH_BYTES: ${PLDR_MAX_FETCH_BYTES:-5242880}
+      PLDR_FETCH_TOTAL_TIMEOUT_SECONDS: ${PLDR_FETCH_TOTAL_TIMEOUT_SECONDS:-30}
+    volumes:
+      - ./data/runtime:/app/data/runtime
+      - ./reports:/app/reports
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3).read()"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+
+  pldr-collector:
+    build:
+      context: .
+      dockerfile: services/intel-api/Dockerfile
+    command: ["python", "-m", "pldr_api.collector", "--loop", "--poll-seconds", "${PLDR_COLLECTION_POLL_SECONDS:-2}"]
+    depends_on:
+      pldr-p0:
+        condition: service_healthy
+    environment:
+      PLDR_DATABASE_URL: sqlite:////app/data/runtime/pldr-p0.db
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+      PLDR_MAX_FETCH_BYTES: ${PLDR_MAX_FETCH_BYTES:-5242880}
+      PLDR_FETCH_TOTAL_TIMEOUT_SECONDS: ${PLDR_FETCH_TOTAL_TIMEOUT_SECONDS:-30}
     volumes:
       - ./data/runtime:/app/data/runtime
       - ./reports:/app/reports

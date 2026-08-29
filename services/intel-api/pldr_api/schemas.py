@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 class ReportRequest(BaseModel):
     event_ids:list[str]=Field(min_length=1,max_length=20)
@@ -86,6 +86,23 @@ class ExternalSearchRequest(BaseModel):
 
 class ExternalSearchSelectionRequest(BaseModel):
     result_ids:list[str]=Field(min_length=1,max_length=20)
+
+
+class CollectionTargetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    url: HttpUrl
+    language: str = Field(default="en", min_length=2, max_length=20)
+    interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
+    enabled: bool = True
+    run_immediately: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("name must contain visible characters")
+        return cleaned
 
 class ModelTaskRequest(BaseModel):
     task:Literal["normalize_event_title","summarize_event","extract_entities_locations","extract_claims_evidence","draft_report","extract_intake_candidates"]
