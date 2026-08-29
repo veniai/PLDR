@@ -431,6 +431,8 @@ async def execute_external_search(
                 raw_result=hit.raw_result,
             )
         )
+        if rank >= request.limit:
+            break
     run.provider = backend_response.provider
     run.channel = backend_response.channel
     run.status = "ok"
