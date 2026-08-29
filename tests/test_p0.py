@@ -889,6 +889,13 @@ class P0Test(unittest.TestCase):
                     "https://news.example.org/story?utm_source=test",
                     title="Duplicate canonical URL",
                 ),
+                *[
+                    self.search_hit(
+                        f"https://news.example.org/story-{index}",
+                        title=f"Additional result {index}",
+                    )
+                    for index in range(1, 8)
+                ],
             ]
             return BackendSearchResponse("brave", f"brave-search-api:{request.scope}", hits)
 
@@ -922,7 +929,10 @@ class P0Test(unittest.TestCase):
         self.assertEqual(news_payload["channel"], "brave-search-api:news")
         self.assertEqual(web_payload["channel"], "brave-search-api:web")
         self.assertNotEqual(news_payload["id"], web_payload["id"])
-        self.assertEqual(news_payload["result_count"], 1)
+        self.assertEqual(news_payload["result_count"], 5)
+        self.assertEqual(len(news_payload["results"]), 5)
+        self.assertEqual(web_payload["result_count"], 5)
+        self.assertEqual(len(web_payload["results"]), 5)
         self.assertEqual(empty.json()["result_count"], 0)
         result = news_payload["results"][0]
         self.assertEqual(result["title"], "Real title")
@@ -966,7 +976,7 @@ class P0Test(unittest.TestCase):
                         )
                     )
                 ),
-                2,
+                10,
             )
             self.assertEqual(
                 len(
