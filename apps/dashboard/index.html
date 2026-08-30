@@ -84,6 +84,7 @@
           <button type="button" role="tab" data-investigation-tab="claims">主张与证据</button>
           <button type="button" role="tab" data-investigation-tab="reports">专题报告</button>
           <button type="button" role="tab" data-investigation-tab="activity">操作记录</button>
+          <span class="investigation-tabs-hint" aria-hidden="true">左右滑动查看更多 →</span>
         </nav>
         <div id="investigation-panel" class="investigation-panel" role="tabpanel" aria-live="polite"></div>
       </section>
@@ -261,57 +262,115 @@
     <form id="search-form" method="dialog">
       <div class="modal-header">
         <div>
-          <span class="panel-kicker">EXTERNAL KEYWORD DISCOVERY</span>
+          <span class="panel-kicker">DISCOVERY WORKSPACE</span>
           <h2 id="search-modal-title">公开资料关键词搜索</h2>
+          <p>搜索是线索入口；选中原页并处理后，才可能进入人工审核。</p>
         </div>
         <button id="search-close" class="icon-btn" type="button" aria-label="关闭公开资料搜索">×</button>
       </div>
-      <div class="search-form-grid">
-        <label class="form-field">
-          <span>关键词（不是筛选已入档事件）</span>
-          <input id="search-keyword" type="search" minlength="2" maxlength="400" placeholder="例如：Suez canal blockage" required>
-        </label>
-        <label class="form-field">
-          <span>范围</span>
-          <select id="search-scope">
-            <option value="news">新闻</option>
-            <option value="web">一般公开网页</option>
-          </select>
-        </label>
-        <label class="form-field">
-          <span>语言</span>
-          <select id="search-language">
-            <option value="en">英语</option>
-            <option value="zh">中文</option>
-            <option value="ar">阿拉伯语</option>
-            <option value="fr">法语</option>
-          </select>
-        </label>
-      </div>
-      <div id="search-provider-summary" class="search-provider-summary"></div>
-      <fieldset class="destination-picker">
-        <legend>加入专题</legend>
-        <label class="form-field">
-          <span>目标专题</span>
-          <select id="search-destination"></select>
-        </label>
-        <label id="search-new-investigation-field" class="form-field" hidden>
-          <span>新专题名称</span>
-          <input id="search-new-investigation" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪">
-        </label>
-        <p id="search-destination-note">选中结果后才会抓取原始页面；不会把搜索摘要当作证据。</p>
-      </fieldset>
-      <div class="form-notice">
-        本入口连接现成外部检索后端，只返回候选线索。搜索标题、摘要、排名和检索渠道都不是 Evidence，也不是正式 Source；只有选中后成功抓取的原始页面快照才会进入既有候选与人工确认流程。
-      </div>
-      <div id="search-status" class="search-status" aria-live="polite">输入关键词后开始检索。</div>
-      <div id="search-results" class="search-results" role="list"></div>
-      <div class="search-actions">
-        <span id="search-selection-count">未选择结果</span>
-        <div>
-          <button id="search-submit" class="btn btn-primary" type="submit">检索</button>
-          <button id="search-select" class="btn btn-ghost" type="button" disabled>加入专题并开始处理</button>
-        </div>
+      <div class="search-workspace">
+        <aside id="search-history-panel" class="search-history-panel" aria-label="查询历史">
+          <div class="search-history-heading">
+            <div><span class="panel-kicker">RECENT RUNS</span><h3>最近查询</h3></div>
+            <button id="search-history-toggle" class="text-btn" type="button" aria-expanded="true">收起</button>
+          </div>
+          <div id="search-history" class="search-history" aria-live="polite">
+            <p class="search-history-empty">正在读取查询记录…</p>
+          </div>
+          <p class="search-history-note">查询运行可重新打开。关闭窗口不会删除已加载结果或你的选择。</p>
+        </aside>
+
+        <section class="search-main" aria-label="资料发现结果">
+          <div class="search-command-panel">
+            <div class="search-form-grid">
+              <label class="form-field search-keyword-field">
+                <span>关键词（不是筛选已入档事件）</span>
+                <input id="search-keyword" type="search" minlength="2" maxlength="400" placeholder="例如：吉隆泥石流、Suez canal blockage" required>
+              </label>
+              <label class="form-field">
+                <span>范围</span>
+                <select id="search-scope">
+                  <option value="news">新闻</option>
+                  <option value="web">一般公开网页</option>
+                </select>
+              </label>
+              <label class="form-field">
+                <span>语言</span>
+                <select id="search-language">
+                  <option value="auto" selected>自动识别</option>
+                  <option value="zh">中文</option>
+                  <option value="en">英语</option>
+                  <option value="ar">阿拉伯语</option>
+                  <option value="fr">法语</option>
+                </select>
+              </label>
+              <label class="form-field">
+                <span>每次加载</span>
+                <select id="search-page-size">
+                  <option value="20" selected>20 条</option>
+                  <option value="10">10 条</option>
+                </select>
+              </label>
+              <button id="search-submit" class="btn btn-primary search-submit" type="submit">开始搜索</button>
+            </div>
+            <div id="search-language-note" class="search-language-note">输入关键词后自动识别语言，也可手动指定。</div>
+            <div id="search-provider-summary" class="search-provider-summary"></div>
+            <fieldset class="destination-picker search-destination-picker">
+              <legend>处理后加入</legend>
+              <label class="form-field">
+                <span>目标专题</span>
+                <select id="search-destination"></select>
+              </label>
+              <label id="search-new-investigation-field" class="form-field" hidden>
+                <span>新专题名称</span>
+                <input id="search-new-investigation" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪">
+              </label>
+              <p id="search-destination-note">选中结果后才会抓取原始页面；不会把搜索摘要当作证据。</p>
+            </fieldset>
+            <details class="search-boundary-note">
+              <summary>搜索结果为什么还不是证据？</summary>
+              <div class="form-notice">
+                本入口连接现成外部检索后端，只返回候选线索。搜索标题、摘要、排名和检索渠道都不是 Evidence，也不是正式 Source；只有选中后成功抓取的原始页面快照才会进入既有候选与人工确认流程。
+              </div>
+            </details>
+          </div>
+
+          <div id="search-status" class="search-status" aria-live="polite">输入关键词后开始检索；每次默认加载 20 条。</div>
+
+          <div id="search-result-tools" class="search-result-tools" hidden>
+            <div class="search-result-summary">
+              <strong id="search-loaded-count">已加载 0 条</strong>
+              <span id="search-run-summary">尚无查询运行</span>
+            </div>
+            <div class="search-filter-row">
+              <label class="search-result-filter"><span aria-hidden="true">⌕</span><input id="search-result-filter" type="search" placeholder="筛选已加载结果"></label>
+              <select id="search-result-state" aria-label="筛选结果状态">
+                <option value="all">全部状态</option>
+                <option value="available">可选择</option>
+                <option value="selected">已选择</option>
+                <option value="failed">处理失败</option>
+              </select>
+            </div>
+            <div class="search-selection-tools" role="group" aria-label="批量选择">
+              <button id="search-select-page" class="text-btn" type="button">全选本页</button>
+              <button id="search-select-loaded" class="text-btn" type="button">全选已加载</button>
+              <button id="search-clear-selection" class="text-btn" type="button">取消选择</button>
+            </div>
+          </div>
+
+          <div id="search-results" class="search-results" role="list"></div>
+          <div id="search-load-more-row" class="search-load-more-row" hidden>
+            <button id="search-load-more" class="btn btn-ghost" type="button">继续加载下一页</button>
+            <span id="search-load-more-note">只会继续加载，不会自动选择或抓取。</span>
+          </div>
+
+          <div class="search-actions">
+            <span id="search-selection-count">未选择结果</span>
+            <div>
+              <button id="search-select" class="btn btn-primary" type="button" disabled>加入专题并开始处理</button>
+            </div>
+          </div>
+        </section>
       </div>
     </form>
   </dialog>
@@ -464,6 +523,11 @@
       </div>
       <button id="intake-close" class="icon-btn" type="button" aria-label="关闭采集箱">×</button>
     </div>
+    <nav id="intake-mobile-steps" class="intake-mobile-steps" aria-label="移动端审核步骤">
+      <button type="button" data-intake-step="0">1 选择材料</button>
+      <button type="button" data-intake-step="1">2 核对原文</button>
+      <button type="button" data-intake-step="2">3 决定入档</button>
+    </nav>
     <div class="intake-layout">
       <section class="intake-list-panel" aria-label="采集箱条目">
         <div class="intake-list-toolbar">

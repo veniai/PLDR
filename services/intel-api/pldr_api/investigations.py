@@ -17,11 +17,14 @@ from .extraction import canonicalize_url, content_hash, extract_page
 from .importers import fetch_public_text_response
 from .intake import generate_candidates
 from .models import (
+    Claim,
     CollectionRun,
     CollectionTarget,
     DecisionLog,
+    Entity,
     Event,
     EventDocument,
+    EventEntity,
     IntakeItem,
     Investigation,
     InvestigationLink,
@@ -35,6 +38,7 @@ from .models import (
 )
 from .repository import serialize_event_card
 from .schemas import (
+    IntakeConfirmationRequest,
     InvestigationCreate,
     InvestigationLinkRequest,
     InvestigationUpdate,
@@ -399,10 +403,7 @@ def bootstrap_legacy_investigations(session: Session) -> dict[str, int]:
                     "requested_url": result.original_url,
                 }
             )
-        fallback = (
-            item.status == "candidate_ready"
-            and item.candidate_mode == "fallback-after-error"
-        )
+        fallback_class = _candidate_fallback_class(item)
         task = ReviewTask(
             id=new_task_id(),
             investigation_id=unclassified.id,
@@ -422,15 +423,15 @@ def bootstrap_legacy_investigations(session: Session) -> dict[str, int]:
             queued_at=now,
             completed_at=now if status_value in TERMINAL_TASK_STATUSES else None,
             error_class=(
-                "model_fallback"
-                if fallback
+                fallback_class
+                if fallback_class
                 else "legacy_intake_failed"
                 if status_value == "failed"
                 else None
             ),
             error_message=(
                 item.candidate_error
-                if fallback
+                if fallback_class == "model_fallback"
                 else (item.error or item.candidate_error)
                 if status_value == "failed"
                 else None
@@ -675,8 +676,107 @@ def serialize_batch(batch: ProcessingBatch) -> dict[str, Any]:
     }
 
 
-def serialize_task(task: ReviewTask) -> dict[str, Any]:
+def _structured_task_error(
+    error_class: str | None,
+    error_message: str | None,
+    *,
+    task_status: str,
+) -> dict[str, Any] | None:
+    """Give old and new task rows the same actionable, user-facing error."""
+    if not error_class and not error_message:
+        return None
+    normalized = (error_message or "").lower()
+    code = error_class or "internal"
+    if error_class == "unsafe_url" and "non-public address" in normalized:
+        code = "dns_policy_blocked"
+    elif error_class == "http_status":
+        code = next((f"http_{value}" for value in (401, 403, 429) if str(value) in normalized), code)
+    elif error_class == "model_fallback":
+        code = "model_timeout_fallback" if "timeout" in normalized or "deadline" in normalized else "model_error_fallback"
+    elif error_class == "extraction":
+        code = "empty_or_short_body"
+    elif error_class == "timeout":
+        code = "fetch_timeout"
+    elif error_class in {"legacy_intake_failed", "intake_failed"} and (
+        "model" in normalized or "generation" in normalized
+    ):
+        code = "legacy_model_error"
+
+    # stage, title, display_message, why, impact, next_action, retryable, degraded
+    specs = {
+        "dns_policy_blocked": ("fetch", "地址安全校验未通过", "网址解析结果包含内网或非公网地址，系统已停止抓取。", "这是 SSRF 安全保护；代理或 DNS 映射也可能产生这类结果。", "尚未取得正文，也未进入正式档案。", "请先检查代理/DNS，或换用公开正文页；当前配置不变时重复重试不会解决问题。", False, False),
+        "unsafe_url": ("fetch", "网址不符合安全策略", "系统为保护内部网络停止了抓取。", "网址或重定向目标不是可验证的公网 HTTP 地址。", "尚未取得正文，也未进入正式档案。", "改用可信的公开 HTTP(S) 网址。", False, False),
+        "http_401": ("fetch", "来源需要登录", "来源要求身份验证，PLDR 没有取得正文。", "公开请求收到 HTTP 401。", "尚未生成候选。", "改用公开原文，或粘贴/上传已获授权的内容。", False, False),
+        "http_403": ("fetch", "来源拒绝访问", "来源拒绝了自动抓取请求。", "公开请求收到 HTTP 403，常见于登录墙或反自动化策略。", "尚未生成候选。", "改用公开转载页，或粘贴/上传原文。", False, False),
+        "http_429": ("fetch", "来源请求过于频繁", "来源暂时限制了抓取频率。", "公开请求收到 HTTP 429。", "这条资料仍在待处理箱。", "等待一段时间后只重试这条资料。", True, False),
+        "http_status": ("fetch", "来源返回异常状态", "来源没有返回可处理的正文。", "网页请求返回失败的 HTTP 状态。", "尚未生成候选。", "稍后重试或更换公开来源。", task_status == "failed", False),
+        "response_too_large": ("fetch", "页面超过安全上限", "页面体积过大，系统停止了抓取。", "采集器限制单条资料大小以保护批量任务。", "尚未生成候选。", "改用正文页、精简文件或粘贴相关内容。", False, False),
+        "unsupported_content_type": ("fetch", "暂不支持这种内容", "链接返回的格式不能作为文本资料处理。", "当前采集器只接受受支持的文本内容。", "尚未生成候选。", "下载后上传受支持文件，或寻找正文网页。", False, False),
+        "unsupported_content_encoding": ("fetch", "暂不支持这种压缩格式", "链接返回的压缩方式不能安全处理。", "采集器拒绝无法受控解压的响应。", "尚未生成候选。", "下载后上传受支持文件，或寻找正文网页。", False, False),
+        "empty_or_short_body": ("extract", "没有提取到有效正文", "页面可访问，但正文为空或过短。", "页面可能依赖脚本、只有导航或登录提示。", "原网页未形成可审核候选。", "改用正文页，或直接粘贴/上传原文。", False, False),
+        "fetch_timeout": ("fetch", "抓取网页超时", "来源未在限定时间内返回完整正文。", "来源响应过慢或网络暂时不稳定。", "这条资料仍在待处理箱。", "稍后只重试这条资料。", True, False),
+        "network": ("fetch", "无法连接来源", "采集器没有建立稳定连接。", "可能是网络、DNS 或来源服务临时故障。", "尚未生成候选。", "稍后重试；持续失败时检查代理/DNS。", True, False),
+        "model_timeout_fallback": ("generate", "AI 超时，已生成规则候选", "原文已保存，系统生成了可人工审核的降级候选。", "外部模型超过本次请求时限。", "可以审核入档，但候选字段可能不完整。", "直接人工审核，或选择“只重试 AI”；不会重复抓取。", True, True),
+        "model_error_fallback": ("generate", "AI 失败，已生成规则候选", "原文已保存，系统生成了可人工审核的降级候选。", "模型返回错误或结果不符合候选结构。", "可以审核入档，但候选字段可能不完整。", "直接人工审核，或选择“只重试 AI”；不会重复抓取。", True, True),
+        "rule_fallback": ("generate", "已使用规则生成候选", "原文已保存，并由确定性规则生成候选。", "当前没有调用可用的外部 AI 模型。", "可以继续审核，但候选字段通常更少。", "继续人工审核；需要时配置模型后重新生成。", False, True),
+        "legacy_model_error": ("generate", "旧候选生成失败", "旧资料没有形成候选，但原文可能已保存。", "旧版模型生成流程曾返回错误。", "尚未进入正式档案。", "使用现有重试入口；失败后会生成可审核降级候选。", True, False),
+    }
+    stage, title, display, why, impact, next_action, retryable, degraded = specs.get(
+        code,
+        ("fetch", "资料处理失败", "系统未能完成这条资料的处理。", "底层处理返回未分类错误。", "尚未进入正式档案。", "稍后重试；持续失败时查看技术详情。", task_status == "failed", False),
+    )
     return {
+        "class": error_class,
+        "message": error_message,
+        "code": code,
+        "stage": stage,
+        "title": title,
+        "display_message": display,
+        "why": why,
+        "impact": impact,
+        "retryable": retryable,
+        "next_action": next_action,
+        "degraded": degraded,
+        "technical_detail": error_message,
+    }
+
+
+def serialize_task(
+    task: ReviewTask,
+    *,
+    session: Session | None = None,
+    include_intake_detail: bool = False,
+) -> dict[str, Any]:
+    structured_error = _structured_task_error(
+        task.error_class, task.error_message, task_status=task.status
+    )
+    if structured_error is not None:
+        upstream_status = next(
+            (
+                value
+                for value in (401, 403, 429)
+                if task.error_class == f"http_{value}"
+                or str(value) in (task.error_message or "")
+            ),
+            None,
+        )
+        structured_error.update(
+            {
+                "trace_id": task.id,
+                "upstream_status": upstream_status,
+                "retry_after": None,
+                "diagnostic": {
+                    "trace_id": task.id,
+                    "task_id": task.id,
+                    "batch_id": task.batch_id,
+                    "investigation_id": task.investigation_id,
+                    "subject_type": task.subject_type,
+                    "subject_id": task.subject_id,
+                },
+            }
+        )
+    fallback_used = task.error_class in {"model_fallback", "rule_fallback"}
+    payload = {
         "id": task.id,
         "task_id": task.id,
         "investigation_id": task.investigation_id,
@@ -700,14 +800,15 @@ def serialize_task(task: ReviewTask) -> dict[str, Any]:
         "lease_recoveries": task.lease_recoveries,
         "error_class": task.error_class,
         "error_message": task.error_message,
-        "error": (
-            {"class": task.error_class, "message": task.error_message}
-            if task.error_class or task.error_message
-            else None
+        "last_error": task.error_message,
+        "error": structured_error,
+        "fallback_used": fallback_used,
+        "degraded": bool(structured_error and structured_error["degraded"]),
+        "retryable": (
+            bool(structured_error["retryable"])
+            if structured_error is not None
+            else task.status == "failed"
         ),
-        "fallback_used": task.error_class == "model_fallback",
-        "retryable": task.status == "failed"
-        or (task.status == "ready" and task.error_class == "model_fallback"),
         "intake_item_id": task.intake_item_id,
         "selection_id": task.selection_id,
         "payload": task.payload_json or {},
@@ -715,6 +816,34 @@ def serialize_task(task: ReviewTask) -> dict[str, Any]:
         "created_at": iso(task.created_at),
         "updated_at": iso(task.updated_at),
     }
+    if session is not None and task.intake_item_id:
+        item = session.scalar(
+            select(IntakeItem)
+            .where(IntakeItem.id == task.intake_item_id)
+            .options(selectinload(IntakeItem.candidates))
+        )
+        if item is not None:
+            from .intake import serialize_intake, serialize_intake_summary
+
+            payload["intake_item"] = (
+                serialize_intake(item)
+                if include_intake_detail
+                else serialize_intake_summary(item)
+            )
+            if item.candidate_mode in {"fallback", "fallback-after-error"}:
+                payload["degraded"] = True
+            if item.candidate_mode == "fallback-after-error":
+                payload["fallback_used"] = True
+            if item.candidate_mode == "fallback" and task.status == "ready":
+                payload["degradation"] = {
+                    "code": "rule_fallback",
+                    "stage": "generate",
+                    "title": "已使用规则生成候选",
+                    "message": "原文已保存；候选字段可能较少，确认前必须人工核对。",
+                    "retryable": False,
+                    "next_action": "继续人工审核；需要时配置模型后重新生成。",
+                }
+    return payload
 
 
 def serialize_activity(entry: DecisionLog) -> dict[str, Any]:
@@ -826,6 +955,14 @@ def _task_terminal_status_for_item(item: IntakeItem) -> str | None:
     return None
 
 
+def _candidate_fallback_class(item: IntakeItem) -> str | None:
+    if item.status != "candidate_ready":
+        return None
+    if item.candidate_mode == "fallback-after-error":
+        return "model_fallback"
+    return None
+
+
 def _active_task_key(investigation_id: str, fingerprint: str) -> str:
     return f"{investigation_id}:{fingerprint}"
 
@@ -899,7 +1036,7 @@ def _batch_response(session: Session, batch: ProcessingBatch) -> dict[str, Any]:
             serialize_investigation(session, investigation) if investigation is not None else None
         ),
         "batch": serialize_batch(batch),
-        "tasks": [serialize_task(task) for task in tasks],
+        "tasks": [serialize_task(task, session=session) for task in tasks],
         "results": [
             {
                 "result_id": (task.payload_json or {}).get("result_id"),
@@ -1108,12 +1245,8 @@ def enqueue_search_result_tasks(session: Session, request: Any) -> dict[str, Any
             queued_at=now,
             completed_at=now if terminal_status is not None else None,
             error_class=(
-                "model_fallback"
-                if item.status == "candidate_ready"
-                and item.candidate_mode == "fallback-after-error"
-                else "intake_failed"
-                if terminal_status == "failed"
-                else None
+                _candidate_fallback_class(item)
+                or ("intake_failed" if terminal_status == "failed" else None)
             ),
             error_message=(item.error or item.candidate_error) if terminal_status else None,
             intake_item_id=item.id,
@@ -1210,10 +1343,7 @@ def ensure_review_task_for_intake(
                 "requested_url": result.original_url,
             }
         )
-    fallback = (
-        item.status == "candidate_ready"
-        and item.candidate_mode == "fallback-after-error"
-    )
+    fallback_class = _candidate_fallback_class(item)
     task = ReviewTask(
         id=new_task_id(),
         investigation_id=investigation_id,
@@ -1231,15 +1361,15 @@ def ensure_review_task_for_intake(
         queued_at=now,
         completed_at=now if task_status in TERMINAL_TASK_STATUSES else None,
         error_class=(
-            "model_fallback"
-            if fallback
+            fallback_class
+            if fallback_class
             else "intake_failed"
             if task_status == "failed"
             else None
         ),
         error_message=(
             item.candidate_error
-            if fallback
+            if fallback_class == "model_fallback"
             else (item.error or item.candidate_error)
             if task_status == "failed"
             else None
@@ -1482,6 +1612,19 @@ def claim_next_review_task(
 
 
 def _task_error_class(exc: Exception) -> str:
+    # Preserve the HTTP status while the exception object is still available;
+    # a persisted message alone is not reliable enough for UI decisions.
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {
+            401,
+            403,
+            429,
+        }:
+            return f"http_{exc.response.status_code}"
+    except Exception:
+        pass
     try:
         from .collection import classify_collection_error
 
@@ -1680,6 +1823,9 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             if task is None:
                 raise RuntimeError("Review task disappeared after candidate generation")
+            task_payload = dict(task.payload_json or {})
+            task_payload["candidate_mode"] = item.candidate_mode
+            task.payload_json = task_payload
             if selection is not None:
                 selection.status = item.status
                 selection.outcome = "ready"
@@ -1879,6 +2025,229 @@ def _object_exists(session: Session, object_type: str, object_id: str) -> bool:
     return session.get(model, object_id) is not None
 
 
+def _investigation_kind(investigation_id: str) -> str:
+    if investigation_id == DEMO_INVESTIGATION_ID:
+        return "demo"
+    if investigation_id == UNCLASSIFIED_INVESTIGATION_ID:
+        return "system"
+    return "user"
+
+
+def _membership_summary(investigation: Investigation) -> dict[str, Any]:
+    return {
+        "id": investigation.id,
+        "title": investigation.title,
+        "kind": _investigation_kind(investigation.id),
+        "status": investigation.status,
+    }
+
+
+def _object_in_investigation(
+    session: Session,
+    investigation_id: str,
+    object_type: str,
+    object_id: str,
+) -> bool:
+    return (
+        session.scalar(
+            select(InvestigationLink.id)
+            .where(
+                InvestigationLink.investigation_id == investigation_id,
+                InvestigationLink.object_type == object_type,
+                InvestigationLink.object_id == object_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _object_memberships(
+    session: Session, object_type: str, object_id: str
+) -> list[dict[str, Any]]:
+    investigations = list(
+        session.scalars(
+            select(Investigation)
+            .join(
+                InvestigationLink,
+                InvestigationLink.investigation_id == Investigation.id,
+            )
+            .where(
+                InvestigationLink.object_type == object_type,
+                InvestigationLink.object_id == object_id,
+            )
+            .order_by(Investigation.title.asc(), Investigation.id.asc())
+        ).unique()
+    )
+    return [_membership_summary(investigation) for investigation in investigations]
+
+
+def _entity_memberships(session: Session, entity_id: str) -> list[dict[str, Any]]:
+    """Topic ownership of an entity is derived from its linked topic events."""
+    investigations = list(
+        session.scalars(
+            select(Investigation)
+            .join(
+                InvestigationLink,
+                InvestigationLink.investigation_id == Investigation.id,
+            )
+            .join(
+                EventEntity,
+                EventEntity.event_id == InvestigationLink.object_id,
+            )
+            .where(
+                InvestigationLink.object_type == "event",
+                EventEntity.entity_id == entity_id,
+            )
+            .order_by(Investigation.title.asc(), Investigation.id.asc())
+        ).unique()
+    )
+    return [_membership_summary(investigation) for investigation in investigations]
+
+
+def _topic_event_ids(session: Session, investigation_id: str) -> list[str]:
+    return list(
+        session.scalars(
+            select(InvestigationLink.object_id).where(
+                InvestigationLink.investigation_id == investigation_id,
+                InvestigationLink.object_type == "event",
+            )
+        )
+    )
+
+
+def _topic_entity_ids(session: Session, investigation_id: str) -> list[str]:
+    event_ids = _topic_event_ids(session, investigation_id)
+    if not event_ids:
+        return []
+    return list(
+        dict.fromkeys(
+            session.scalars(
+                select(EventEntity.entity_id)
+                .where(EventEntity.event_id.in_(event_ids))
+                .order_by(EventEntity.entity_id.asc())
+            )
+        )
+    )
+
+
+def _confirmation_scope_errors(
+    session: Session,
+    investigation_id: str,
+    request: IntakeConfirmationRequest,
+    *,
+    allow_cross_investigation: bool,
+) -> list[str]:
+    if allow_cross_investigation:
+        return []
+    errors: list[str] = []
+    if request.merge_event_id and not _object_in_investigation(
+        session, investigation_id, "event", request.merge_event_id
+    ):
+        errors.append(
+            "Selected merge event is outside this investigation; explicitly enable cross-investigation reuse to continue"
+        )
+    topic_entity_ids = set(_topic_entity_ids(session, investigation_id))
+    for decision in request.entities:
+        if (
+            decision.action == "merge"
+            and decision.merge_entity_id
+            and decision.merge_entity_id not in topic_entity_ids
+        ):
+            errors.append(
+                f"Entity merge target {decision.merge_entity_id} is outside this investigation; explicitly enable cross-investigation reuse to continue"
+            )
+    return errors
+
+
+def _review_scope_payload(
+    session: Session,
+    investigation_id: str,
+    request: IntakeConfirmationRequest,
+    *,
+    allow_cross_investigation: bool,
+) -> dict[str, Any]:
+    merge_event = None
+    if request.merge_event_id:
+        owners = _object_memberships(session, "event", request.merge_event_id)
+        merge_event = {
+            "id": request.merge_event_id,
+            "in_scope": any(owner["id"] == investigation_id for owner in owners),
+            "investigations": owners,
+            "unassigned": not owners,
+        }
+    merge_entities = []
+    for decision in request.entities:
+        if decision.action != "merge" or not decision.merge_entity_id:
+            continue
+        owners = _entity_memberships(session, decision.merge_entity_id)
+        merge_entities.append(
+            {
+                "candidate_key": decision.candidate_key,
+                "id": decision.merge_entity_id,
+                "in_scope": any(owner["id"] == investigation_id for owner in owners),
+                "investigations": owners,
+                "unassigned": not owners,
+            }
+        )
+    return {
+        "investigation_id": investigation_id,
+        "mode": "explicit-cross-investigation"
+        if allow_cross_investigation
+        else "investigation-only",
+        "allow_cross_investigation": allow_cross_investigation,
+        "merge_event": merge_event,
+        "merge_entities": merge_entities,
+    }
+
+
+def _next_review_task(
+    session: Session, investigation_id: str, *, exclude_intake_id: str
+) -> ReviewTask | None:
+    candidates = list(
+        session.scalars(
+            select(ReviewTask)
+            .where(
+                ReviewTask.investigation_id == investigation_id,
+                ReviewTask.intake_item_id != exclude_intake_id,
+                ReviewTask.status.in_(["ready", "failed", "queued", "fetching", "generating"]),
+            )
+            .order_by(ReviewTask.queued_at.asc(), ReviewTask.id.asc())
+            .limit(500)
+        )
+    )
+    priority = {"ready": 0, "failed": 1, "queued": 2, "fetching": 3, "generating": 4}
+    return min(
+        candidates,
+        key=lambda task: (priority.get(task.status, 99), task.queued_at, task.id),
+        default=None,
+    )
+
+
+def _require_scoped_intake(
+    session: Session, investigation_id: str, item_id: str
+) -> IntakeItem:
+    if session.get(Investigation, investigation_id) is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    if not _object_in_investigation(session, investigation_id, "intake", item_id):
+        # Do not leak whether an unlinked intake object exists globally.
+        raise HTTPException(
+            status_code=404,
+            detail="Intake item not found in this investigation",
+        )
+    item = session.scalar(
+        select(IntakeItem)
+        .where(IntakeItem.id == item_id)
+        .options(selectinload(IntakeItem.candidates))
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Intake item not found in this investigation",
+        )
+    return item
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_investigation(
     request: InvestigationCreate,
@@ -1892,18 +2261,27 @@ def create_investigation(
 @router.get("")
 def list_investigations(
     status_value: str | None = Query(default=None, alias="status"),
+    offset: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    query = select(Investigation).order_by(
-        Investigation.updated_at.desc(), Investigation.id.asc()
-    )
+    filters = []
     if status_value:
-        query = query.where(Investigation.status == status_value)
-    items = list(session.scalars(query.limit(limit)))
+        filters.append(Investigation.status == status_value)
+    total = int(session.scalar(select(func.count()).select_from(Investigation).where(*filters)) or 0)
+    query = (
+        select(Investigation)
+        .where(*filters)
+        .order_by(Investigation.updated_at.desc(), Investigation.id.asc())
+        .offset(offset)
+        .limit(limit)
+    )
+    items = list(session.scalars(query))
     return {
         "items": [serialize_investigation(session, item) for item in items],
-        "count": len(items),
+        "count": total,
+        "offset": offset,
+        "limit": limit,
     }
 
 
@@ -1936,7 +2314,7 @@ def get_task(task_id: str, session: Session = Depends(get_session)) -> dict[str,
     task = session.get(ReviewTask, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Review task not found")
-    return serialize_task(task)
+    return serialize_task(task, session=session, include_intake_detail=True)
 
 
 @router.get("/{investigation_id}")
@@ -1948,6 +2326,208 @@ def get_investigation(
     if investigation is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return serialize_investigation(session, investigation, include_detail=True)
+
+
+@router.get("/{investigation_id}/intake/{item_id}")
+def get_investigation_intake(
+    investigation_id: str,
+    item_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Load one full material only after the analyst opens it."""
+    from .intake import serialize_intake
+
+    return serialize_intake(
+        _require_scoped_intake(session, investigation_id, item_id)
+    )
+
+
+@router.get("/{investigation_id}/review-options")
+def investigation_review_options(
+    investigation_id: str,
+    include_reusable: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """Return merge targets, strict by default and explicit when cross-topic."""
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    topic_event_ids = set(_topic_event_ids(session, investigation_id))
+    event_query = select(Event).order_by(Event.start_at.desc(), Event.id.asc())
+    if not include_reusable:
+        event_query = event_query.where(Event.id.in_(topic_event_ids))
+    events = list(session.scalars(event_query))
+
+    topic_entity_ids = set(_topic_entity_ids(session, investigation_id))
+    entity_query = select(Entity).order_by(Entity.name.asc(), Entity.id.asc())
+    if not include_reusable:
+        entity_query = entity_query.where(Entity.id.in_(topic_entity_ids))
+    entities = list(session.scalars(entity_query))
+
+    claim_query = select(Claim).order_by(Claim.created_at.desc(), Claim.id.asc())
+    if not include_reusable:
+        claim_query = claim_query.where(Claim.event_id.in_(topic_event_ids))
+    claims = list(session.scalars(claim_query))
+
+    event_options = []
+    for event in events:
+        owners = _object_memberships(session, "event", event.id)
+        event_options.append(
+            {
+                "id": event.id,
+                "title": event.title,
+                "summary": event.summary,
+                "start_at": iso(event.start_at),
+                "in_scope": event.id in topic_event_ids,
+                "reusable": event.id not in topic_event_ids,
+                "investigations": owners,
+                "unassigned": not owners,
+            }
+        )
+    entity_options = []
+    for entity in entities:
+        owners = _entity_memberships(session, entity.id)
+        entity_options.append(
+            {
+                "id": entity.id,
+                "name": entity.name,
+                "type": entity.entity_type,
+                "in_scope": entity.id in topic_entity_ids,
+                "reusable": entity.id not in topic_entity_ids,
+                "investigations": owners,
+                "unassigned": not owners,
+            }
+        )
+    claim_options = []
+    for claim in claims:
+        owners = _object_memberships(session, "event", claim.event_id)
+        claim_options.append(
+            {
+                "id": claim.id,
+                "event_id": claim.event_id,
+                "text": claim.text,
+                "status": claim.status,
+                "in_scope": claim.event_id in topic_event_ids,
+                "reusable": claim.event_id not in topic_event_ids,
+                "investigations": owners,
+                "unassigned": not owners,
+            }
+        )
+    return {
+        "events": event_options,
+        "entities": entity_options,
+        "claims": claim_options,
+        "scope": {
+            "mode": "explicit-cross-investigation"
+            if include_reusable
+            else "investigation-only",
+            "investigation": _membership_summary(investigation),
+            "include_reusable": include_reusable,
+        },
+    }
+
+
+@router.post("/{investigation_id}/intake/{item_id}/preview")
+def preview_investigation_intake(
+    investigation_id: str,
+    item_id: str,
+    request: IntakeConfirmationRequest,
+    allow_cross_investigation: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = _require_scoped_intake(session, investigation_id, item_id)
+    from .intake import build_confirmation_preview
+
+    preview = build_confirmation_preview(session, item, request)
+    scope_errors = _confirmation_scope_errors(
+        session,
+        investigation_id,
+        request,
+        allow_cross_investigation=allow_cross_investigation,
+    )
+    preview["errors"] = [*preview["errors"], *scope_errors]
+    preview["confirmable"] = not preview["errors"]
+    preview["scope"] = _review_scope_payload(
+        session,
+        investigation_id,
+        request,
+        allow_cross_investigation=allow_cross_investigation,
+    )
+    preview["semantic_preview"]["scope"] = preview["scope"]
+    return preview
+
+
+@router.post("/{investigation_id}/intake/{item_id}/confirm")
+def confirm_investigation_intake(
+    investigation_id: str,
+    item_id: str,
+    request: IntakeConfirmationRequest,
+    allow_cross_investigation: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = _require_scoped_intake(session, investigation_id, item_id)
+    scope_errors = _confirmation_scope_errors(
+        session,
+        investigation_id,
+        request,
+        allow_cross_investigation=allow_cross_investigation,
+    )
+    if scope_errors:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "The review selection contains targets outside this investigation",
+                "errors": scope_errors,
+                "next_action": "Enable cross-investigation reuse explicitly and review target ownership before confirming.",
+            },
+        )
+    scope_payload = _review_scope_payload(
+        session,
+        investigation_id,
+        request,
+        allow_cross_investigation=allow_cross_investigation,
+    )
+    if item.status != "confirmed" and allow_cross_investigation and (
+        (scope_payload["merge_event"] and not scope_payload["merge_event"]["in_scope"])
+        or any(not entity["in_scope"] for entity in scope_payload["merge_entities"])
+    ):
+        record_action(
+            session,
+            investigation_id,
+            "review.cross_investigation_reuse_approved",
+            actor=request.analyst,
+            object_type="intake",
+            object_id=item.id,
+            detail=scope_payload,
+        )
+    from .intake import confirm_intake, serialize_intake
+
+    try:
+        item, result, created = confirm_intake(session, item, request)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    next_task = _next_review_task(
+        session, investigation_id, exclude_intake_id=item.id
+    )
+    result = dict(result)
+    result["final_event_id"] = item.final_event_id
+    result["event_url"] = (
+        f"/pldr-api/v1/events/{item.final_event_id}" if item.final_event_id else None
+    )
+    result["next_task"] = (
+        serialize_task(next_task, session=session) if next_task is not None else None
+    )
+    return {
+        "status": "confirmed",
+        "created": created,
+        "investigation_id": investigation_id,
+        "final_event_id": item.final_event_id,
+        "event_url": result["event_url"],
+        "next_task": result["next_task"],
+        "result": result,
+        "intake_item": serialize_intake(item),
+    }
 
 
 @router.patch("/{investigation_id}")
@@ -2067,7 +2647,7 @@ def list_investigation_tasks(
         )
     )
     return {
-        "items": [serialize_task(task) for task in tasks],
+        "items": [serialize_task(task, session=session) for task in tasks],
         "count": total,
         "offset": offset,
         "limit": limit,

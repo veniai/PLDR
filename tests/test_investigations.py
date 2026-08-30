@@ -318,6 +318,8 @@ class InvestigationWorkflowTest(unittest.TestCase):
         recovered = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
         self.assertEqual(recovered["status"], "ready")
         self.assertFalse(recovered["fallback_used"])
+        self.assertTrue(recovered["degraded"])
+        self.assertEqual(recovered["degradation"]["code"], "rule_fallback")
         self.assertIsNone(recovered["error"])
 
         confirmed_topic = self.create_investigation("Confirmed material reused M:N")

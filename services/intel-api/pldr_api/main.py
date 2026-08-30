@@ -31,6 +31,7 @@ from .intake import (
     get_intake_item,
     reject_intake,
     serialize_intake,
+    serialize_intake_summary,
     submit_file_intake,
     submit_rss_intake,
     submit_text_intake,
@@ -64,6 +65,8 @@ from .seed import counts, seed_database
 from .search import (
     ExternalSearchError,
     execute_external_search,
+    get_query_run_payload,
+    list_query_runs,
     provider_metadata,
     retry_search_result,
     select_search_results,
@@ -145,6 +148,80 @@ def ensure_compatible_schema() -> None:
                     text(
                         "CREATE UNIQUE INDEX uq_collection_run_active_key "
                         "ON collection_runs (active_key)"
+                    )
+                )
+    if "external_search_query_runs" in inspector.get_table_names():
+        columns = {
+            column["name"]
+            for column in inspector.get_columns("external_search_query_runs")
+        }
+        additions = {
+            "error_detail": "JSON",
+            "current_page": "INTEGER DEFAULT 1",
+            "page_size": "INTEGER DEFAULT 10",
+            "returned_count": "INTEGER DEFAULT 0",
+            "has_more": "BOOLEAN DEFAULT 0",
+            "total_known": "BOOLEAN DEFAULT 0",
+            "total_count": "INTEGER",
+            "updated_at": "DATETIME",
+        }
+        missing_columns = set(additions) - columns
+        if missing_columns:
+            page_size_backfill = (
+                "CASE WHEN result_count BETWEEN 5 AND 20 "
+                "THEN result_count ELSE 10 END"
+                if "page_size" in missing_columns
+                else "COALESCE(page_size, 10)"
+            )
+            with engine.begin() as connection:
+                for name, definition in additions.items():
+                    if name not in missing_columns:
+                        continue
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE external_search_query_runs "
+                            f"ADD COLUMN {name} {definition}"
+                        )
+                    )
+                # Existing query runs already represent their first loaded page.
+                connection.execute(
+                    text(
+                        "UPDATE external_search_query_runs SET "
+                        "current_page = COALESCE(current_page, 1), "
+                        f"page_size = {page_size_backfill}, "
+                        "returned_count = CASE "
+                        "WHEN COALESCE(current_page, 1) = 1 "
+                        "AND COALESCE(returned_count, 0) = 0 "
+                        "THEN COALESCE(result_count, 0) "
+                        "ELSE COALESCE(returned_count, 0) END, "
+                        "has_more = COALESCE(has_more, 0), "
+                        "total_known = COALESCE(total_known, 0), "
+                        "updated_at = COALESCE(updated_at, created_at)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS "
+                        "ix_external_search_query_runs_updated_at "
+                        "ON external_search_query_runs (updated_at)"
+                    )
+                )
+    if "external_search_results" in inspector.get_table_names():
+        columns = {
+            column["name"] for column in inspector.get_columns("external_search_results")
+        }
+        if "source_page" not in columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE external_search_results "
+                        "ADD COLUMN source_page INTEGER DEFAULT 1"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_external_search_results_source_page "
+                        "ON external_search_results (source_page)"
                     )
                 )
 
@@ -466,8 +543,37 @@ async def external_search(
         session.rollback()
         raise HTTPException(
             status_code=exc.status_code,
-            detail={"message": str(exc), "reason": exc.reason, "query_run_id": exc.query_run_id},
+            detail=exc.as_dict(),
         ) from exc
+
+
+@app.get("/api/v1/search/runs", include_in_schema=False)
+@app.get("/pldr-api/v1/search/runs")
+def external_search_runs(
+    investigation_id: str = Query(min_length=1, max_length=80),
+    limit: int = Query(default=10, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    if session.get(Investigation, investigation_id) is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return list_query_runs(
+        session, investigation_id=investigation_id, limit=limit
+    )
+
+
+@app.get("/api/v1/search/runs/{run_id}", include_in_schema=False)
+@app.get("/pldr-api/v1/search/runs/{run_id}")
+def external_search_run(
+    run_id: str,
+    investigation_id: str = Query(min_length=1, max_length=80),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        return get_query_run_payload(
+            session, run_id, investigation_id=investigation_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/search/select", include_in_schema=False)
@@ -525,13 +631,15 @@ async def intake_file(
 def intake_list(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
+    include_detail: bool = Query(default=True),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     query = select(IntakeItem).options(selectinload(IntakeItem.candidates)).order_by(IntakeItem.created_at.desc())
     if status:
         query = query.where(IntakeItem.status == status)
     items = list(session.scalars(query.limit(limit)))
-    return {"items": [serialize_intake(item) for item in items], "count": len(items)}
+    serializer = serialize_intake if include_detail else serialize_intake_summary
+    return {"items": [serializer(item) for item in items], "count": len(items)}
 
 
 @app.get("/api/v1/intake/options", include_in_schema=False)

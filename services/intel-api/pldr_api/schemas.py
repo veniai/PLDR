@@ -137,7 +137,15 @@ class IntakeCancelRequest(BaseModel):
 class ExternalSearchRequest(BaseModel):
     keyword:str=Field(min_length=2,max_length=400)
     scope:Literal["news","web"]="web"
+    # ``limit`` is the original P1 contract and remains the fallback page size.
+    # New clients can use the clearer ``page_size`` name without breaking old
+    # callers that still send only ``limit``.
     limit:int=Field(default=10,ge=5,le=20)
+    page_size:int|None=Field(default=None,ge=5,le=20)
+    page:int=Field(default=1,ge=1,le=50)
+    pageno:int|None=Field(default=None,ge=1,le=50)
+    cursor:str|None=Field(default=None,min_length=1,max_length=16)
+    query_run_id:str|None=Field(default=None,min_length=1,max_length=96)
     language:str=Field(default="en",min_length=2,max_length=20)
     investigation_id:str|None=Field(default=None,max_length=80)
     new_investigation:InvestigationCreate|None=None
@@ -146,10 +154,42 @@ class ExternalSearchRequest(BaseModel):
     def one_investigation_context(self):
         if self.investigation_id and self.new_investigation:
             raise ValueError("Use investigation_id or new_investigation, not both")
+        requested_pages = [self.page]
+        if self.pageno is not None:
+            requested_pages.append(self.pageno)
+        if self.cursor is not None:
+            try:
+                cursor_page = int(self.cursor)
+            except ValueError as exc:
+                raise ValueError("cursor must be a numeric page token") from exc
+            if cursor_page < 1 or cursor_page > 50:
+                raise ValueError("cursor is outside the supported page range")
+            requested_pages.append(cursor_page)
+        explicit_pages = {value for value in requested_pages if value != 1}
+        if len(explicit_pages) > 1:
+            raise ValueError("page, pageno, and cursor must identify the same page")
+        if explicit_pages:
+            self.page = explicit_pages.pop()
+        elif self.pageno is not None:
+            self.page = self.pageno
+        if self.page > 1 and not self.query_run_id:
+            raise ValueError("query_run_id is required when loading another page")
+        if self.query_run_id and not self.investigation_id:
+            raise ValueError(
+                "investigation_id is required when continuing a saved query"
+            )
+        if self.query_run_id and self.new_investigation:
+            raise ValueError(
+                "A saved query cannot be continued into a new investigation"
+            )
         return self
 
+    @property
+    def effective_page_size(self) -> int:
+        return self.page_size or self.limit
+
 class ExternalSearchSelectionRequest(BaseModel):
-    result_ids:list[str]=Field(min_length=1,max_length=20)
+    result_ids:list[str]=Field(min_length=1,max_length=100)
     request_id:str|None=Field(default=None,min_length=1,max_length=128)
     investigation_id:str|None=Field(default=None,max_length=80)
     new_investigation:InvestigationCreate|None=None
@@ -159,6 +199,15 @@ class ExternalSearchSelectionRequest(BaseModel):
     def one_investigation_context(self):
         if self.investigation_id and self.new_investigation:
             raise ValueError("Use investigation_id or new_investigation, not both")
+        if (
+            len(self.result_ids) > 20
+            and not self.request_id
+            and not self.investigation_id
+            and not self.new_investigation
+        ):
+            raise ValueError(
+                "More than 20 results requires the asynchronous topic path"
+            )
         return self
 
 

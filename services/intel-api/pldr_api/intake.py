@@ -47,6 +47,8 @@ SUPPORTED_FILE_SUFFIXES = {
 }
 UNKNOWN_TITLE = "[unknown title]"
 UNKNOWN_DATETIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
+DEFAULT_EVENT_SUMMARY = "Analyst-confirmed intake material."
+DEFAULT_EVIDENCE_NOTE = "Human-confirmed from isolated intake candidate; machine candidate retained in intake."
 
 
 def utcnow() -> datetime:
@@ -54,7 +56,11 @@ def utcnow() -> datetime:
 
 
 def iso(value: datetime | None) -> str | None:
-    return value.isoformat().replace("+00:00", "Z") if value else None
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def parse_datetime(value: str | None) -> datetime | None:
@@ -67,6 +73,25 @@ def parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _normalized_new_event_fields(item: IntakeItem, request: IntakeConfirmationRequest) -> dict[str, Any]:
+    """Return the exact values used when confirmation creates a formal Event."""
+    # A document publication time is provenance about the material, not proof of
+    # when the described event happened. Keep an intentionally blank event time
+    # unknown in the public contract; Event.start_at remains non-null only because
+    # the existing persistence model requires a sortable sentinel value.
+    requested_start_at = parse_datetime(request.event.start_at)
+    start_at = requested_start_at or UNKNOWN_DATETIME
+    return {
+        "title": request.event.title.strip(),
+        "summary": request.event.summary.strip() or DEFAULT_EVENT_SUMMARY,
+        "event_type": request.event.event_type,
+        "start_at": start_at,
+        "start_at_known": requested_start_at is not None,
+        "location_name": request.event.location_name if request.event.location_name != "Unknown" else "",
+        "importance": request.event.importance,
+    }
 
 
 def sha256_text(value: str) -> str:
@@ -175,7 +200,9 @@ def deterministic_candidate_result(item: IntakeItem) -> dict[str, Any]:
         "event": {
             "title": _clean_known(item.title),
             "summary": snapshot[:500],
-            "event_time": iso(item.published_at),
+            # Publication time describes the document, not necessarily the
+            # event. A deterministic fallback has no basis to equate them.
+            "event_time": None,
             "location_name": None,
         },
         "entities": [],
@@ -236,12 +263,16 @@ def _store_candidates(
     else:
         event = dict(event)
         event_time = event.get("event_time")
+        if event_time is None:
+            event_time = event.get("occurred_at") or event.get("start_at")
+        for alias in ("occurred_at", "start_at", "published_at"):
+            event.pop(alias, None)
         if (
             event_time is not None
-            and event_time != iso(item.published_at)
-            and event_time not in item.extracted_snapshot
+            and (not isinstance(event_time, str) or event_time not in item.extracted_snapshot)
         ):
-            event["event_time"] = None
+            event_time = None
+        event["event_time"] = event_time
     event_key = "event"
     session.add(
         IntakeCandidate(
@@ -664,6 +695,39 @@ def serialize_candidate(candidate: IntakeCandidate) -> dict[str, Any]:
     }
 
 
+def serialize_intake_summary(item: IntakeItem) -> dict[str, Any]:
+    """List-safe material metadata; never embeds snapshots or candidate blobs."""
+    return {
+        "id": item.id,
+        "input_type": item.input_type,
+        "status": item.status,
+        "error": item.error,
+        "source": {
+            "description": item.source_description or None,
+            "url": item.source_url,
+            "canonical_url": item.canonical_url,
+            "known": bool(item.source_description or item.canonical_url),
+        },
+        "title": _clean_known(item.title),
+        "published_at": iso(item.published_at),
+        "language": item.language,
+        "created_at": iso(item.created_at),
+        "updated_at": iso(item.updated_at),
+        "search": item.review.get("external_search") or None,
+        "candidate_generation": {
+            "mode": item.candidate_mode,
+            "model": item.candidate_model,
+            "error": item.candidate_error,
+        },
+        "candidate_count": len(item.candidates),
+        "final_object_ids": {
+            "event": item.final_event_id,
+            "document": item.final_document_id,
+            "snapshot": item.final_snapshot_id,
+        },
+    }
+
+
 def serialize_intake(item: IntakeItem) -> dict[str, Any]:
     candidates = [serialize_candidate(candidate) for candidate in item.candidates]
     return {
@@ -754,6 +818,11 @@ def validate_confirmation(
             errors.append("Selected merge event does not exist")
     if request.disposition != "merge" and not request.event.title.strip():
         errors.append("A known event title is required to create or modify a new formal event")
+    if request.disposition != "merge" and request.event.start_at:
+        try:
+            parse_datetime(request.event.start_at)
+        except ValueError:
+            errors.append("Event start time must be a valid ISO-8601 datetime")
     if request.disposition == "modify":
         machine_event = _machine_event(item)
         if not _difference(machine_event, request.event.model_dump(mode="json")):
@@ -826,7 +895,85 @@ def build_confirmation_preview(
 ) -> dict[str, Any]:
     errors = validate_confirmation(session, item, request)
     merge_event = session.get(Event, request.merge_event_id) if request.merge_event_id else None
-    return {
+    if merge_event is not None:
+        merge_metadata = merge_event.metadata_json or {}
+        event_preview = {
+            "id": merge_event.id,
+            "title": merge_event.title,
+            "summary": merge_event.summary,
+            "event_type": merge_event.event_type,
+            "start_at": None if merge_metadata.get("start_at_known") is False else iso(merge_event.start_at),
+            "location_name": merge_event.location_name,
+            "importance": merge_event.importance,
+            "action": "merge",
+        }
+    else:
+        try:
+            normalized_event = _normalized_new_event_fields(item, request)
+        except ValueError:
+            normalized_event = {
+                "title": request.event.title.strip(),
+                "summary": request.event.summary.strip() or DEFAULT_EVENT_SUMMARY,
+                "event_type": request.event.event_type,
+                "start_at": None,
+                "start_at_known": False,
+                "location_name": request.event.location_name if request.event.location_name != "Unknown" else "",
+                "importance": request.event.importance,
+            }
+        event_preview = {
+            "id": None,
+            "title": normalized_event["title"],
+            "summary": normalized_event["summary"],
+            "event_type": normalized_event["event_type"],
+            "start_at": iso(normalized_event["start_at"]) if normalized_event["start_at_known"] else None,
+            "location_name": normalized_event["location_name"],
+            "importance": normalized_event["importance"],
+            "action": "create" if request.disposition == "create" else "create-modified",
+        }
+
+    entity_previews: list[dict[str, Any]] = []
+    for decision in request.entities:
+        if decision.action == "exclude":
+            continue
+        target = session.get(Entity, decision.merge_entity_id) if decision.action == "merge" and decision.merge_entity_id else None
+        entity_previews.append({
+            "action": decision.action,
+            "name": target.name if target is not None else decision.name.strip(),
+            "entity_type": target.entity_type if target is not None else decision.entity_type,
+            "aliases": list(target.aliases or []) if target is not None else decision.aliases,
+            "role": decision.role,
+            "merge_entity_id": decision.merge_entity_id,
+        })
+
+    claim_previews: list[dict[str, Any]] = []
+    for decision in request.claims:
+        if decision.action == "exclude":
+            continue
+        target = session.get(Claim, decision.merge_claim_id) if decision.action == "merge" and decision.merge_claim_id else None
+        claim_previews.append({
+            "action": decision.action,
+            "text": target.text if target is not None else decision.text.strip(),
+            "status": target.status if target is not None else decision.status,
+            "confidence": target.confidence if target is not None else decision.confidence,
+            "temporal_scope": target.temporal_scope if target is not None else decision.temporal_scope,
+            "merge_claim_id": decision.merge_claim_id,
+        })
+
+    evidence_previews = [
+        {
+            "snippet": decision.snippet,
+            "stance": decision.stance,
+            "strength": decision.strength,
+            "note": decision.note or DEFAULT_EVIDENCE_NOTE,
+            "snapshot_trace": {
+                "start_offset": item.extracted_snapshot.find(decision.snippet),
+                "end_offset": item.extracted_snapshot.find(decision.snippet) + len(decision.snippet),
+            },
+        }
+        for decision in request.evidence
+        if decision.action == "include"
+    ]
+    preview = {
         "confirmable": not errors,
         "errors": errors,
         "disposition": request.disposition,
@@ -843,42 +990,10 @@ def build_confirmation_preview(
                 "content_hash": item.extracted_hash,
             },
             "snapshot": {"content_hash": item.extracted_hash, "length": len(item.extracted_snapshot)},
-            "event": {
-                "id": merge_event.id if merge_event else None,
-                "title": merge_event.title if merge_event else request.event.title,
-                "summary": merge_event.summary if merge_event else request.event.summary,
-                "action": "merge" if merge_event else ("create" if request.disposition == "create" else "create-modified"),
-            },
-            "entities": [
-                {
-                    "action": decision.action,
-                    "name": decision.name,
-                    "merge_entity_id": decision.merge_entity_id,
-                }
-                for decision in request.entities
-                if decision.action != "exclude"
-            ],
-            "claims": [
-                {
-                    "action": decision.action,
-                    "text": decision.text,
-                    "merge_claim_id": decision.merge_claim_id,
-                }
-                for decision in request.claims
-                if decision.action != "exclude"
-            ],
-            "evidence": [
-                {
-                    "snippet": decision.snippet,
-                    "stance": decision.stance,
-                    "snapshot_trace": {
-                        "start_offset": item.extracted_snapshot.find(decision.snippet),
-                        "end_offset": item.extracted_snapshot.find(decision.snippet) + len(decision.snippet),
-                    },
-                }
-                for decision in request.evidence
-                if decision.action == "include"
-            ],
+            "event": event_preview,
+            "entities": entity_previews,
+            "claims": claim_previews,
+            "evidence": evidence_previews,
         },
         "trace": {
             "intake_item_id": item.id,
@@ -887,6 +1002,44 @@ def build_confirmation_preview(
             "analyst": request.analyst,
         },
     }
+    formal = preview["formal"]
+    degraded = item.candidate_mode in {"fallback", "fallback-after-error"}
+    selected = {
+        decision.candidate_key
+        for decision in [*request.claims, *request.evidence]
+        if decision.action not in {"exclude"}
+    }
+    preview["semantic_preview"] = {
+        "source": {**formal["source"], "action": "reuse_or_create"},
+        "document": {**formal["document"], "action": "create_or_update"},
+        "snapshot": {**formal["snapshot"], "action": "append_immutable"},
+        "event": formal["event"],
+        "entities": formal["entities"],
+        "claims": formal["claims"],
+        "evidence": formal["evidence"],
+        "relations": [
+            {"type": "event_document", "from": "event", "to": "document"},
+            *[
+                dict(relation)
+                for relation in item.candidate_relations
+                if relation.get("type") == "claim_evidence"
+                and relation.get("from") in selected
+                and relation.get("to") in selected
+            ],
+        ],
+        "actions": [
+            "保存来源、文档和不可变正文快照",
+            "并入已有事件" if formal["event"]["action"] == "merge" else "创建正式事件",
+            f"处理 {len(formal['claims'])} 条主张和 {len(formal['evidence'])} 条证据",
+            "保留机器候选、人工修改和正式对象之间的审计记录",
+        ],
+        "candidate_generation": {
+            "mode": item.candidate_mode,
+            "degraded": degraded,
+            "warning": "规则降级候选必须人工核对。" if degraded else None,
+        },
+    }
+    return preview
 
 
 def _origin(item: IntakeItem) -> tuple[str, str]:
@@ -1228,22 +1381,23 @@ def _confirm_validated_intake(
         if event is None:
             raise ValueError("Selected merge event no longer exists")
     else:
+        event_fields = _normalized_new_event_fields(item, request)
         event = Event(
             id="evt_intake_" + uuid.uuid4().hex[:16],
-            title=request.event.title.strip(),
-            summary=request.event.summary.strip() or "Analyst-confirmed intake material.",
-            event_type=request.event.event_type,
-            start_at=parse_datetime(request.event.start_at) or item.published_at or UNKNOWN_DATETIME,
+            title=event_fields["title"],
+            summary=event_fields["summary"],
+            event_type=event_fields["event_type"],
+            start_at=event_fields["start_at"],
             end_at=None,
             latitude=None,
             longitude=None,
-            location_name=request.event.location_name if request.event.location_name != "Unknown" else "",
-            importance=request.event.importance,
+            location_name=event_fields["location_name"],
+            importance=event_fields["importance"],
             status="confirmed",
             confidence=0.5,
             metadata_json={
                 "intake_item_id": item.id,
-                "start_at_known": bool(request.event.start_at or item.published_at),
+                "start_at_known": event_fields["start_at_known"],
                 "confirmation_stage": "P0.3-human-confirmed",
             },
         )
@@ -1332,8 +1486,7 @@ def _confirm_validated_intake(
                 end_offset=end,
                 stance=decision.stance,
                 strength=decision.strength,
-                note=decision.note
-                or "Human-confirmed from isolated intake candidate; machine candidate retained in intake.",
+                note=decision.note or DEFAULT_EVIDENCE_NOTE,
             )
         )
         evidence_ids[decision.candidate_key] = evidence_id
@@ -1381,6 +1534,9 @@ def _confirm_validated_intake(
         },
         "human_changes": differences,
         "trace": trace,
+        "final_event_id": event.id,
+        "event_url": f"/pldr-api/v1/events/{event.id}",
+        "next_task": None,
     }
     item.status = "confirmed"
     item.error = None

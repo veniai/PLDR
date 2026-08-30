@@ -134,7 +134,12 @@ def normalize_model_result(task: str, result: Any) -> dict[str, Any]:
     if isinstance(event, dict):
         event = dict(event)
         _copy_alias(event, "summary", "description")
-        _copy_alias(event, "event_time", "occurred_at", "published_at")
+        _copy_alias(event, "event_time", "occurred_at", "start_at")
+        # Provider aliases are normalized to one reviewed candidate field.
+        # `published_at` is deliberately not an event-time alias: it describes
+        # the source document and cannot establish when the event occurred.
+        for alias in ("occurred_at", "start_at", "published_at"):
+            event.pop(alias, None)
         _copy_alias(event, "location_name", "location")
         if isinstance(event.get("location_name"), dict):
             event["location_name"] = event["location_name"].get("name")
