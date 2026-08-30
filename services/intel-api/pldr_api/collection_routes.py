@@ -13,8 +13,10 @@ from .collection import (
     collection_summary,
     enqueue_target_run,
     list_target_runs,
+    list_discovered_items,
     list_version_runs,
     new_target_id,
+    serialize_discovered_item,
     serialize_run,
     serialize_target,
     utcnow,
@@ -85,6 +87,7 @@ def create_collection_target(
     target = CollectionTarget(
         id=new_target_id(),
         name=request.name.strip(),
+        target_type=request.target_type,
         url=url,
         language=request.language,
         interval_seconds=request.interval_seconds,
@@ -178,6 +181,23 @@ def list_collection_runs(
     return {
         "items": [serialize_run(run) for run in runs],
         "count": serialize_target(session, target)["run_count"],
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@router.get("/targets/{target_id}/items")
+def list_collection_discovered_items(
+    target_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    target = _target_or_404(session, target_id)
+    items = list_discovered_items(session, target.id, offset=offset, limit=limit)
+    return {
+        "items": [serialize_discovered_item(item) for item in items],
+        "count": serialize_target(session, target)["discovered_item_count"],
         "offset": offset,
         "limit": limit,
     }

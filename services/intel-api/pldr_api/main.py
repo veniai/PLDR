@@ -153,6 +153,31 @@ def ensure_compatible_schema() -> None:
             )
     if "collection_runs" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("collection_runs")}
+        run_additions = {
+            "discovered_count": "INTEGER DEFAULT 0",
+            "new_item_count": "INTEGER DEFAULT 0",
+            "duplicate_item_count": "INTEGER DEFAULT 0",
+            "invalid_item_count": "INTEGER DEFAULT 0",
+        }
+        missing_run_additions = set(run_additions) - columns
+        if missing_run_additions:
+            with engine.begin() as connection:
+                for name, definition in run_additions.items():
+                    if name in missing_run_additions:
+                        connection.execute(
+                            text(
+                                f"ALTER TABLE collection_runs ADD COLUMN {name} {definition}"
+                            )
+                        )
+                connection.execute(
+                    text(
+                        "UPDATE collection_runs SET "
+                        "discovered_count = COALESCE(discovered_count, 0), "
+                        "new_item_count = COALESCE(new_item_count, 0), "
+                        "duplicate_item_count = COALESCE(duplicate_item_count, 0), "
+                        "invalid_item_count = COALESCE(invalid_item_count, 0)"
+                    )
+                )
         if "active_key" not in columns:
             with engine.begin() as connection:
                 connection.execute(
@@ -188,6 +213,22 @@ def ensure_compatible_schema() -> None:
                     text(
                         "CREATE UNIQUE INDEX uq_collection_run_active_key "
                         "ON collection_runs (active_key)"
+                    )
+                )
+    if "collection_targets" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("collection_targets")}
+        if "target_type" not in columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE collection_targets ADD COLUMN target_type "
+                        "VARCHAR(30) DEFAULT 'web_page' NOT NULL"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_collection_targets_target_type "
+                        "ON collection_targets (target_type)"
                     )
                 )
     if "external_search_query_runs" in inspector.get_table_names():

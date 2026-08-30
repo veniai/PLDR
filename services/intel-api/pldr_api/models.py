@@ -225,13 +225,16 @@ class IntakeCandidate(Base):
 
 
 class CollectionTarget(Base):
-    """A fixed public page monitored by the reliable-collection worker."""
+    """A public source monitored by the reliable-collection worker."""
 
     __tablename__ = "collection_targets"
     __table_args__ = (UniqueConstraint("url", name="uq_collection_target_url"),)
 
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    target_type: Mapped[str] = mapped_column(
+        String(30), default="web_page", nullable=False, index=True
+    )
     url: Mapped[str] = mapped_column(String(900), nullable=False)
     language: Mapped[str] = mapped_column(String(20), default="en")
     interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
@@ -295,6 +298,10 @@ class CollectionRun(Base):
     current_intake_item_id: Mapped[str | None] = mapped_column(
         ForeignKey("intake_items.id"), index=True
     )
+    discovered_count: Mapped[int] = mapped_column(Integer, default=0)
+    new_item_count: Mapped[int] = mapped_column(Integer, default=0)
+    duplicate_item_count: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_item_count: Mapped[int] = mapped_column(Integer, default=0)
     target: Mapped[CollectionTarget] = relationship(back_populates="runs")
     previous_intake_item: Mapped[IntakeItem | None] = relationship(
         foreign_keys=[previous_intake_item_id]
@@ -302,6 +309,36 @@ class CollectionRun(Base):
     current_intake_item: Mapped[IntakeItem | None] = relationship(
         foreign_keys=[current_intake_item_id]
     )
+
+
+class CollectionDiscoveredItem(Base):
+    """One durable feed item fingerprint and its optional review material."""
+
+    __tablename__ = "collection_discovered_items"
+    __table_args__ = (
+        UniqueConstraint("target_id", "item_key", name="uq_collection_discovered_item_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(112), primary_key=True)
+    target_id: Mapped[str] = mapped_column(
+        ForeignKey("collection_targets.id"), index=True
+    )
+    item_key: Mapped[str] = mapped_column(String(64), index=True)
+    source_url: Mapped[str] = mapped_column(String(900), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    intake_item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("intake_items.id"), unique=True
+    )
+    first_seen_run_id: Mapped[str] = mapped_column(String(96))
+    last_seen_run_id: Mapped[str] = mapped_column(String(96))
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    intake_item: Mapped[IntakeItem | None] = relationship()
 
 
 class SearchQueryRun(Base):
