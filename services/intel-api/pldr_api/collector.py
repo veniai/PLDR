@@ -4,19 +4,32 @@ import argparse
 import asyncio
 
 from .collection import run_once, worker_identity
-from .database import Base, engine
+from .database import Base, SessionLocal, engine
+from .investigations import bootstrap_legacy_investigations, run_review_task_once
 
 
 async def _run_loop(*, poll_seconds: float) -> None:
     worker_id = worker_identity()
+    prefer_review = True
     while True:
-        completed = await run_once(worker_id=worker_id)
+        if prefer_review:
+            completed = await run_review_task_once(worker_id=f"{worker_id}:review")
+            if completed is None:
+                completed = await run_once(worker_id=worker_id)
+        else:
+            completed = await run_once(worker_id=worker_id)
+            if completed is None:
+                completed = await run_review_task_once(worker_id=f"{worker_id}:review")
+        prefer_review = not prefer_review
         if completed is None:
             await asyncio.sleep(poll_seconds)
 
 
 async def _run_single() -> None:
-    await run_once(worker_id=worker_identity())
+    worker_id = worker_identity()
+    completed = await run_review_task_once(worker_id=f"{worker_id}:review")
+    if completed is None:
+        await run_once(worker_id=worker_id)
 
 
 def main() -> int:
@@ -34,6 +47,8 @@ def main() -> int:
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be positive")
     Base.metadata.create_all(bind=engine)
+    with SessionLocal() as session:
+        bootstrap_legacy_investigations(session)
     try:
         if args.once:
             asyncio.run(_run_single())

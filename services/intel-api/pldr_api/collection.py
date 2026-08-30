@@ -718,6 +718,15 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                 run.version_number = version_number
                 run.previous_intake_item_id = previous_item.id if previous_item else None
                 run.current_intake_item_id = item.id
+                from .investigations import attach_collection_intake_to_investigations
+
+                attach_collection_intake_to_investigations(
+                    session,
+                    target_id=target.id,
+                    item=item,
+                    run_id=run.id,
+                    outcome=outcome,
+                )
 
             finished = utcnow()
             run.status = "succeeded"

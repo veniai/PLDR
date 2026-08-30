@@ -18,12 +18,78 @@
         </div>
       </div>
       <div id="metrics" class="metrics" aria-label="专题指标"></div>
-      <div class="system-state">
-        <span class="live-dot" aria-hidden="true"></span>
-        <span id="system-state-text">正在连接</span>
+      <div class="topbar-actions">
+        <button id="btn-workbench-home" class="topbar-link active" type="button">专题首页</button>
+        <button id="btn-classic-workspace" class="topbar-link" type="button">经典事件视图</button>
+        <div class="system-state">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="system-state-text">正在连接</span>
+        </div>
       </div>
     </header>
 
+    <main id="investigation-app" class="investigation-app">
+      <section id="investigation-home" class="investigation-home" aria-labelledby="investigation-home-title">
+        <div class="investigation-hero">
+          <div class="investigation-hero-copy">
+            <span class="eyebrow">INVESTIGATION WORKBENCH</span>
+            <h1 id="investigation-home-title">从问题出发，推进你的专题调查</h1>
+            <p>把发现、采集、审核和证据组织在同一个专题里。AI 只生成候选，正式档案仍由你确认。</p>
+          </div>
+          <div class="investigation-hero-actions">
+            <button id="btn-create-investigation" class="btn btn-primary" type="button">＋ 创建专题</button>
+            <button id="btn-home-search" class="btn btn-ghost" type="button">⌕ 发现公开资料</button>
+            <button id="btn-home-import" class="btn btn-ghost" type="button">＋ 导入资料</button>
+          </div>
+        </div>
+        <div id="investigation-sync-note" class="investigation-sync-note" aria-live="polite">
+          正在读取专题服务…
+        </div>
+        <div class="investigation-home-grid">
+          <section class="investigation-section" aria-labelledby="my-investigations-title">
+            <div class="investigation-section-head">
+              <div>
+                <span class="panel-kicker">MY INVESTIGATIONS</span>
+                <h2 id="my-investigations-title">我的专题</h2>
+              </div>
+              <span id="investigation-count" class="count-badge">0</span>
+            </div>
+            <div id="investigation-list" class="investigation-list" aria-live="polite"></div>
+          </section>
+          <aside class="investigation-section assignment-section" aria-labelledby="my-assignments-title">
+            <div class="investigation-section-head">
+              <div>
+                <span class="panel-kicker">MY QUEUE</span>
+                <h2 id="my-assignments-title">待我处理</h2>
+              </div>
+              <span id="assignment-count" class="count-badge warning">0</span>
+            </div>
+            <div id="assignment-list" class="assignment-list" aria-live="polite"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="investigation-detail-page" class="investigation-detail-page" aria-labelledby="investigation-page-title" hidden>
+        <div class="investigation-page-nav">
+          <button id="btn-investigation-back" class="text-btn investigation-back" type="button">← 返回我的专题</button>
+          <span id="investigation-page-sync" class="investigation-sync-chip">读取中</span>
+        </div>
+        <header id="investigation-page-header" class="investigation-page-header"></header>
+        <nav id="investigation-tabs" class="investigation-tabs" role="tablist" aria-label="专题工作区">
+          <button type="button" role="tab" data-investigation-tab="today">今日待办</button>
+          <button type="button" role="tab" data-investigation-tab="discovery">发现资料</button>
+          <button type="button" role="tab" data-investigation-tab="monitoring">监测来源</button>
+          <button type="button" role="tab" data-investigation-tab="review">待我审核</button>
+          <button type="button" role="tab" data-investigation-tab="events">事件脉络</button>
+          <button type="button" role="tab" data-investigation-tab="claims">主张与证据</button>
+          <button type="button" role="tab" data-investigation-tab="reports">专题报告</button>
+          <button type="button" role="tab" data-investigation-tab="activity">操作记录</button>
+        </nav>
+        <div id="investigation-panel" class="investigation-panel" role="tabpanel" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <section id="classic-workspace-shell" class="classic-workspace-shell" hidden>
     <section class="command-bar" aria-labelledby="topic-title">
       <div class="topic-copy">
         <span class="eyebrow">ACTIVE INTELLIGENCE TOPIC</span>
@@ -59,7 +125,7 @@
       </div>
     </section>
 
-    <main class="workspace">
+    <div class="workspace" role="main" aria-label="经典事件工作区">
       <section class="panel map-panel" aria-labelledby="map-title">
         <div class="panel-header">
           <div>
@@ -165,7 +231,8 @@
         </div>
         <div id="gaps" class="gap-list"></div>
       </section>
-    </main>
+    </div>
+    </section>
   </div>
 
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
@@ -222,6 +289,18 @@
         </label>
       </div>
       <div id="search-provider-summary" class="search-provider-summary"></div>
+      <fieldset class="destination-picker">
+        <legend>加入专题</legend>
+        <label class="form-field">
+          <span>目标专题</span>
+          <select id="search-destination"></select>
+        </label>
+        <label id="search-new-investigation-field" class="form-field" hidden>
+          <span>新专题名称</span>
+          <input id="search-new-investigation" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪">
+        </label>
+        <p id="search-destination-note">选中结果后才会抓取原始页面；不会把搜索摘要当作证据。</p>
+      </fieldset>
       <div class="form-notice">
         本入口连接现成外部检索后端，只返回候选线索。搜索标题、摘要、排名和检索渠道都不是 Evidence，也不是正式 Source；只有选中后成功抓取的原始页面快照才会进入既有候选与人工确认流程。
       </div>
@@ -231,7 +310,7 @@
         <span id="search-selection-count">未选择结果</span>
         <div>
           <button id="search-submit" class="btn btn-primary" type="submit">检索</button>
-          <button id="search-select" class="btn btn-ghost" type="button" disabled>选中项加入采集箱</button>
+          <button id="search-select" class="btn btn-ghost" type="button" disabled>加入专题并开始处理</button>
         </div>
       </div>
     </form>
@@ -287,6 +366,18 @@
         <span>已知发布时间（ISO-8601，可选）</span>
         <input id="import-published" type="datetime-local" placeholder="未知则留空">
       </label>
+      <fieldset class="destination-picker">
+        <legend>导入后进入</legend>
+        <label class="form-field">
+          <span>目标专题</span>
+          <select id="import-destination"></select>
+        </label>
+        <label id="import-new-investigation-field" class="form-field" hidden>
+          <span>新专题名称</span>
+          <input id="import-new-investigation" type="text" minlength="2" maxlength="160" placeholder="例如：港口中断调查">
+        </label>
+        <p id="import-destination-note">如果专题关联服务暂不可用，材料仍会进入真实采集箱，并明确标记为待归类。</p>
+      </fieldset>
       <div class="form-notice">
         所有新材料先进入持久化待处理采集箱。系统保存原始/提取快照与指纹；AI 仅生成候选，正式事件、主张和报告只会在人工确认后改变。
       </div>
@@ -382,6 +473,38 @@
       </section>
       <section id="intake-detail" class="intake-detail" aria-live="polite"></section>
     </div>
+  </dialog>
+
+  <dialog id="investigation-create-modal" class="modal investigation-create-modal" aria-labelledby="investigation-create-title">
+    <form id="investigation-create-form" method="dialog">
+      <div class="modal-header">
+        <div>
+          <span class="panel-kicker">NEW INVESTIGATION</span>
+          <h2 id="investigation-create-title">创建专题</h2>
+        </div>
+        <button id="investigation-create-close" class="icon-btn" type="button" aria-label="关闭创建专题窗口">×</button>
+      </div>
+      <label class="form-field">
+        <span>专题名称</span>
+        <input id="investigation-create-name" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪" required>
+      </label>
+      <label class="form-field">
+        <span>核心调查问题</span>
+        <textarea id="investigation-create-question" rows="4" minlength="4" maxlength="800" placeholder="我们需要回答什么问题？" required></textarea>
+      </label>
+      <label class="form-field">
+        <span>范围说明（可选）</span>
+        <textarea id="investigation-create-description" rows="3" maxlength="1200" placeholder="对象、时间范围、地区或明确不包含的内容"></textarea>
+      </label>
+      <div class="form-notice">
+        创建专题不会生成事件或证据。后续资料仍需真实抓取、候选生成和人工确认。
+      </div>
+      <div id="investigation-create-result" class="import-result" aria-live="polite"></div>
+      <div class="modal-actions">
+        <button id="investigation-create-cancel" class="btn btn-ghost" type="button">取消</button>
+        <button id="investigation-create-submit" class="btn btn-primary" type="submit">创建并进入专题</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast-stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>

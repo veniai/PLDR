@@ -388,3 +388,160 @@ class SearchSelectionEvent(Base):
     trace_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     selection: Mapped[SearchSelection] = relationship(back_populates="events")
+
+
+class Investigation(Base):
+    """A durable analyst topic that groups work without changing formal evidence."""
+
+    __tablename__ = "investigations"
+
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    question: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class InvestigationLink(Base):
+    """Many-to-many topic membership for durable PLDR object identifiers."""
+
+    __tablename__ = "investigation_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "investigation_id",
+            "object_type",
+            "object_id",
+            name="uq_investigation_object_link",
+        ),
+        Index("ix_investigation_link_object", "object_type", "object_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        ForeignKey("investigations.id"), index=True
+    )
+    object_type: Mapped[str] = mapped_column(String(40), index=True)
+    object_id: Mapped[str] = mapped_column(String(128), index=True)
+    role: Mapped[str] = mapped_column(String(40), default="member")
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ProcessingBatch(Base):
+    """One quick-return selection request whose entries are independent tasks."""
+
+    __tablename__ = "investigation_processing_batches"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), unique=True, index=True)
+    investigation_id: Mapped[str] = mapped_column(
+        ForeignKey("investigations.id"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    requested_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ReviewTask(Base):
+    """One leased fetch/generation unit; failures never abort sibling entries."""
+
+    __tablename__ = "investigation_review_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "investigation_id",
+            "intake_item_id",
+            name="uq_investigation_review_task_intake",
+        ),
+        Index("uq_investigation_task_active_key", "active_key", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        ForeignKey("investigations.id"), index=True
+    )
+    batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_processing_batches.id"), index=True
+    )
+    task_type: Mapped[str] = mapped_column(String(40), default="search_result_intake", index=True)
+    subject_type: Mapped[str] = mapped_column(String(40), default="search_result", index=True)
+    subject_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Non-NULL only while the task is actionable. SQLite permits multiple NULLs,
+    # giving us one active task per investigation/result without losing history.
+    active_key: Mapped[str | None] = mapped_column(String(240))
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1)
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(160), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_recoveries: Mapped[int] = mapped_column(Integer, default=0)
+    error_class: Mapped[str | None] = mapped_column(String(80), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    intake_item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("intake_items.id"), index=True
+    )
+    selection_id: Mapped[str | None] = mapped_column(
+        ForeignKey("external_search_selections.id"), index=True
+    )
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProcessingBatchEntry(Base):
+    """Stable membership of requested results in a batch, including deduplicated tasks."""
+
+    __tablename__ = "investigation_processing_batch_entries"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "result_id", name="uq_processing_batch_result"),
+    )
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_processing_batches.id"), index=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("investigation_review_tasks.id"), index=True
+    )
+    result_id: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class DecisionLog(Base):
+    """Append-only analyst/system action trail scoped to an investigation."""
+
+    __tablename__ = "investigation_decision_logs"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        ForeignKey("investigations.id"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    actor: Mapped[str] = mapped_column(String(160), default="system")
+    object_type: Mapped[str | None] = mapped_column(String(40), index=True)
+    object_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("investigation_review_tasks.id"), index=True
+    )
+    detail_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+# Stable vocabulary aliases for integrations that call these processing tasks or
+# action logs rather than using the UI-facing class names.
+ProcessingTask = ReviewTask
+InvestigationTask = ReviewTask
+DecisionActionLog = DecisionLog
+InvestigationActivity = DecisionLog
