@@ -27,6 +27,7 @@ from pldr_api.collection import (
     execute_claimed_run,
     claim_next_run,
     enqueue_target_run,
+    parse_rss_feed,
     run_once,
     utcnow,
 )
@@ -42,6 +43,7 @@ from pldr_api.intake import submit_web_intake
 from pldr_api.main import app, ensure_compatible_schema
 from pldr_api.models import (
     Claim,
+    CollectionDiscoveredItem,
     CollectionRun,
     CollectionTarget,
     Document,
@@ -94,6 +96,24 @@ class P1CollectionTest(unittest.TestCase):
         )
 
     @staticmethod
+    def rss_fetched(
+        first_description: str = "The first controlled feed item contains enough durable summary text for review.",
+        second_description: str = "The second controlled feed item contains its own independent summary and source link.",
+    ) -> FetchedPublicText:
+        xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>Controlled dispatch feed</title>
+<item><guid>item-one</guid><link>https://updates.example.org/news/one</link><title>First item</title><description>{first_description}</description></item>
+<item><guid>item-two</guid><link>https://updates.example.org/news/two</link><title>Second item</title><description>{second_description}</description></item>
+</channel></rss>'''
+        return FetchedPublicText(
+            resolved_url="https://updates.example.org/feed.xml",
+            text=xml,
+            status_code=200,
+            media_type="application/rss+xml",
+            size_bytes=len(xml.encode("utf-8")),
+        )
+
+    @staticmethod
     def formal_counts() -> dict[str, int]:
         models = [Source, Document, Snapshot, Event, Entity, Claim, Evidence]
         with SessionLocal() as session:
@@ -113,6 +133,25 @@ class P1CollectionTest(unittest.TestCase):
                 json={
                     "name": "Controlled status page",
                     "url": "https://updates.example.org/status",
+                    "language": "en",
+                    "interval_seconds": 300,
+                    "run_immediately": run_immediately,
+                },
+            )
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    def create_rss_target(self, *, run_immediately: bool = True) -> dict:
+        with patch(
+            "pldr_api.collection_routes.validate_public_http_url",
+            side_effect=lambda url: url,
+        ):
+            response = self.client.post(
+                "/pldr-api/v1/collection/targets",
+                json={
+                    "name": "Controlled dispatch feed",
+                    "target_type": "rss_feed",
+                    "url": "https://updates.example.org/feed.xml",
                     "language": "en",
                     "interval_seconds": 300,
                     "run_immediately": run_immediately,
@@ -210,6 +249,188 @@ class P1CollectionTest(unittest.TestCase):
         summary = self.client.get("/pldr-api/v1/collection/summary")
         self.assertEqual(summary.status_code, 200, summary.text)
         self.assertEqual(summary.json()["pending_review"], 2)
+
+    def test_rss_feed_discovers_deduplicates_and_keeps_review_boundary(self):
+        before = self.formal_counts()
+        created = self.create_rss_target(run_immediately=True)
+        target_id = created["target"]["id"]
+
+        first = self.run_with(self.rss_fetched())
+        self.assertEqual((first.status, first.outcome, first.version_number), ("succeeded", "items", None))
+        self.assertIsNone(first.current_intake_item_id)
+        self.assertEqual(
+            (first.discovered_count, first.new_item_count, first.duplicate_item_count, first.invalid_item_count),
+            (2, 2, 0, 0),
+        )
+
+        with SessionLocal() as session:
+            items = list(
+                session.scalars(
+                    select(IntakeItem).where(IntakeItem.input_type == "rss_collection").order_by(IntakeItem.canonical_url)
+                )
+            )
+            self.assertEqual([item.canonical_url for item in items], [
+                "https://updates.example.org/news/one",
+                "https://updates.example.org/news/two",
+            ])
+            self.assertTrue(all(item.status == "candidate_ready" for item in items))
+            self.assertTrue(all(
+                item.review["rss_collection"]["run_id"] == first.id for item in items
+            ))
+            states = list(session.scalars(select(CollectionDiscoveredItem)))
+            self.assertEqual({state.status for state in states}, {"ready"})
+            self.assertEqual({state.intake_item_id for state in states}, {item.id for item in items})
+
+        detail = self.client.get(f"/pldr-api/v1/collection/targets/{target_id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        payload = detail.json()
+        self.assertEqual(payload["target_type"], "rss_feed")
+        self.assertEqual(payload["version_count"], 0)
+        self.assertEqual(payload["discovered_item_count"], 2)
+        self.assertEqual(len(payload["discovered_items"]), 2)
+        items_page = self.client.get(f"/pldr-api/v1/collection/targets/{target_id}/items?offset=1&limit=1")
+        self.assertEqual(items_page.status_code, 200, items_page.text)
+        self.assertEqual(items_page.json()["count"], 2)
+        self.assertEqual(len(items_page.json()["items"]), 1)
+
+        queued = self.client.post(f"/pldr-api/v1/collection/targets/{target_id}/run")
+        self.assertEqual(queued.status_code, 200, queued.text)
+        second = self.run_with(self.rss_fetched())
+        self.assertEqual((second.status, second.outcome), ("succeeded", "items"))
+        self.assertEqual(
+            (second.discovered_count, second.new_item_count, second.duplicate_item_count, second.invalid_item_count),
+            (2, 0, 2, 0),
+        )
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                2,
+            )
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(CollectionDiscoveredItem)),
+                2,
+            )
+        summary = self.client.get("/pldr-api/v1/collection/summary")
+        self.assertEqual(summary.status_code, 200, summary.text)
+        self.assertEqual(summary.json()["pending_review"], 2)
+        self.assertEqual(summary.json()["discoveries"], 2)
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_rss_rejects_unsafe_items_and_malformed_feed_fail_closed(self):
+        created = self.create_rss_target(run_immediately=True)
+        target_id = created["target"]["id"]
+        xml = '''<?xml version="1.0"?>
+        <rss version="2.0"><channel><title>Unsafe mixed feed</title>
+        <item><guid>safe</guid><link>https://updates.example.org/news/safe</link><title>Safe item</title><description>A public feed item with enough controlled summary text for review.</description></item>
+        <item><guid>private</guid><link>http://127.0.0.1/status</link><title>Private item</title><description>This private link must fail closed and must not create an intake.</description></item>
+        </channel></rss>'''
+        mixed = FetchedPublicText(
+            resolved_url="https://updates.example.org/feed.xml",
+            text=xml,
+            status_code=200,
+            media_type="application/rss+xml",
+            size_bytes=len(xml.encode("utf-8")),
+        )
+        first = self.run_with(mixed)
+        self.assertEqual((first.status, first.outcome), ("succeeded", "items"))
+        self.assertEqual(
+            (first.discovered_count, first.new_item_count, first.duplicate_item_count, first.invalid_item_count),
+            (1, 1, 0, 1),
+        )
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                1,
+            )
+            item = session.scalar(select(IntakeItem))
+            assert item is not None
+            self.assertEqual(item.canonical_url, "https://updates.example.org/news/safe")
+
+        queued = self.client.post(f"/pldr-api/v1/collection/targets/{target_id}/run")
+        self.assertEqual(queued.status_code, 200, queued.text)
+        malformed = FetchedPublicText(
+            resolved_url="https://updates.example.org/feed.xml",
+            text="<rss><channel><title>broken",
+            status_code=200,
+            media_type="application/rss+xml",
+            size_bytes=30,
+        )
+        failed = self.run_with(malformed)
+        self.assertEqual((failed.status, failed.error_class), ("failed", "rss_parse"))
+        self.assertIn("malformed", failed.error_message)
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                1,
+            )
+
+    def test_rss_lease_replay_adopts_item_committed_before_state_link(self):
+        created = self.create_rss_target(run_immediately=True)
+        run_id = created["queued_run"]["id"]
+        fetched = self.rss_fetched()
+        parsed = parse_rss_feed(fetched)
+        first = parsed.items[0]
+
+        with SessionLocal() as session:
+            claimed = claim_next_run(
+                session, worker_id="crashing-rss-worker", lease_seconds=30, now=utcnow()
+            )
+            assert claimed is not None
+            self.assertEqual(claimed.id, run_id)
+            state = CollectionDiscoveredItem(
+                id="col_item_committed_before_link",
+                target_id=created["target"]["id"],
+                item_key=first.item_key,
+                source_url=first.url,
+                title=first.title,
+                status="pending",
+                first_seen_run_id=run_id,
+                last_seen_run_id=run_id,
+            )
+            session.add(state)
+            session.commit()
+            orphan = asyncio.run(
+                submit_web_intake(
+                    session,
+                    first.url,
+                    "Controlled dispatch feed",
+                    first.title,
+                    first.html,
+                    "en",
+                    input_type="rss_collection",
+                    review_extra={
+                        "rss_collection": {
+                            "target_id": created["target"]["id"],
+                            "run_id": run_id,
+                            "item_key": first.item_key,
+                            "feed_url": created["target"]["url"],
+                            "source_url": first.url,
+                        }
+                    },
+                )
+            )
+            orphan_id = orphan.id
+            crashed = session.get(CollectionRun, run_id)
+            assert crashed is not None
+            crashed.lease_expires_at = utcnow() - timedelta(seconds=1)
+            session.commit()
+
+        replayed = self.run_with(fetched)
+        self.assertEqual((replayed.id, replayed.status, replayed.outcome), (run_id, "succeeded", "items"))
+        self.assertEqual((replayed.new_item_count, replayed.duplicate_item_count), (2, 0))
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                2,
+            )
+            adopted = session.get(IntakeItem, orphan_id)
+            assert adopted is not None
+            self.assertEqual(adopted.review["rss_collection"]["run_id"], run_id)
+            linked_state = session.get(
+                CollectionDiscoveredItem, "col_item_committed_before_link"
+            )
+            assert linked_state is not None
+            self.assertEqual((linked_state.status, linked_state.intake_item_id), ("ready", orphan_id))
 
     def test_archived_intake_keeps_collection_version_chain_and_diff(self):
         created = self.create_target(run_immediately=True)
@@ -795,6 +1016,46 @@ class P1CollectionTest(unittest.TestCase):
 
         ensure_compatible_schema()
 
+    def test_additive_migration_preserves_existing_collection_targets(self):
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE collection_targets"))
+            connection.execute(
+                text(
+                    "CREATE TABLE collection_targets ("
+                    "id VARCHAR(80) PRIMARY KEY, name VARCHAR(200) NOT NULL, "
+                    "url VARCHAR(900) NOT NULL, language VARCHAR(20), "
+                    "interval_seconds INTEGER, enabled BOOLEAN, next_run_at DATETIME, "
+                    "health VARCHAR(30), consecutive_failures INTEGER, "
+                    "last_run_at DATETIME, last_success_at DATETIME, last_error TEXT, "
+                    "created_at DATETIME, updated_at DATETIME)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO collection_targets "
+                    "(id, name, url, language, interval_seconds, enabled, health) "
+                    "VALUES ('legacy-target', 'Legacy page', "
+                    "'https://example.org/status', 'en', 3600, 1, 'healthy')"
+                )
+            )
+
+        ensure_compatible_schema()
+        columns = {
+            column["name"]
+            for column in inspect(engine).get_columns("collection_targets")
+        }
+        self.assertIn("target_type", columns)
+        with engine.begin() as connection:
+            self.assertEqual(
+                connection.execute(
+                    text(
+                        "SELECT target_type FROM collection_targets "
+                        "WHERE id='legacy-target'"
+                    )
+                ).scalar(),
+                "web_page",
+            )
+
     def test_fetch_rejects_non_text_and_oversized_responses(self):
         class BufferedResponse:
             status_code = 200
@@ -1170,14 +1431,20 @@ class P1CollectionTest(unittest.TestCase):
         for marker in [
             'id="btn-collection"',
             'id="collection-modal"',
+            'id="collection-target-type"',
             "P1 SLICE",
             "监测配置和运行记录不是正式 Source/Evidence",
+            "RSS 条目保存来源提供的标题和摘要快照，不冒充已抓取原文",
         ]:
             self.assertIn(marker, dashboard.text)
         script = self.client.get("/assets/app.js").text
         for marker in [
             "/pldr-api/v1/collection/targets",
             "/pldr-api/v1/collection/runs/",
+            "/pldr-api/v1/collection/targets/",
+            "target_type",
+            "discovered_items",
+            "RSS 监测条目",
             'data-collection-action="more-runs"',
             'data-collection-action="more-versions"',
             "collectionDiffRequestSerial",

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import html as html_lib
 import re
 import socket
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urljoin
+from xml.etree import ElementTree
 
 import httpx
 from sqlalchemy import case, func, select, update
@@ -15,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal
-from .extraction import canonicalize_url, content_hash, extract_page
+from .extraction import canonicalize_url, content_hash, extract_page, normalize_text
 from .importers import (
     FetchedPublicText,
     ResponseTooLargeError,
@@ -24,12 +28,19 @@ from .importers import (
     fetch_public_text_response,
 )
 from .intake import generate_candidates, lock_intake_for_mutation, submit_web_intake
-from .models import CollectionRun, CollectionTarget, IntakeItem
-from .security import UnsafeUrlError
+from .models import (
+    CollectionDiscoveredItem,
+    CollectionRun,
+    CollectionTarget,
+    IntakeItem,
+)
+from .security import UnsafeUrlError, validate_public_http_url
 
 
 RUN_STATUSES = {"queued", "running", "succeeded", "failed"}
 VERSION_OUTCOMES = {"baseline", "changed"}
+RSS_OUTCOME = "items"
+MAX_RSS_ITEMS = 50
 DEFAULT_LEASE_SECONDS = 180
 MIN_OVERDUE_GRACE_SECONDS = 60
 MAX_OVERDUE_GRACE_SECONDS = 300
@@ -62,6 +73,115 @@ def new_run_id() -> str:
 
 def worker_identity() -> str:
     return f"{socket.gethostname()}:{uuid.uuid4().hex[:10]}"
+
+
+@dataclass(frozen=True)
+class RssItem:
+    item_key: str
+    url: str
+    title: str
+    description: str
+    html: str
+    raw_hash: str
+
+
+@dataclass(frozen=True)
+class ParsedRssFeed:
+    items: list[RssItem]
+    duplicate_count: int
+    invalid_count: int
+
+
+def _rss_text(node: ElementTree.Element | None, default: str = "") -> str:
+    if node is None:
+        return default
+    return normalize_text("".join(node.itertext()))
+
+
+def _rss_find(node: ElementTree.Element, *paths: str) -> ElementTree.Element | None:
+    for path in paths:
+        found = node.find(path)
+        if found is not None:
+            return found
+    return None
+
+
+def parse_rss_feed(fetched: FetchedPublicText) -> ParsedRssFeed:
+    """Normalize bounded RSS/Atom content without treating channel metadata as evidence."""
+    try:
+        root = ElementTree.fromstring(fetched.text)
+    except ElementTree.ParseError as exc:
+        raise ValueError("RSS XML is malformed") from exc
+
+    nodes = root.findall(".//item") or root.findall(
+        ".//{http://www.w3.org/2005/Atom}entry"
+    )
+    if not nodes:
+        raise ValueError("RSS feed contains no items")
+
+    items_by_key: dict[str, RssItem] = {}
+    duplicate_count = 0
+    invalid_count = 0
+    for node in nodes[:MAX_RSS_ITEMS]:
+        title_node = _rss_find(node, "title", "{http://www.w3.org/2005/Atom}title")
+        link_node = _rss_find(node, "link", "{http://www.w3.org/2005/Atom}link")
+        description_node = _rss_find(
+            node,
+            "description",
+            "summary",
+            "{http://www.w3.org/2005/Atom}summary",
+        )
+        identity_node = _rss_find(node, "guid", "{http://www.w3.org/2005/Atom}id")
+
+        title = _rss_text(title_node, "Untitled RSS item")
+        raw_link = _rss_text(link_node) or (
+            link_node.attrib.get("href", "") if link_node is not None else ""
+        )
+        description = _rss_text(description_node, title)
+        try:
+            url = canonicalize_url(urljoin(fetched.resolved_url, raw_link))
+            validate_public_http_url(url, resolve=False)
+            if len(url) > 900 or len(normalize_text(f"{title} {description}")) < 40:
+                raise ValueError("RSS item has no durable public text identity")
+        except (ValueError, UnsafeUrlError):
+            invalid_count += 1
+            continue
+
+        safe_title = html_lib.escape(title)
+        safe_description = html_lib.escape(description)
+        synthetic_html = (
+            "<html><head><title>"
+            + safe_title
+            + "</title></head><body><article><h1>"
+            + safe_title
+            + "</h1><p>"
+            + safe_description
+            + "</p></article></body></html>"
+        )
+        raw_hash = hashlib.sha256(synthetic_html.encode("utf-8")).hexdigest()
+        identity = _rss_text(identity_node) or url
+        item_key = hashlib.sha256(
+            f"{identity}\n{content_hash(synthetic_html)}".encode("utf-8")
+        ).hexdigest()
+        if item_key in items_by_key:
+            duplicate_count += 1
+            continue
+        items_by_key[item_key] = RssItem(
+            item_key=item_key,
+            url=url,
+            title=title,
+            description=description,
+            html=synthetic_html,
+            raw_hash=raw_hash,
+        )
+
+    if not items_by_key:
+        raise ValueError("RSS feed contains no acceptable public items")
+    return ParsedRssFeed(
+        items=list(items_by_key.values()),
+        duplicate_count=duplicate_count,
+        invalid_count=invalid_count,
+    )
 
 
 def serialize_run(run: CollectionRun) -> dict[str, Any]:
@@ -97,6 +217,12 @@ def serialize_run(run: CollectionRun) -> dict[str, Any]:
         "content": {
             "raw_hash": run.raw_hash,
             "body_hash": run.body_hash,
+        },
+        "discovery": {
+            "discovered_count": run.discovered_count,
+            "new_item_count": run.new_item_count,
+            "duplicate_item_count": run.duplicate_item_count,
+            "invalid_item_count": run.invalid_item_count,
         },
         "version_number": run.version_number,
         "intake_chain": {
@@ -155,6 +281,55 @@ def _run_count(session: Session, target_id: str) -> int:
     )
 
 
+def _discovered_item_count(session: Session, target_id: str) -> int:
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(CollectionDiscoveredItem)
+            .where(CollectionDiscoveredItem.target_id == target_id)
+        )
+        or 0
+    )
+
+
+def serialize_discovered_item(item: CollectionDiscoveredItem) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "target_id": item.target_id,
+        "source_url": item.source_url,
+        "title": item.title,
+        "status": item.status,
+        "intake_item_id": item.intake_item_id,
+        "first_seen_run_id": item.first_seen_run_id,
+        "last_seen_run_id": item.last_seen_run_id,
+        "last_seen_at": iso(item.last_seen_at),
+        "error": item.error,
+        "created_at": iso(item.created_at),
+        "updated_at": iso(item.updated_at),
+    }
+
+
+def list_discovered_items(
+    session: Session,
+    target_id: str,
+    *,
+    offset: int = 0,
+    limit: int = 100,
+) -> list[CollectionDiscoveredItem]:
+    return list(
+        session.scalars(
+            select(CollectionDiscoveredItem)
+            .where(CollectionDiscoveredItem.target_id == target_id)
+            .order_by(
+                CollectionDiscoveredItem.last_seen_at.desc(),
+                CollectionDiscoveredItem.created_at.desc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
 def target_is_overdue(target: CollectionTarget, *, now: datetime | None = None) -> bool:
     if not target.enabled or target.next_run_at is None:
         return False
@@ -188,6 +363,7 @@ def serialize_target(
     payload: dict[str, Any] = {
         "id": target.id,
         "name": target.name,
+        "target_type": target.target_type,
         "url": target.url,
         "language": target.language,
         "interval_seconds": target.interval_seconds,
@@ -202,6 +378,7 @@ def serialize_target(
         "last_error": target.last_error,
         "version_count": _version_count(session, target.id),
         "run_count": _run_count(session, target.id),
+        "discovered_item_count": _discovered_item_count(session, target.id),
         "created_at": iso(target.created_at),
         "updated_at": iso(target.updated_at),
         "latest_run": serialize_run(latest) if latest else None,
@@ -240,6 +417,18 @@ def serialize_target(
         payload["versions"] = [serialize_run(run) for run in version_runs]
         payload["versions_returned"] = len(version_runs)
         payload["versions_truncated"] = payload["version_count"] > len(version_runs)
+        discovered_items = list_discovered_items(
+            session,
+            target.id,
+            limit=min(version_limit, 500),
+        )
+        payload["discovered_items"] = [
+            serialize_discovered_item(item) for item in discovered_items
+        ]
+        payload["discovered_items_returned"] = len(discovered_items)
+        payload["discovered_items_truncated"] = (
+            payload["discovered_item_count"] > len(discovered_items)
+        )
     return payload
 
 
@@ -494,6 +683,8 @@ def classify_collection_error(exc: Exception) -> str:
     if isinstance(exc, httpx.NetworkError):
         return "network"
     message = str(exc).lower()
+    if "rss" in message or "feed" in message:
+        return "rss_parse"
     if "extracted page body" in message or "page is empty" in message:
         return "extraction"
     return "internal"
@@ -552,6 +743,281 @@ def _recoverable_intake(
     return None
 
 
+def _finish_run_success(
+    session: Session,
+    run: CollectionRun,
+    target: CollectionTarget,
+    *,
+    started_clock: float,
+) -> CollectionRun:
+    finished = utcnow()
+    run.status = "succeeded"
+    run.active_key = None
+    run.completed_at = finished
+    run.duration_ms = max(0, int((time.monotonic() - started_clock) * 1000))
+    run.lease_owner = None
+    run.lease_expires_at = None
+    run.error_class = None
+    run.error_message = None
+    session.execute(
+        update(CollectionTarget)
+        .where(CollectionTarget.id == target.id)
+        .values(
+            health=case(
+                (CollectionTarget.enabled.is_(True), "healthy"),
+                else_="paused",
+            ),
+            consecutive_failures=0,
+            last_run_at=finished,
+            last_success_at=finished,
+            last_error=None,
+            next_run_at=case(
+                (
+                    CollectionTarget.enabled.is_(True)
+                    & CollectionTarget.next_run_at.is_(None),
+                    finished + timedelta(seconds=target.interval_seconds),
+                ),
+                else_=CollectionTarget.next_run_at,
+            ),
+            updated_at=finished,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+    return run
+
+
+def _finish_run_failure(
+    session: Session,
+    run_id: str,
+    exc: Exception,
+    *,
+    started_clock: float,
+) -> CollectionRun:
+    session.rollback()
+    run = session.get(CollectionRun, run_id)
+    target = session.get(CollectionTarget, run.target_id) if run else None
+    if run is None or target is None:
+        raise
+    finished = utcnow()
+    run.status = "failed"
+    run.active_key = None
+    run.outcome = None
+    run.completed_at = finished
+    run.duration_ms = max(0, int((time.monotonic() - started_clock) * 1000))
+    run.lease_owner = None
+    run.lease_expires_at = None
+    run.error_class = classify_collection_error(exc)
+    run.error_message = str(exc)[:4000]
+    failure_count = target.consecutive_failures + 1
+    failure_health = "error" if failure_count >= 3 else "degraded"
+    delay = min(target.interval_seconds, 60 * (2 ** (failure_count - 1)))
+    session.execute(
+        update(CollectionTarget)
+        .where(CollectionTarget.id == target.id)
+        .values(
+            health=case(
+                (CollectionTarget.enabled.is_(True), failure_health),
+                else_="paused",
+            ),
+            consecutive_failures=failure_count,
+            last_run_at=finished,
+            last_error=str(exc)[:4000],
+            next_run_at=case(
+                (
+                    CollectionTarget.enabled.is_(True),
+                    finished + timedelta(seconds=delay),
+                ),
+                else_=None,
+            ),
+            updated_at=finished,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+    return run
+
+
+def _discovered_state(
+    session: Session, target_id: str, item_key: str
+) -> CollectionDiscoveredItem | None:
+    return session.scalar(
+        select(CollectionDiscoveredItem).where(
+            CollectionDiscoveredItem.target_id == target_id,
+            CollectionDiscoveredItem.item_key == item_key,
+        )
+    )
+
+
+def _recover_discovered_intake(
+    session: Session,
+    run: CollectionRun,
+    target: CollectionTarget,
+    state: CollectionDiscoveredItem,
+    item: RssItem | None,
+) -> IntakeItem | None:
+    """Adopt material committed in the crash window before its state link."""
+    candidates = list(
+        session.scalars(
+            select(IntakeItem)
+            .where(
+                IntakeItem.input_type == "rss_collection",
+                IntakeItem.source_description == target.name,
+            )
+            .order_by(IntakeItem.created_at.desc())
+            .limit(200)
+        )
+    )
+    queued_at = _as_aware(run.queued_at)
+    for candidate in candidates:
+        trace = (candidate.review or {}).get("rss_collection") or {}
+        if (
+            trace.get("target_id") == target.id
+            and trace.get("run_id") == run.id
+            and trace.get("item_key") == state.item_key
+        ):
+            return candidate
+        if item is None or _as_aware(candidate.created_at) < queued_at:
+            continue
+        if candidate.canonical_url == item.url and candidate.raw_hash == item.raw_hash:
+            return candidate
+    return None
+
+
+async def _execute_claimed_rss_run(
+    session: Session,
+    run: CollectionRun,
+    target: CollectionTarget,
+    *,
+    started_clock: float,
+) -> CollectionRun:
+    try:
+        fetched = await fetch_public_text_response(target.url)
+        parsed = parse_rss_feed(fetched)
+        feed_hash = content_hash(
+            "\n".join(f"{item.item_key}:{item.raw_hash}" for item in parsed.items)
+        )
+        run.resolved_url = canonicalize_url(fetched.resolved_url)
+        run.http_status = fetched.status_code
+        run.media_type = fetched.media_type
+        run.size_bytes = fetched.size_bytes
+        run.raw_hash = hashlib.sha256(fetched.text.encode("utf-8")).hexdigest()
+        run.body_hash = feed_hash
+        session.commit()
+
+        current_states: dict[str, CollectionDiscoveredItem] = {}
+        new_count = 0
+        duplicate_count = 0
+        for item in parsed.items:
+            state = _discovered_state(session, target.id, item.item_key)
+            seen_at = utcnow()
+            if state is None:
+                state = CollectionDiscoveredItem(
+                    id=f"col_item_{uuid.uuid4().hex[:18]}",
+                    target_id=target.id,
+                    item_key=item.item_key,
+                    source_url=item.url,
+                    title=item.title,
+                    status="pending",
+                    first_seen_run_id=run.id,
+                    last_seen_run_id=run.id,
+                    last_seen_at=seen_at,
+                )
+                session.add(state)
+                session.flush()
+            else:
+                state.last_seen_run_id = run.id
+                state.last_seen_at = seen_at
+                state.updated_at = seen_at
+            current_states[state.item_key] = state
+
+            intake = (
+                session.get(IntakeItem, state.intake_item_id)
+                if state.intake_item_id
+                else None
+            )
+            if intake is None:
+                intake = _recover_discovered_intake(session, run, target, state, item)
+            if intake is None and state.status == "pending":
+                intake = await submit_web_intake(
+                    session,
+                    item.url,
+                    target.name,
+                    item.title,
+                    item.html,
+                    target.language,
+                    input_type="rss_collection",
+                    review_extra={
+                        "rss_collection": {
+                            "target_id": target.id,
+                            "run_id": run.id,
+                            "item_key": item.item_key,
+                            "feed_url": target.url,
+                            "source_url": item.url,
+                        }
+                    },
+                )
+
+            if intake is None:
+                state.status = "failed"
+                state.error = "Feed item disappeared before a durable material was committed"
+            else:
+                state.intake_item_id = intake.id
+                state.status = "failed" if intake.status == "failed" else "ready"
+                state.error = intake.error if intake.status == "failed" else None
+                if intake.status != "failed":
+                    from .investigations import attach_collection_intake_to_investigations
+
+                    attach_collection_intake_to_investigations(
+                        session,
+                        target_id=target.id,
+                        item=intake,
+                        run_id=run.id,
+                        outcome="discovered",
+                    )
+
+            if state.first_seen_run_id == run.id:
+                new_count += 1
+            else:
+                duplicate_count += 1
+            session.commit()
+
+        missing_count = 0
+        stale_states = list(
+            session.scalars(
+                select(CollectionDiscoveredItem).where(
+                    CollectionDiscoveredItem.target_id == target.id,
+                    CollectionDiscoveredItem.status == "pending",
+                )
+            )
+        )
+        for state in stale_states:
+            if state.item_key in current_states:
+                continue
+            recovered = _recover_discovered_intake(session, run, target, state, None)
+            if recovered is None:
+                state.status = "failed"
+                state.error = "Feed item disappeared before a durable material was committed"
+                state.updated_at = utcnow()
+                missing_count += 1
+            else:
+                state.intake_item_id = recovered.id
+                state.status = "failed" if recovered.status == "failed" else "ready"
+                state.error = recovered.error if recovered.status == "failed" else None
+                state.updated_at = utcnow()
+        if stale_states:
+            session.commit()
+
+        run.discovered_count = len(parsed.items) + parsed.duplicate_count
+        run.new_item_count = new_count
+        run.duplicate_item_count = duplicate_count + parsed.duplicate_count
+        run.invalid_item_count = parsed.invalid_count + missing_count
+        run.outcome = RSS_OUTCOME
+        return _finish_run_success(session, run, target, started_clock=started_clock)
+    except Exception as exc:
+        return _finish_run_failure(session, run.id, exc, started_clock=started_clock)
+
+
 async def execute_claimed_run(run_id: str) -> CollectionRun:
     """Fetch one claimed target and atomically finish its durable run record."""
     started_clock = time.monotonic()
@@ -564,6 +1030,10 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
         target = session.get(CollectionTarget, run.target_id)
         if target is None:
             raise ValueError("Collection target not found")
+        if target.target_type == "rss_feed":
+            return await _execute_claimed_rss_run(
+                session, run, target, started_clock=started_clock
+            )
         try:
             recovered_item = _recoverable_intake(
                 session,
@@ -732,92 +1202,14 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                     outcome=outcome,
                 )
 
-            finished = utcnow()
-            run.status = "succeeded"
-            run.active_key = None
-            run.completed_at = finished
-            run.duration_ms = max(0, int((time.monotonic() - started_clock) * 1000))
-            run.lease_owner = None
-            run.lease_expires_at = None
-            run.error_class = None
-            run.error_message = None
-            # Evaluate enabled/paused at the final SQL write, not from the ORM object
-            # loaded before a long fetch. This keeps a concurrent pause/resume from
-            # leaving enabled=true with recorded health=paused (or the reverse).
-            session.execute(
-                update(CollectionTarget)
-                .where(CollectionTarget.id == target.id)
-                .values(
-                    health=case(
-                        (CollectionTarget.enabled.is_(True), "healthy"),
-                        else_="paused",
-                    ),
-                    consecutive_failures=0,
-                    last_run_at=finished,
-                    last_success_at=finished,
-                    last_error=None,
-                    next_run_at=case(
-                        (
-                            CollectionTarget.enabled.is_(True)
-                            & CollectionTarget.next_run_at.is_(None),
-                            finished + timedelta(seconds=target.interval_seconds),
-                        ),
-                        else_=CollectionTarget.next_run_at,
-                    ),
-                    updated_at=finished,
-                )
-                .execution_options(synchronize_session=False)
-            )
-            session.commit()
-            return run
+            return _finish_run_success(session, run, target, started_clock=started_clock)
         except Exception as exc:
-            session.rollback()
-            run = session.get(CollectionRun, run_id)
-            target = session.get(CollectionTarget, run.target_id) if run else None
-            if run is None or target is None:
-                raise
-            # submit_web_intake commits a user-visible material record before
-            # this worker continues with provenance/linking. From that boundary
-            # onward the Intake may already carry analyst decisions or formal
-            # references, so a later Collection tail failure must never treat it
-            # as a disposable orphan. Preserve it and fail only this run.
-            finished = utcnow()
-            run.status = "failed"
-            run.active_key = None
-            run.outcome = None
-            run.completed_at = finished
-            run.duration_ms = max(0, int((time.monotonic() - started_clock) * 1000))
-            run.lease_owner = None
-            run.lease_expires_at = None
-            run.error_class = classify_collection_error(exc)
-            run.error_message = str(exc)[:4000]
-            failure_count = target.consecutive_failures + 1
-            failure_health = "error" if failure_count >= 3 else "degraded"
-            delay = min(target.interval_seconds, 60 * (2 ** (failure_count - 1)))
-            session.execute(
-                update(CollectionTarget)
-                .where(CollectionTarget.id == target.id)
-                .values(
-                    health=case(
-                        (CollectionTarget.enabled.is_(True), failure_health),
-                        else_="paused",
-                    ),
-                    consecutive_failures=failure_count,
-                    last_run_at=finished,
-                    last_error=str(exc)[:4000],
-                    next_run_at=case(
-                        (
-                            CollectionTarget.enabled.is_(True),
-                            finished + timedelta(seconds=delay),
-                        ),
-                        else_=None,
-                    ),
-                    updated_at=finished,
-                )
-                .execution_options(synchronize_session=False)
+            return _finish_run_failure(
+                session,
+                run_id,
+                exc,
+                started_clock=started_clock,
             )
-            session.commit()
-            return run
 
 
 async def run_once(
@@ -839,6 +1231,15 @@ def collection_summary(session: Session, *, now: datetime | None = None) -> dict
         for run in runs
         if run.current_intake_item_id and run.outcome in VERSION_OUTCOMES
     }
+    current_intake_ids.update(
+        intake_id
+        for intake_id in session.scalars(
+            select(CollectionDiscoveredItem.intake_item_id).where(
+                CollectionDiscoveredItem.intake_item_id.is_not(None)
+            )
+        )
+        if intake_id
+    )
     pending_review = 0
     if current_intake_ids:
         pending_review = int(
@@ -890,6 +1291,9 @@ def collection_summary(session: Session, *, now: datetime | None = None) -> dict
             for status in sorted(RUN_STATUSES)
         },
         "changes": sum(1 for run in runs if run.outcome == "changed"),
+        "discoveries": sum(
+            run.new_item_count for run in runs if run.outcome == RSS_OUTCOME
+        ),
         "pending_review": pending_review,
     }
 

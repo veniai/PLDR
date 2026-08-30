@@ -461,24 +461,31 @@
     <div class="modal-header">
       <div>
         <span class="panel-kicker">P1 RELIABLE COLLECTION</span>
-        <h2 id="collection-modal-title">固定网页来源监测</h2>
+        <h2 id="collection-modal-title">可靠来源监测</h2>
       </div>
       <button id="collection-close" class="icon-btn" type="button" aria-label="关闭来源监测">×</button>
     </div>
     <div class="collection-shell">
       <section class="collection-command" aria-labelledby="collection-add-title">
         <div class="collection-command-copy">
-          <h3 id="collection-add-title">添加固定公共网页</h3>
-          <p>按周期抓取同一网页。首次内容和正文变化进入待审箱；无变化只保留运行记录。</p>
+          <h3 id="collection-add-title">添加可靠公共来源</h3>
+          <p>固定网页按版本监测；RSS 按条目发现。新材料都进入待审箱，重复项只保留运行记录。</p>
         </div>
         <form id="collection-source-form" class="collection-source-form">
           <label class="form-field">
             <span>来源名称</span>
             <input id="collection-name" type="text" minlength="2" maxlength="160" placeholder="例如：港口公告" required>
           </label>
+          <label class="form-field">
+            <span>来源类型</span>
+            <select id="collection-target-type">
+              <option value="web_page" selected>固定网页</option>
+              <option value="rss_feed">RSS / Atom</option>
+            </select>
+          </label>
           <label class="form-field collection-url-field">
-            <span>固定公共网页 URL</span>
-            <input id="collection-url" type="url" placeholder="https://example.org/status" required>
+            <span>公共来源 URL</span>
+            <input id="collection-url" type="url" placeholder="https://example.org/status 或 /feed.xml" required>
           </label>
           <label class="form-field">
             <span>检查周期</span>
@@ -505,7 +512,7 @@
           <button id="collection-add" class="btn btn-primary" type="submit">添加来源</button>
         </form>
         <div class="form-notice collection-notice">
-          当前首切片只支持无需登录、且 URL 不含凭据的公共 HTTP(S) 网页。监测配置和运行记录不是正式 Source/Evidence；抓取成功不等于 AI 成功，只有人工确认才进入正式事件档案。
+          当前支持无需登录、且 URL 不含凭据的公共 HTTP(S) 固定网页与 RSS/Atom。RSS 条目保存来源提供的标题和摘要快照，不冒充已抓取原文；监测配置和运行记录不是正式 Source/Evidence，只有人工确认才进入正式事件档案。
         </div>
       </section>
       <div id="collection-summary" class="collection-summary" aria-live="polite"></div>

@@ -537,6 +537,7 @@ async def submit_web_intake(
     html: str | None,
     language: str,
     input_type: str = "web",
+    review_extra: dict[str, Any] | None = None,
 ) -> IntakeItem:
     requested_url = str(url)
     common = {
@@ -559,6 +560,11 @@ async def submit_web_intake(
         if len(page.body) < 40:
             raise ValueError("Extracted page body is too short")
         known_title = (title or page.title or "").strip() or None
+        review: dict[str, Any] = {
+            "material": {"resolved_url": resolved_url, "fetched_at": iso(fetched_at)}
+        }
+        if review_extra:
+            review.update(review_extra)
         item = _base_item(
             input_type,
             source_description=(source_name or canonical_url.split("//", 1)[-1].split("/", 1)[0]).strip(),
@@ -570,7 +576,7 @@ async def submit_web_intake(
             raw_hash=sha256_text(html),
             extracted_snapshot=page.body,
             extracted_hash=content_hash(page.body),
-            review={"material": {"resolved_url": resolved_url, "fetched_at": iso(fetched_at)}},
+            review=review,
         )
         session.add(item)
         session.commit()

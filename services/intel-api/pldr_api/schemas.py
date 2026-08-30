@@ -222,6 +222,7 @@ class ExternalSearchSelectionRequest(BaseModel):
 
 class CollectionTargetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    target_type: Literal["web_page", "rss_feed"] = "web_page"
     url: HttpUrl
     language: str = Field(default="en", min_length=2, max_length=20)
     interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)

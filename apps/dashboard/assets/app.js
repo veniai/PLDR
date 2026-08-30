@@ -154,7 +154,8 @@ const LABELS = {
     failed: "采集失败",
     archived: "已删除",
   },
-  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果", collection: "固定网页版本" },
+  inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果", collection: "固定网页版本", rss_collection: "RSS 监测条目" },
+  collectionTargetType: { web_page: "固定网页", rss_feed: "RSS / Atom" },
   searchScope: { news: "新闻", web: "一般公开网页" },
   collectionStatus: {
     healthy: "正常",
@@ -175,8 +176,10 @@ const LABELS = {
     baseline: "首次版本",
     changed: "正文变化",
     unchanged: "正文未变",
+    items: "条目检查",
     failed: "抓取失败",
   },
+  discoveredItemStatus: { pending: "待处理", ready: "可审核", failed: "失败" },
   investigationStatus: { active: "进行中", paused: "已暂停", closed: "已关闭", archived: "已归档" },
   taskStage: {
     queued: "处理中",
@@ -1800,7 +1803,7 @@ function renderInvestigationToday(investigation) {
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>优先处理</h3><p>失败与待审核优先，随后显示实际处理进度</p></div><span class="count-badge warning">${active.length}</span></div>${renderTaskRows(active)}</section>
       <aside class="investigation-rail">
         ${renderSituationAssessment(investigation)}
-        <div class="workbench-surface"><div class="workbench-surface-head"><div><h3>采集覆盖</h3><p>当前专题的固定网页</p></div></div><div class="workbench-surface-body"><p class="muted">${targetsForInvestigation(investigation).length} 个已关联监测来源。${state.collectionSummary ? "全局监测服务已连接。" : "监测摘要暂不可用。"}</p><button class="btn btn-ghost" type="button" data-investigation-action="monitoring">查看来源状态</button></div></div>
+        <div class="workbench-surface"><div class="workbench-surface-head"><div><h3>采集覆盖</h3><p>当前专题的可靠来源</p></div></div><div class="workbench-surface-body"><p class="muted">${targetsForInvestigation(investigation).length} 个已关联监测来源。${state.collectionSummary ? "全局监测服务已连接。" : "监测摘要暂不可用。"}</p><button class="btn btn-ghost" type="button" data-investigation-action="monitoring">查看来源状态</button></div></div>
         ${renderMiniMap(investigation)}
       </aside>
     </div>`;
@@ -1817,12 +1820,12 @@ function renderInvestigationDiscovery(investigation) {
 
 function renderInvestigationMonitoring(investigation) {
   const targets = targetsForInvestigation(investigation);
-  return `${investigationPanelHeading("RELIABLE COLLECTION", "监测来源", "固定公共网页的队列、运行、不可变版本与失败恢复；配置本身不是 Source/Evidence。", `<button class="btn btn-primary" type="button" data-investigation-action="add-source">＋ 添加固定网页</button>`)}
+  return `${investigationPanelHeading("RELIABLE COLLECTION", "监测来源", "固定网页与 RSS 的队列、运行、不可变材料和失败恢复；配置本身不是 Source/Evidence。", `<button class="btn btn-primary" type="button" data-investigation-action="add-source">＋ 添加可靠来源</button>`)}
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>专题受管来源</h3><p>点击来源进入完整运行与版本视图</p></div><span class="count-badge">${targets.length}</span></div>
       ${targets.length ? `<div class="topic-task-list">${targets.map((target) => {
         const status = collectionTargetStatus(target);
-        return `<article class="topic-task-row"><div><h3>${escapeHtml(target.name || "未命名来源")}</h3><p>${escapeHtml(target.url || target.canonical_url || "地址未知")}</p><div class="topic-task-meta"><span class="task-stage ${escapeHtml(status === "healthy" ? "ready" : status === "pending" ? "queued" : status)}">${escapeHtml(LABELS.collectionStatus[status] || status)}</span><span>V${escapeHtml(target.version_count ?? 0)}</span><span>${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</span></div></div><div class="topic-task-actions"><button class="btn btn-ghost" type="button" data-investigation-action="open-source" data-target-id="${escapeHtml(target.id)}">打开运行记录</button></div></article>`;
-      }).join("")}</div>` : '<div class="investigation-empty"><strong>该专题还没有关联固定来源</strong><p>添加一个无需登录的公共 HTTP(S) 网页，运行与变化会如实显示。</p></div>'}
+        return `<article class="topic-task-row"><div><h3>${escapeHtml(target.name || "未命名来源")}</h3><p>${escapeHtml(target.url || target.canonical_url || "地址未知")}</p><div class="topic-task-meta"><span class="task-stage ${escapeHtml(status === "healthy" ? "ready" : status === "pending" ? "queued" : status)}">${escapeHtml(LABELS.collectionStatus[status] || status)}</span><span>${escapeHtml(collectionTargetCount(target))}</span><span>${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</span></div></div><div class="topic-task-actions"><button class="btn btn-ghost" type="button" data-investigation-action="open-source" data-target-id="${escapeHtml(target.id)}">打开运行记录</button></div></article>`;
+      }).join("")}</div>` : '<div class="investigation-empty"><strong>该专题还没有关联可靠来源</strong><p>添加一个无需登录的公共 HTTP(S) 网页或 RSS，运行与材料会如实显示。</p></div>'}
     </section>`;
 }
 
@@ -4938,6 +4941,13 @@ function collectionIntervalMinutes(target) {
   return null;
 }
 
+function collectionTargetCount(target) {
+  if ((target?.target_type || "web_page") === "rss_feed") {
+    return `${target.discovered_item_count ?? 0} 条`;
+  }
+  return `V${target.version_count ?? 0}`;
+}
+
 function collectionRunError(run) {
   if (!run?.error) return run?.error_message || "";
   if (typeof run.error === "string") return run.error;
@@ -4971,9 +4981,9 @@ function renderCollectionSummary() {
   const targets = metrics.targets || {};
   const runs = metrics.runs || {};
   const cards = [
-    [targets.total ?? metrics.total_targets ?? state.collectionTargets.length, "固定来源"],
+    [targets.total ?? metrics.total_targets ?? state.collectionTargets.length, "可靠来源"],
     [targets.healthy ?? metrics.healthy ?? 0, "运行正常"],
-    [metrics.changed_pending ?? metrics.pending_changes ?? metrics.pending_review ?? 0, "版本待审"],
+    [metrics.changed_pending ?? metrics.pending_changes ?? metrics.pending_review ?? 0, "材料待审"],
     [(targets.degraded ?? 0) + (targets.error ?? metrics.error ?? 0) + (targets.stale ?? 0), "需要恢复"],
     [(runs.queued ?? metrics.queued ?? 0) + (runs.running ?? metrics.running ?? 0), "队列中"],
   ];
@@ -4988,14 +4998,16 @@ function renderCollectionTargets() {
   if (!visibleTargets.length) {
     root.innerHTML = `
       <div class="collection-empty">
-        <strong>${state.collectionScopeInvestigationId ? "本专题还没有固定来源" : "还没有固定来源"}</strong>
-        <p>在上方添加一个无需登录的公共网页。${state.collectionScopeInvestigationId ? "这里不会显示其他专题或全局来源。" : "PLDR 不会用演示运行记录填充这里。"}</p>
+        <strong>${state.collectionScopeInvestigationId ? "本专题还没有可靠来源" : "还没有可靠来源"}</strong>
+        <p>在上方添加一个无需登录的公共网页或 RSS。${state.collectionScopeInvestigationId ? "这里不会显示其他专题或全局来源。" : "PLDR 不会用演示运行记录填充这里。"}</p>
       </div>`;
     return;
   }
   root.innerHTML = visibleTargets.map((target) => {
     const status = collectionTargetStatus(target);
     const active = target.id === state.selectedCollectionTargetId;
+    const targetType = target.target_type || "web_page";
+    const count = collectionTargetCount(target);
     return `
       <div role="listitem">
         <button class="collection-target ${active ? "active" : ""}" type="button" data-collection-target="${escapeHtml(target.id)}">
@@ -5003,9 +5015,9 @@ function renderCollectionTargets() {
           <span class="collection-target-copy">
             <strong>${escapeHtml(target.name || "未命名来源")}</strong>
             <small>${escapeHtml(target.url || target.canonical_url || "地址未知")}</small>
-            <em>${escapeHtml(LABELS.collectionStatus[status] || status)} · ${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</em>
+            <em>${escapeHtml(LABELS.collectionTargetType[targetType] || targetType)} · ${escapeHtml(LABELS.collectionStatus[status] || status)} · ${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</em>
           </span>
-          <span class="collection-target-count">V${escapeHtml(target.version_count ?? 0)}</span>
+          <span class="collection-target-count">${escapeHtml(count)}</span>
         </button>
       </div>`;
   }).join("");
@@ -5066,10 +5078,13 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
   const target = detail.target || detail;
   const runs = detail.runs || target.runs || [];
   const versions = detail.versions || target.versions || [];
+  const discoveredItems = detail.discovered_items || target.discovered_items || [];
   const runTotal = Number(detail.run_count ?? target.run_count ?? runs.length);
   const versionTotal = Number(detail.version_count ?? target.version_count ?? versions.length);
+  const discoveredTotal = Number(detail.discovered_item_count ?? target.discovered_item_count ?? discoveredItems.length);
   const status = collectionTargetStatus(target);
   const paused = target.enabled === false || status === "paused";
+  const targetType = target.target_type || "web_page";
   root.innerHTML = `
     <div class="collection-detail-head">
       <div>
@@ -5083,6 +5098,7 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
       </div>
     </div>
     <dl class="collection-facts">
+      <div><dt>来源类型</dt><dd>${escapeHtml(LABELS.collectionTargetType[targetType] || targetType)}</dd></div>
       <div><dt>检查周期</dt><dd>${escapeHtml(collectionIntervalMinutes(target) ?? "?")} 分钟</dd></div>
       <div><dt>上次成功</dt><dd>${formatDate(target.last_success_at, true)}</dd></div>
       <div><dt>下次运行</dt><dd>${target.enabled === false ? "已暂停" : formatDate(target.next_run_at, true)}</dd></div>
@@ -5099,6 +5115,7 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
               <div>
                 <strong>${escapeHtml(collectionRunLabel(run))}</strong>
                 <small>${formatDate(run.started_at || run.created_at || run.queued_at, true)} · ${escapeHtml(run.trigger || "manual")} · ${escapeHtml(collectionRunDuration(run))}</small>
+                ${run.discovery ? `<small>发现 ${escapeHtml(run.discovery.new_item_count ?? 0)} 新条目 · 重复 ${escapeHtml(run.discovery.duplicate_item_count ?? 0)} · 无效 ${escapeHtml(run.discovery.invalid_item_count ?? 0)}</small>` : ""}
                 ${collectionRunError(run) ? `<p>${escapeHtml(collectionRunError(run))}</p>` : ""}
               </div>
               ${run.status === "failed" ? `<button class="text-btn warning" type="button" data-collection-action="retry" data-run-id="${escapeHtml(run.id)}" ${paused ? 'disabled title="请先恢复周期"' : ""}>重试</button>` : ""}
@@ -5107,6 +5124,23 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
         </div>
       </section>
       <section>
+        ${
+          targetType === "rss_feed"
+            ? `
+        <div class="collection-section-heading"><div><span class="panel-kicker">DISCOVERED ITEMS</span><h3>发现条目</h3></div><span>已载入 ${discoveredItems.length} / 共 ${discoveredTotal} 个</span></div>
+        <div class="collection-version-list">
+          ${discoveredItems.length ? discoveredItems.map((item) => `
+            <article class="collection-version">
+              <div>
+                <strong>${escapeHtml(item.title || item.source_url || "未命名条目")}</strong>
+                <span>${escapeHtml(LABELS.discoveredItemStatus[item.status] || item.status || "未知状态")}</span>
+                <small>${formatDate(item.last_seen_at || item.updated_at || item.created_at, true)}</small>
+                ${item.error ? `<small>${escapeHtml(item.error)}</small>` : ""}
+              </div>
+              ${item.intake_item_id ? `<button class="text-btn" type="button" data-collection-action="review" data-intake-id="${escapeHtml(item.intake_item_id)}">打开条目材料</button>` : ""}
+            </article>`).join("") : '<div class="collection-empty"><p>成功检查 RSS 后才会出现条目。</p></div>'}
+        </div>`
+            : `
         <div class="collection-section-heading"><div><span class="panel-kicker">IMMUTABLE VERSIONS</span><h3>正文版本</h3></div><span>已载入 ${versions.length} / 共 ${versionTotal} 个</span></div>
         <div class="collection-version-list">
           ${versions.length ? versions.map((version) => {
@@ -5125,7 +5159,8 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
           }).join("") : '<div class="collection-empty"><p>成功抓取后才会出现第一个正文版本。</p></div>'}
           ${versions.length < versionTotal ? `<button class="text-btn collection-load-more" type="button" data-collection-action="more-versions" data-target-id="${escapeHtml(target.id)}">加载更早版本</button>` : ""}
         </div>
-        <div id="collection-diff" class="collection-diff">${renderCollectionDiff(state.collectionDiff)}</div>
+        <div id="collection-diff" class="collection-diff">${renderCollectionDiff(state.collectionDiff)}</div>`
+        }
       </section>
     </div>`;
 }
@@ -5273,12 +5308,12 @@ async function openCollectionModal(preferredTargetId = null, scopeInvestigationI
   state.collectionScopeInvestigationTitle = scope?.title || null;
   state.collectionScopeTargetIds = scopeInvestigationId ? new Set() : null;
   const modalTitle = preferredTargetId && scope
-    ? `“${scope.title}”的固定网页来源`
+    ? `“${scope.title}”的可靠来源`
     : destination
-    ? `为“${destination.title}”添加固定网页`
+    ? `为“${destination.title}”添加可靠来源`
     : scope
-      ? `“${scope.title}”的固定网页来源`
-      : "固定网页来源监测";
+      ? `“${scope.title}”的可靠来源`
+      : "可靠来源监测";
   $("#collection-modal-title").textContent = modalTitle;
   $("#collection-modal-title").title = modalTitle;
   if (typeof modal.showModal === "function") modal.showModal();
@@ -5305,7 +5340,7 @@ function closeCollectionModal() {
   state.selectedCollectionTargetId = null;
   state.selectedCollectionTarget = null;
   state.collectionDiff = null;
-  $("#collection-modal-title").textContent = "固定网页来源监测";
+  $("#collection-modal-title").textContent = "可靠来源监测";
   $("#collection-modal-title").removeAttribute("title");
   const button = $("#collection-add");
   button.disabled = false;
@@ -5353,6 +5388,7 @@ async function submitCollectionTarget(event) {
       method: "POST",
       body: JSON.stringify({
         name: $("#collection-name").value.trim(),
+        target_type: $("#collection-target-type").value,
         url: $("#collection-url").value.trim(),
         interval_seconds: Number($("#collection-interval").value) * 60,
         language: $("#collection-language").value,
@@ -5362,7 +5398,7 @@ async function submitCollectionTarget(event) {
     });
     const run = result.run || result.queued_run || null;
     const runFailed = run?.status === "failed";
-    toast(runFailed ? `来源已保存，但首次抓取失败：${collectionRunError(run) || "未知错误"}` : run?.status === "queued" ? "固定来源已保存，首次试抓已进入持久队列。" : "固定来源已保存。变化只会进入待审箱。", runFailed ? "error" : "success", 7000);
+    toast(runFailed ? `来源已保存，但首次检查失败：${collectionRunError(run) || "未知错误"}` : run?.status === "queued" ? "可靠来源已保存，首次检查已进入持久队列。" : "可靠来源已保存。新材料只会进入待审箱。", runFailed ? "error" : "success", 7000);
     if (destination && result.target?.id) {
       try {
         const association = await associateInvestigationObjects(destination, "collection_target", [result.target.id], { origin: "fixed_url_monitor" });
@@ -5378,7 +5414,7 @@ async function submitCollectionTarget(event) {
     if (requestSerial !== state.collectionSubmitSerial || !$("#collection-modal").open) {
       refreshData({ keepSelection: true, quiet: true }).catch(() => null);
       refreshInvestigationDirectory().catch(() => null);
-      toast("固定来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
+      toast("可靠来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
       return;
     }
     $("#collection-source-form").reset();
@@ -5389,7 +5425,7 @@ async function submitCollectionTarget(event) {
       await refreshData({ keepSelection: true, quiet: true });
       await refreshInvestigationDirectory();
       if (requestSerial !== state.collectionSubmitSerial || !$("#collection-modal").open) {
-        toast("固定来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
+        toast("可靠来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
         return;
       }
       if (destination && state.activeInvestigationId === destination.id) await loadInvestigationWorkspace(destination.id, { quiet: true });
