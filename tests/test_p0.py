@@ -1546,7 +1546,7 @@ class P0Test(unittest.TestCase):
         self.assertIn("data-search-retry=", script.text)
         self.assertIn('data-intake-action="retry-search"', script.text)
         self.assertIn("item.search_history", script.text)
-        self.assertIn("历次查询与结果", script.text)
+        self.assertIn("处理追踪", script.text)
         self.assertIn('escapeHtml(result.title || "无标题")', script.text)
 
         styles = self.client.get("/assets/styles.css")

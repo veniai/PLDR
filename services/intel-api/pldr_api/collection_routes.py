@@ -96,7 +96,29 @@ def create_collection_target(
     )
     session.add(target)
     try:
+        session.flush()
+        from .investigations import link_object, resolve_investigation_context
+
+        investigation, _ = resolve_investigation_context(
+            session,
+            investigation_id=request.investigation_id,
+            new_investigation=request.new_investigation,
+            actor=request.actor,
+            default_unclassified=True,
+        )
+        assert investigation is not None
+        link_object(
+            session,
+            investigation.id,
+            "collection_target",
+            target.id,
+            actor=request.actor,
+            action="collection.target_linked",
+        )
         session.commit()
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except IntegrityError as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail="Collection target URL already exists") from exc
@@ -106,6 +128,7 @@ def create_collection_target(
     return {
         "target": serialize_target(session, target),
         "queued_run": serialize_run(queued_run) if queued_run else None,
+        "investigation_id": investigation.id,
     }
 
 

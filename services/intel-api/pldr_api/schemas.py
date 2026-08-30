@@ -1,11 +1,67 @@
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+
+
+class InvestigationCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=240)
+    question: str = Field(default="", max_length=4000)
+    # ``objective`` is accepted as a human-friendly synonym. Responses expose
+    # both keys, while persistence keeps one canonical question/goal value.
+    objective: str | None = Field(default=None, max_length=4000)
+    description: str = Field(default="", max_length=20_000)
+    status: Literal["active", "paused", "closed", "archived"] = "active"
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("title must contain visible characters")
+        return cleaned
+
+
+class InvestigationUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    question: str | None = Field(default=None, max_length=4000)
+    objective: str | None = Field(default=None, max_length=4000)
+    description: str | None = Field(default=None, max_length=20_000)
+    status: Literal["active", "paused", "closed", "archived"] | None = None
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("title must contain visible characters")
+        return cleaned
+
+
+class InvestigationLinkRequest(BaseModel):
+    object_type: Literal["search_query", "intake", "collection_target", "event"]
+    object_id: str = Field(min_length=1, max_length=128)
+    role: str = Field(default="member", min_length=1, max_length=40)
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
+
+
+class ReviewTaskRetryRequest(BaseModel):
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
 
 class ReportRequest(BaseModel):
-    event_ids:list[str]=Field(min_length=1,max_length=20)
+    event_ids:list[str]=Field(default_factory=list,max_length=20)
+    investigation_id:str|None=Field(default=None,max_length=80)
     title:str|None=Field(default=None,max_length=200)
+
+    @model_validator(mode="after")
+    def require_scope(self):
+        if not self.event_ids and not self.investigation_id:
+            raise ValueError("event_ids or investigation_id is required")
+        return self
 
 class ImportUrlRequest(BaseModel):
     url:HttpUrl
@@ -83,9 +139,27 @@ class ExternalSearchRequest(BaseModel):
     scope:Literal["news","web"]="web"
     limit:int=Field(default=10,ge=5,le=20)
     language:str=Field(default="en",min_length=2,max_length=20)
+    investigation_id:str|None=Field(default=None,max_length=80)
+    new_investigation:InvestigationCreate|None=None
+
+    @model_validator(mode="after")
+    def one_investigation_context(self):
+        if self.investigation_id and self.new_investigation:
+            raise ValueError("Use investigation_id or new_investigation, not both")
+        return self
 
 class ExternalSearchSelectionRequest(BaseModel):
     result_ids:list[str]=Field(min_length=1,max_length=20)
+    request_id:str|None=Field(default=None,min_length=1,max_length=128)
+    investigation_id:str|None=Field(default=None,max_length=80)
+    new_investigation:InvestigationCreate|None=None
+    actor:str=Field(default="analyst",min_length=1,max_length=160)
+
+    @model_validator(mode="after")
+    def one_investigation_context(self):
+        if self.investigation_id and self.new_investigation:
+            raise ValueError("Use investigation_id or new_investigation, not both")
+        return self
 
 
 class CollectionTargetCreate(BaseModel):
@@ -95,6 +169,9 @@ class CollectionTargetCreate(BaseModel):
     interval_seconds: int = Field(default=3600, ge=60, le=2_592_000)
     enabled: bool = True
     run_immediately: bool = False
+    investigation_id: str | None = Field(default=None, max_length=80)
+    new_investigation: InvestigationCreate | None = None
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
 
     @field_validator("name")
     @classmethod
@@ -103,6 +180,12 @@ class CollectionTargetCreate(BaseModel):
         if not cleaned:
             raise ValueError("name must contain visible characters")
         return cleaned
+
+    @model_validator(mode="after")
+    def one_investigation_context(self):
+        if self.investigation_id and self.new_investigation:
+            raise ValueError("Use investigation_id or new_investigation, not both")
+        return self
 
 class ModelTaskRequest(BaseModel):
     task:Literal["normalize_event_title","summarize_event","extract_entities_locations","extract_claims_evidence","draft_report","extract_intake_candidates"]

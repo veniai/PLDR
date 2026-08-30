@@ -189,6 +189,33 @@ def deterministic_candidate_result(item: IntakeItem) -> dict[str, Any]:
     }
 
 
+def generate_deterministic_candidates(
+    session: Session,
+    item: IntakeItem,
+    *,
+    model_error: str,
+) -> IntakeItem:
+    """Persist an explicitly-labelled reviewable fallback after a model error.
+
+    The error remains visible and the investigation task stays retryable; this
+    prevents a provider timeout from becoming a dead end without representing
+    deterministic extraction as a model result.
+    """
+    for candidate in list(item.candidates):
+        session.delete(candidate)
+    session.flush()
+    result = deterministic_candidate_result(item)
+    _store_candidates(session, item, result, "fallback-after-error", None)
+    item.status = "candidate_ready"
+    item.candidate_mode = "fallback-after-error"
+    item.candidate_model = None
+    item.candidate_error = model_error
+    item.updated_at = utcnow()
+    session.expire(item, ["candidates"])
+    session.commit()
+    return item
+
+
 def _candidate_machine_data(data: dict[str, Any], source_mode: str) -> dict[str, Any]:
     return {"fields": data, "source_mode": source_mode, "status": "machine-candidate"}
 
@@ -1370,6 +1397,18 @@ def _confirm_validated_intake(
         "differences": differences,
     }
     item.review = review
+    # Topic membership and review-task state are promoted in this same
+    # transaction as the formal event, so the audit trail cannot lag behind a
+    # successful confirmation.
+    from .investigations import record_intake_disposition
+
+    record_intake_disposition(
+        session,
+        item,
+        status_value="confirmed",
+        actor=request.analyst,
+        event_id=event.id,
+    )
     session.flush()
     session.refresh(item)
     session.commit()
@@ -1389,6 +1428,15 @@ def reject_intake(session: Session, item: IntakeItem, analyst: str, reason: str)
     for candidate in item.candidates:
         candidate.disposition = "rejected"
         candidate.reviewed_at = now
+    from .investigations import record_intake_disposition
+
+    record_intake_disposition(
+        session,
+        item,
+        status_value="rejected",
+        actor=analyst,
+        reason=reason,
+    )
     session.commit()
     session.refresh(item)
     return item
@@ -1407,6 +1455,15 @@ def cancel_intake(session: Session, item: IntakeItem, analyst: str, reason: str)
     for candidate in item.candidates:
         candidate.disposition = "cancelled"
         candidate.reviewed_at = now
+    from .investigations import record_intake_disposition
+
+    record_intake_disposition(
+        session,
+        item,
+        status_value="cancelled",
+        actor=analyst,
+        reason=reason,
+    )
     session.commit()
     session.refresh(item)
     return item

@@ -393,6 +393,9 @@ async def execute_external_search(
         status="running",
     )
     session.add(run)
+    from .investigations import attach_search_run, record_action
+
+    investigation = attach_search_run(session, request, run)
     session.commit()
     session.refresh(run)
     started = time.monotonic()
@@ -402,6 +405,15 @@ async def execute_external_search(
         run.status = "failed"
         run.error = str(exc)
         run.latency_ms = int((time.monotonic() - started) * 1000)
+        record_action(
+            session,
+            investigation.id,
+            "search.query_failed",
+            actor="analyst",
+            object_type="search_query",
+            object_id=run.id,
+            detail={"reason": exc.reason, "error": str(exc)},
+        )
         session.commit()
         exc.query_run_id = run.id
         raise
@@ -438,6 +450,15 @@ async def execute_external_search(
     run.status = "ok"
     run.result_count = len(seen)
     run.latency_ms = int((time.monotonic() - started) * 1000)
+    record_action(
+        session,
+        investigation.id,
+        "search.query_completed",
+        actor="analyst",
+        object_type="search_query",
+        object_id=run.id,
+        detail={"result_count": run.result_count, "latency_ms": run.latency_ms},
+    )
     session.commit()
     session.refresh(run)
     selections = {
@@ -451,7 +472,14 @@ async def execute_external_search(
             )
         )
     }
-    return serialize_query_run(run, list(run.results), selections)
+    payload = serialize_query_run(run, list(run.results), selections)
+    payload["investigation_id"] = investigation.id
+    payload["investigation"] = {
+        "id": investigation.id,
+        "title": investigation.title,
+        "status": investigation.status,
+    }
+    return payload
 
 
 def _trace_for_selection(
@@ -656,6 +684,20 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
 async def select_search_results(
     session: Session, request: ExternalSearchSelectionRequest, *, retry: bool = False
 ) -> dict[str, Any]:
+    if (
+        request.investigation_id is not None
+        or request.new_investigation is not None
+        or request.request_id is not None
+    ):
+        # The investigation-aware path is deliberately a short database-only
+        # transaction. Requests carrying an idempotency key but no explicit topic
+        # are queued into the durable unclassified topic. The collector performs
+        # each fetch/model operation later. Only the keyless legacy contract stays
+        # synchronous for compatibility with existing API clients.
+        from .investigations import enqueue_search_result_tasks
+
+        return enqueue_search_result_tasks(session, request)
+
     requested_ids = list(dict.fromkeys(request.result_ids))
     results = list(
         session.scalars(
@@ -705,6 +747,14 @@ async def select_search_results(
                     "result": serialize_search_result(result, existing),
                 }
             )
+            from .investigations import link_legacy_search_selection
+
+            link_legacy_search_selection(
+                session,
+                query_run_id=result.query_run_id,
+                intake_item_id=existing.intake_item_id,
+            )
+            session.commit()
             continue
 
         existing_item = _existing_intake_for_result(session, result)
@@ -741,6 +791,14 @@ async def select_search_results(
                 "result": serialize_search_result(result, selection),
             }
         )
+        from .investigations import link_legacy_search_selection
+
+        link_legacy_search_selection(
+            session,
+            query_run_id=result.query_run_id,
+            intake_item_id=selection.intake_item_id,
+        )
+        session.commit()
     return {
         "status": "ok",
         "requested_count": len(requested_ids),

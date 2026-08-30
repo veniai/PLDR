@@ -16,6 +16,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from .collection_routes import router as collection_router
 from .database import Base, REPO_ROOT, SessionLocal, engine, get_session
+from .investigations import (
+    DEMO_INVESTIGATION_ID,
+    bootstrap_legacy_investigations,
+    investigation_event_ids,
+    record_action,
+    router as investigation_router,
+    task_router as investigation_task_router,
+)
 from .intake import (
     build_confirmation_preview,
     cancel_intake,
@@ -30,7 +38,7 @@ from .intake import (
     generate_candidates,
 )
 from .llm import run_model_task
-from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Snapshot, Source
+from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Investigation, Snapshot, Source
 from .reporting import REPORT_DIR, build_report
 from .repository import (
     get_event,
@@ -174,6 +182,8 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as session:
         seed_database(session)
     backfill_evidence_snapshots()
+    with SessionLocal() as session:
+        bootstrap_legacy_investigations(session)
     yield
 
 
@@ -187,10 +197,12 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=configured_cors_origins(),
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type", "X-PLDR-Admin-Token"],
 )
 app.include_router(collection_router)
+app.include_router(investigation_router)
+app.include_router(investigation_task_router)
 app.mount("/assets", StaticFiles(directory=ASSET_DIR), name="assets")
 app.mount("/reports", StaticFiles(directory=REPORT_DIR), name="reports")
 
@@ -213,7 +225,9 @@ def reseed(
     _: None = Depends(require_admin_token),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    return {"status": "ok", "counts": seed_database(session, force=force)}
+    result = seed_database(session, force=force)
+    bootstrap_legacy_investigations(session)
+    return {"status": "ok", "counts": result}
 
 
 @app.get("/api/v1/overview", include_in_schema=False)
@@ -339,7 +353,60 @@ def source_health(session: Session = Depends(get_session)) -> dict[str, Any]:
 @app.post("/pldr-api/v1/reports")
 def create_report(request: ReportRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
-        return build_report(session, request.event_ids, request.title)
+        event_ids = list(dict.fromkeys(request.event_ids))
+        investigation: Investigation | None = None
+        if request.investigation_id:
+            investigation = session.get(Investigation, request.investigation_id)
+            linked_ids = investigation_event_ids(session, request.investigation_id)
+            linked_set = set(linked_ids)
+            outside = [event_id for event_id in event_ids if event_id not in linked_set]
+            if outside:
+                raise ValueError(
+                    "Events are outside the investigation scope: " + ", ".join(outside)
+                )
+            if not event_ids:
+                event_ids = linked_ids
+        contains_demo_material = False
+        for event_id in event_ids:
+            event = session.get(Event, event_id)
+            if event is not None and any(
+                bool((link.document.metadata_json or {}).get("demo"))
+                for link in event.document_links
+            ):
+                contains_demo_material = True
+                break
+        payload = build_report(
+            session,
+            event_ids,
+            request.title or (investigation.title if investigation is not None else None),
+            demo_notice=(
+                investigation is None
+                or investigation.id == DEMO_INVESTIGATION_ID
+                or contains_demo_material
+            ),
+        )
+        if investigation is not None:
+            record_action(
+                session,
+                investigation.id,
+                "report.generated",
+                actor="analyst",
+                object_type="report",
+                object_id=payload["filename"],
+                detail={
+                    "event_ids": event_ids,
+                    "filename": payload["filename"],
+                    "title": payload["title"],
+                    "url": payload["url"],
+                    "generated_at": payload["generated_at"],
+                    "event_count": payload["event_count"],
+                    "evidence_count": payload["evidence_count"],
+                },
+            )
+            session.commit()
+            payload["investigation_id"] = investigation.id
+            payload["event_ids"] = event_ids
+        return payload
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -392,6 +459,9 @@ async def external_search(
 ) -> dict[str, Any]:
     try:
         return await execute_external_search(session, request)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ExternalSearchError as exc:
         session.rollback()
         raise HTTPException(
@@ -406,7 +476,14 @@ async def select_external_search_results(
     request: ExternalSearchSelectionRequest, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
     try:
-        return await select_search_results(session, request)
+        payload = await select_search_results(session, request)
+        if (
+            request.investigation_id is not None
+            or request.new_investigation is not None
+            or request.request_id is not None
+        ):
+            return JSONResponse(status_code=202, content=payload)
+        return payload
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
