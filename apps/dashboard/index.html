@@ -19,8 +19,8 @@
       </div>
       <div id="metrics" class="metrics" aria-label="专题指标"></div>
       <div class="topbar-actions">
-        <button id="btn-workbench-home" class="topbar-link active" type="button">专题首页</button>
-        <button id="btn-classic-workspace" class="topbar-link" type="button">经典事件视图</button>
+        <button id="btn-workbench-home" class="topbar-link active" type="button">我的专题</button>
+        <button id="btn-classic-workspace" class="topbar-link" type="button">事件总览</button>
         <div class="system-state">
           <span class="live-dot" aria-hidden="true"></span>
           <span id="system-state-text">正在连接</span>
@@ -76,15 +76,16 @@
         </div>
         <header id="investigation-page-header" class="investigation-page-header"></header>
         <nav id="investigation-tabs" class="investigation-tabs" role="tablist" aria-label="专题工作区">
-          <button type="button" role="tab" data-investigation-tab="today">今日待办</button>
-          <button type="button" role="tab" data-investigation-tab="discovery">发现资料</button>
-          <button type="button" role="tab" data-investigation-tab="monitoring">监测来源</button>
-          <button type="button" role="tab" data-investigation-tab="review">待我审核</button>
-          <button type="button" role="tab" data-investigation-tab="events">事件脉络</button>
-          <button type="button" role="tab" data-investigation-tab="claims">主张与证据</button>
-          <button type="button" role="tab" data-investigation-tab="reports">专题报告</button>
-          <button type="button" role="tab" data-investigation-tab="activity">操作记录</button>
-          <span class="investigation-tabs-hint" aria-hidden="true">左右滑动查看更多 →</span>
+          <button type="button" role="tab" data-investigation-tab="overview">概览</button>
+          <button type="button" role="tab" data-investigation-tab="materials">资料</button>
+          <button type="button" role="tab" data-investigation-tab="review">待审核 <span id="investigation-review-tab-count" class="tab-count">0</span></button>
+          <button type="button" role="tab" data-investigation-tab="outcomes">成果</button>
+          <details id="investigation-more-menu" class="investigation-more-menu">
+            <summary>更多</summary>
+            <div class="investigation-more-popover">
+              <button type="button" data-investigation-tab="activity">操作记录</button>
+            </div>
+          </details>
         </nav>
         <div id="investigation-panel" class="investigation-panel" role="tabpanel" aria-live="polite"></div>
       </section>
@@ -93,9 +94,13 @@
     <section id="classic-workspace-shell" class="classic-workspace-shell" hidden>
     <section class="command-bar" aria-labelledby="topic-title">
       <div class="topic-copy">
-        <span class="eyebrow">ACTIVE INTELLIGENCE TOPIC</span>
-        <h1 id="topic-title">专题加载中</h1>
+        <span class="eyebrow">CONFIRMED EVENTS</span>
+        <h1 id="topic-title">事件总览加载中</h1>
         <p id="topic-description">正在组装事件、来源与证据链。</p>
+        <div class="event-overview-scope-row">
+          <p id="event-overview-scope" class="event-overview-scope"><strong>全局范围</strong> · 显示全部已确认事件</p>
+          <button id="event-overview-return" class="text-btn" type="button" hidden>← 返回专题</button>
+        </div>
         <div class="topic-meta">
           <span id="topic-mode" class="meta-chip">模式加载中</span>
           <span id="topic-range" class="meta-chip">时间范围加载中</span>
@@ -126,12 +131,12 @@
       </div>
     </section>
 
-    <div class="workspace" role="main" aria-label="经典事件工作区">
+    <div class="workspace" role="main" aria-label="事件总览工作区">
       <section class="panel map-panel" aria-labelledby="map-title">
         <div class="panel-header">
           <div>
             <span class="panel-kicker">GEOSPATIAL VIEW</span>
-            <h2 id="map-title">专题态势</h2>
+            <h2 id="map-title">事件态势</h2>
           </div>
           <div class="map-legend" aria-label="事件重要性图例">
             <span><i class="legend-dot critical"></i>极高</span>
@@ -274,10 +279,14 @@
             <div><span class="panel-kicker">RECENT RUNS</span><h3>最近查询</h3></div>
             <button id="search-history-toggle" class="text-btn" type="button" aria-expanded="true">收起</button>
           </div>
+          <div class="record-view-switch search-history-view-switch" role="group" aria-label="查询记录范围">
+            <button class="active" type="button" data-search-history-visibility="active">当前</button>
+            <button type="button" data-search-history-visibility="archived">已删除</button>
+          </div>
           <div id="search-history" class="search-history" aria-live="polite">
             <p class="search-history-empty">正在读取查询记录…</p>
           </div>
-          <p class="search-history-note">查询运行可重新打开。关闭窗口不会删除已加载结果或你的选择。</p>
+          <p class="search-history-note">删除只隐藏查询记录，不影响已经选择或保存的材料。</p>
         </aside>
 
         <section class="search-main" aria-label="资料发现结果">
@@ -532,6 +541,10 @@
       <section class="intake-list-panel" aria-label="采集箱条目">
         <div class="intake-list-toolbar">
           <span id="intake-summary">0 条待处理</span>
+          <div class="record-view-switch" role="group" aria-label="材料记录范围">
+            <button class="active" type="button" data-intake-visibility="active">当前</button>
+            <button type="button" data-intake-visibility="archived">已删除</button>
+          </div>
         </div>
         <div id="intake-list" class="intake-list" role="list"></div>
       </section>

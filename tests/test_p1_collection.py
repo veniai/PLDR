@@ -211,6 +211,185 @@ class P1CollectionTest(unittest.TestCase):
         self.assertEqual(summary.status_code, 200, summary.text)
         self.assertEqual(summary.json()["pending_review"], 2)
 
+    def test_archived_intake_keeps_collection_version_chain_and_diff(self):
+        created = self.create_target(run_immediately=True)
+        target_id = created["target"]["id"]
+        baseline = self.run_with(
+            self.fetched(
+                "The first monitored bulletin establishes an immutable baseline with "
+                "enough public text for later version comparison and analyst review."
+            )
+        )
+        baseline_intake_id = baseline.current_intake_item_id
+        assert baseline_intake_id is not None
+
+        queued = self.client.post(f"/pldr-api/v1/collection/targets/{target_id}/run")
+        self.assertEqual(queued.status_code, 200, queued.text)
+        changed = self.run_with(
+            self.fetched(
+                "The second monitored bulletin reports a material closure and a new "
+                "inspection window with enough public text for a durable comparison."
+            )
+        )
+        changed_intake_id = changed.current_intake_item_id
+        assert changed_intake_id is not None
+        self.assertEqual(changed.previous_intake_item_id, baseline_intake_id)
+
+        before_archive = self.client.get(
+            f"/pldr-api/v1/intake/{baseline_intake_id}"
+        )
+        self.assertEqual(before_archive.status_code, 200, before_archive.text)
+        original_status = before_archive.json()["status"]
+        archived = self.client.post(
+            f"/pldr-api/v1/intake/{baseline_intake_id}/archive",
+            json={
+                "analyst": "collection-archive-test",
+                "reason": "Hide an old version from active review without deleting it",
+            },
+        )
+        self.assertEqual(archived.status_code, 200, archived.text)
+
+        archived_detail = self.client.get(
+            f"/pldr-api/v1/intake/{baseline_intake_id}"
+        )
+        self.assertEqual(archived_detail.status_code, 200, archived_detail.text)
+        self.assertTrue(archived_detail.json()["archived"])
+        self.assertEqual(archived_detail.json()["status"], original_status)
+
+        with SessionLocal() as session:
+            persisted_baseline = session.get(CollectionRun, baseline.id)
+            persisted_changed = session.get(CollectionRun, changed.id)
+            assert persisted_baseline is not None and persisted_changed is not None
+            self.assertEqual(
+                persisted_baseline.current_intake_item_id, baseline_intake_id
+            )
+            self.assertEqual(
+                persisted_changed.previous_intake_item_id, baseline_intake_id
+            )
+            self.assertEqual(
+                persisted_changed.current_intake_item_id, changed_intake_id
+            )
+
+        target_detail = self.client.get(
+            f"/pldr-api/v1/collection/targets/{target_id}"
+        )
+        self.assertEqual(target_detail.status_code, 200, target_detail.text)
+        versions_by_id = {
+            version["id"]: version for version in target_detail.json()["versions"]
+        }
+        self.assertEqual(len(versions_by_id), 2)
+        self.assertEqual(
+            versions_by_id[baseline.id]["intake_chain"]["current"],
+            baseline_intake_id,
+        )
+        self.assertEqual(
+            versions_by_id[changed.id]["intake_chain"],
+            {"previous": baseline_intake_id, "current": changed_intake_id},
+        )
+
+        version_history = self.client.get(
+            f"/pldr-api/v1/collection/targets/{target_id}/versions"
+        )
+        self.assertEqual(version_history.status_code, 200, version_history.text)
+        self.assertEqual(version_history.json()["count"], 2)
+        self.assertEqual(
+            {item["id"] for item in version_history.json()["items"]},
+            {baseline.id, changed.id},
+        )
+
+        diff = self.client.get(f"/pldr-api/v1/collection/runs/{changed.id}/diff")
+        self.assertEqual(diff.status_code, 200, diff.text)
+        self.assertEqual(diff.json()["previous"]["intake_item_id"], baseline_intake_id)
+        self.assertEqual(diff.json()["current"]["intake_item_id"], changed_intake_id)
+        self.assertIn("closure", diff.json()["added_text"])
+
+        investigation = self.client.post(
+            "/pldr-api/v1/investigations",
+            json={
+                "title": "Collection archive attachment topic",
+                "question": "Which monitored versions remain active?",
+            },
+        )
+        self.assertEqual(investigation.status_code, 201, investigation.text)
+        investigation_id = investigation.json()["id"]
+        linked_target = self.client.post(
+            f"/pldr-api/v1/investigations/{investigation_id}/links",
+            json={"object_type": "collection_target", "object_id": target_id},
+        )
+        self.assertEqual(linked_target.status_code, 201, linked_target.text)
+        # Only the non-archived current version becomes an active review task.
+        self.assertEqual(linked_target.json()["version_tasks_created"], 1)
+        from pldr_api.investigations import attach_collection_intake_to_investigations
+        from pldr_api.models import InvestigationLink, ReviewTask
+
+        with SessionLocal() as session:
+            self.assertIsNone(
+                session.scalar(
+                    select(InvestigationLink.id).where(
+                        InvestigationLink.investigation_id == investigation_id,
+                        InvestigationLink.object_type == "intake",
+                        InvestigationLink.object_id == baseline_intake_id,
+                    )
+                )
+            )
+            self.assertIsNone(
+                session.scalar(
+                    select(ReviewTask.id).where(
+                        ReviewTask.investigation_id == investigation_id,
+                        ReviewTask.intake_item_id == baseline_intake_id,
+                    )
+                )
+            )
+            archived_baseline = session.get(IntakeItem, baseline_intake_id)
+            assert archived_baseline is not None
+            self.assertEqual(
+                attach_collection_intake_to_investigations(
+                    session,
+                    target_id=target_id,
+                    item=archived_baseline,
+                    run_id=baseline.id,
+                    outcome="baseline",
+                ),
+                0,
+            )
+            session.commit()
+
+        restored = self.client.post(
+            f"/pldr-api/v1/intake/{baseline_intake_id}/restore"
+        )
+        self.assertEqual(restored.status_code, 200, restored.text)
+        with SessionLocal() as session:
+            restored_baseline = session.get(IntakeItem, baseline_intake_id)
+            assert restored_baseline is not None
+            self.assertEqual(
+                attach_collection_intake_to_investigations(
+                    session,
+                    target_id=target_id,
+                    item=restored_baseline,
+                    run_id=baseline.id,
+                    outcome="baseline",
+                ),
+                1,
+            )
+            session.commit()
+            self.assertIsNotNone(
+                session.scalar(
+                    select(InvestigationLink.id).where(
+                        InvestigationLink.investigation_id == investigation_id,
+                        InvestigationLink.object_type == "intake",
+                        InvestigationLink.object_id == baseline_intake_id,
+                    )
+                )
+            )
+            self.assertIsNotNone(
+                session.scalar(
+                    select(ReviewTask.id).where(
+                        ReviewTask.investigation_id == investigation_id,
+                        ReviewTask.intake_item_id == baseline_intake_id,
+                    )
+                )
+            )
+
     def test_failed_run_retry_and_no_intake_pollution(self):
         before = self.formal_counts()
         created = self.create_target(run_immediately=True)
@@ -241,6 +420,205 @@ class P1CollectionTest(unittest.TestCase):
             self.assertEqual(target.health, "healthy")
             self.assertEqual(target.consecutive_failures, 0)
             self.assertIsNone(target.last_error)
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_collection_tail_failure_preserves_committed_analyst_rejection(self):
+        before = self.formal_counts()
+        self.create_target(run_immediately=True)
+        captured: dict[str, str] = {}
+
+        def reject_then_fail(
+            _worker_session,
+            *,
+            target_id: str,
+            item: IntakeItem,
+            run_id: str,
+            outcome: str,
+        ) -> int:
+            captured.update(
+                item_id=item.id,
+                target_id=target_id,
+                run_id=run_id,
+                outcome=outcome,
+            )
+            # The material and its collection provenance have already committed.
+            # Reproduce an analyst decision landing before a later linking failure.
+            from pldr_api.intake import reject_intake
+
+            with SessionLocal() as analyst_session:
+                analyst_item = analyst_session.get(IntakeItem, item.id)
+                assert analyst_item is not None
+                reject_intake(
+                    analyst_session,
+                    analyst_item,
+                    "collection-tail-analyst",
+                    "Reject after the durable collection capture",
+                )
+            raise RuntimeError("controlled collection attach tail failure")
+
+        with patch(
+            "pldr_api.investigations.attach_collection_intake_to_investigations",
+            new=reject_then_fail,
+        ):
+            failed = self.run_with(
+                self.fetched(
+                    "This monitored bulletin is committed before an analyst rejects it, "
+                    "then the collection attachment tail fails deterministically."
+                )
+            )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertEqual(failed.error_class, "internal")
+        self.assertIn("controlled collection attach tail failure", failed.error_message)
+        self.assertIsNone(failed.current_intake_item_id)
+        self.assertEqual(captured["run_id"], failed.id)
+        self.assertEqual(captured["outcome"], "baseline")
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                1,
+            )
+            preserved = session.get(IntakeItem, captured["item_id"])
+            assert preserved is not None
+            self.assertEqual(preserved.status, "rejected")
+            self.assertEqual(preserved.disposition, "reject")
+            self.assertEqual(preserved.reviewed_by, "collection-tail-analyst")
+            self.assertEqual(
+                preserved.rejection_reason,
+                "Reject after the durable collection capture",
+            )
+            self.assertEqual(
+                preserved.review["collection"]["run_id"],
+                failed.id,
+            )
+            self.assertEqual(
+                preserved.review["collection"]["target_id"],
+                captured["target_id"],
+            )
+            self.assertTrue(preserved.candidates)
+            self.assertTrue(
+                all(candidate.disposition == "rejected" for candidate in preserved.candidates)
+            )
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_collection_tail_failure_preserves_unreviewed_committed_capture(self):
+        before = self.formal_counts()
+        self.create_target(run_immediately=True)
+        captured: dict[str, str] = {}
+
+        def fail_after_provenance(
+            _worker_session,
+            *,
+            target_id: str,
+            item: IntakeItem,
+            run_id: str,
+            outcome: str,
+        ) -> int:
+            captured.update(
+                item_id=item.id,
+                target_id=target_id,
+                run_id=run_id,
+                outcome=outcome,
+            )
+            raise RuntimeError("controlled unreviewed collection tail failure")
+
+        with patch(
+            "pldr_api.investigations.attach_collection_intake_to_investigations",
+            new=fail_after_provenance,
+        ):
+            failed = self.run_with(
+                self.fetched(
+                    "This unreviewed monitored bulletin is already durable when the "
+                    "later investigation attachment fails deterministically."
+                )
+            )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("controlled unreviewed collection tail failure", failed.error_message)
+        self.assertIsNone(failed.current_intake_item_id)
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                1,
+            )
+            preserved = session.get(IntakeItem, captured["item_id"])
+            assert preserved is not None
+            self.assertEqual(preserved.status, "candidate_ready")
+            self.assertIsNone(preserved.disposition)
+            self.assertIsNone(preserved.reviewed_by)
+            self.assertEqual(preserved.review["collection"]["run_id"], failed.id)
+            self.assertEqual(
+                preserved.review["collection"]["target_id"],
+                captured["target_id"],
+            )
+            self.assertTrue(preserved.candidates)
+        self.assertEqual(self.formal_counts(), before)
+
+    def test_collection_run_preserves_failed_intake_committed_by_submit(self):
+        before = self.formal_counts()
+        self.create_target(run_immediately=True)
+        failed_item_id = "int_collection_committed_failure"
+
+        async def submit_committed_failure(
+            session,
+            url: str,
+            source_name: str | None,
+            _title: str | None,
+            html: str | None,
+            language: str,
+            input_type: str = "web",
+        ) -> IntakeItem:
+            now = utcnow()
+            item = IntakeItem(
+                id=failed_item_id,
+                input_type=input_type,
+                status="failed",
+                error="controlled committed intake failure",
+                source_description=source_name or "",
+                source_url=url,
+                canonical_url=url,
+                language=language,
+                raw_snapshot=html or "",
+                raw_hash="a" * 64,
+                extracted_snapshot="",
+                extracted_hash="b" * 64,
+                review={"fixture": "committed-before-run-failure"},
+                candidate_relations=[],
+                confirmation_result={},
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(item)
+            session.commit()
+            return item
+
+        with patch(
+            "pldr_api.collection.submit_web_intake",
+            new=submit_committed_failure,
+        ):
+            failed = self.run_with(
+                self.fetched(
+                    "This otherwise valid collection response forces the intake submit "
+                    "boundary to return a durable, user-visible failure record."
+                )
+            )
+
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("controlled committed intake failure", failed.error_message)
+        self.assertIsNone(failed.current_intake_item_id)
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.scalar(select(func.count()).select_from(IntakeItem)),
+                1,
+            )
+            preserved = session.get(IntakeItem, failed_item_id)
+            assert preserved is not None
+            self.assertEqual(preserved.status, "failed")
+            self.assertEqual(preserved.error, "controlled committed intake failure")
+            self.assertEqual(
+                preserved.review,
+                {"fixture": "committed-before-run-failure"},
+            )
         self.assertEqual(self.formal_counts(), before)
 
     def test_lease_replay_adopts_intake_committed_before_run_link(self):

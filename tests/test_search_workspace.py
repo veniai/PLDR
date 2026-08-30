@@ -398,6 +398,461 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(selection_payload["error"]["code"], "dns_policy_blocked")
         self.assertFalse(selection_payload["retryable"])
 
+    def test_legacy_retry_preserves_terminal_decisions_across_async_boundaries(self):
+        from pldr_api.intake import cancel_intake, reject_intake
+        from pldr_api.models import (
+            IntakeItem,
+            SearchSelection,
+            SearchSelectionEvent,
+        )
+        from pldr_api.search import lock_intake_for_mutation
+
+        async def backend(_, request):
+            return BackendSearchResponse(
+                "searxng",
+                "searxng:web",
+                [self.hit(201), self.hit(202), self.hit(203)],
+                False,
+            )
+
+        with patch("pldr_api.search.request_search", new=backend):
+            searched = self.client.post(
+                "/pldr-api/v1/search",
+                json={"keyword": "legacy retry concurrency", "scope": "web"},
+            )
+        self.assertEqual(searched.status_code, 200, searched.text)
+        results = searched.json()["results"]
+
+        async def initial_failure(url, **_kwargs):
+            raise RuntimeError(f"Initial fetch failed for {url}")
+
+        with patch(
+            "pldr_api.intake.validate_public_http_url", lambda url, resolve=True: url
+        ), patch(
+            "pldr_api.intake.fetch_public_text", new=initial_failure
+        ):
+            selected = self.client.post(
+                "/pldr-api/v1/search/select",
+                json={"result_ids": [result["id"] for result in results]},
+            )
+        self.assertEqual(selected.status_code, 200, selected.text)
+        intake_ids = [entry["intake_item_id"] for entry in selected.json()["results"]]
+
+        for index, fetch_outcome in enumerate(("success", "failure")):
+            result_id = results[index]["id"]
+            intake_id = intake_ids[index]
+            with SessionLocal() as session:
+                selection = session.query(SearchSelection).filter_by(
+                    intake_item_id=intake_id
+                ).one()
+                original_attempts = selection.attempt_count
+                original_events = session.query(SearchSelectionEvent).filter_by(
+                    selection_id=selection.id
+                ).count()
+                original_error = selection.intake_item.error
+
+            async def decide_during_retry_fetch(url, *, _outcome=fetch_outcome):
+                with SessionLocal() as concurrent_session:
+                    item = concurrent_session.get(IntakeItem, intake_id)
+                    assert item is not None
+                    if _outcome == "success":
+                        reject_intake(
+                            concurrent_session,
+                            item,
+                            "legacy-retry-rejector",
+                            "Rejected while successful retry fetch was awaited",
+                        )
+                    else:
+                        cancel_intake(
+                            concurrent_session,
+                            item,
+                            "legacy-retry-canceller",
+                            "Cancelled while failing retry fetch was awaited",
+                        )
+                if _outcome == "failure":
+                    raise RuntimeError("Retry fetch failed after cancellation")
+                return url, (
+                    "<html><head><title>Late retry page</title></head><body><article>"
+                    "This sufficiently long fetched page must not overwrite the analyst "
+                    "decision that committed while the retry request was waiting."
+                    "</article></body></html>"
+                )
+
+            with patch(
+                "pldr_api.search.fetch_public_text", new=decide_during_retry_fetch
+            ), patch(
+                "pldr_api.intake.run_model_task",
+                new=AsyncMock(
+                    side_effect=AssertionError(
+                        "a superseded fetch must not start candidate generation"
+                    )
+                ),
+            ):
+                retried = self.client.post(
+                    f"/pldr-api/v1/search/results/{result_id}/retry"
+                )
+            self.assertEqual(retried.status_code, 409, retried.text)
+            self.assertIn("changed while work was running", retried.json()["detail"])
+
+            with SessionLocal() as session:
+                item = session.get(IntakeItem, intake_id)
+                selection = session.query(SearchSelection).filter_by(
+                    intake_item_id=intake_id
+                ).one()
+                assert item is not None
+                expected_status = "rejected" if fetch_outcome == "success" else "cancelled"
+                self.assertEqual(item.status, expected_status)
+                self.assertEqual(
+                    item.disposition,
+                    "reject" if fetch_outcome == "success" else "cancel",
+                )
+                self.assertEqual(
+                    item.error,
+                    original_error
+                    if fetch_outcome == "success"
+                    else "Cancelled while failing retry fetch was awaited",
+                )
+                self.assertEqual(item.raw_snapshot, "")
+                self.assertEqual(item.extracted_snapshot, "")
+                self.assertEqual(selection.attempt_count, original_attempts)
+                self.assertEqual(selection.status, "failed")
+                self.assertEqual(
+                    session.query(SearchSelectionEvent).filter_by(
+                        selection_id=selection.id
+                    ).count(),
+                    original_events,
+                )
+
+        generation_result_id = results[2]["id"]
+        generation_intake_id = intake_ids[2]
+        with SessionLocal() as session:
+            item = session.get(IntakeItem, generation_intake_id)
+            selection = session.query(SearchSelection).filter_by(
+                intake_item_id=generation_intake_id
+            ).one()
+            assert item is not None
+            item.status = "generation_failed"
+            item.candidate_mode = "failed"
+            item.candidate_error = "Model unavailable before retry"
+            item.updated_at = item.updated_at
+            selection.status = "generation_failed"
+            original_attempts = selection.attempt_count
+            original_events = session.query(SearchSelectionEvent).filter_by(
+                selection_id=selection.id
+            ).count()
+            session.commit()
+
+        rejected_after_generation = False
+
+        def reject_before_retry_trace(session, item_id, *, action):
+            nonlocal rejected_after_generation
+            if action == "recording this search retry" and not rejected_after_generation:
+                rejected_after_generation = True
+                with SessionLocal() as concurrent_session:
+                    item = concurrent_session.get(IntakeItem, item_id)
+                    assert item is not None
+                    reject_intake(
+                        concurrent_session,
+                        item,
+                        "post-generation-retry-analyst",
+                        "Rejected after retry generation and before trace commit",
+                    )
+            return lock_intake_for_mutation(session, item_id, action=action)
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            new=AsyncMock(return_value={"mode": "fallback"}),
+        ), patch(
+            "pldr_api.search.lock_intake_for_mutation",
+            new=reject_before_retry_trace,
+        ):
+            retried_generation = self.client.post(
+                f"/pldr-api/v1/search/results/{generation_result_id}/retry"
+            )
+        self.assertTrue(rejected_after_generation)
+        self.assertEqual(retried_generation.status_code, 409, retried_generation.text)
+        self.assertIn(
+            "changed while work was running", retried_generation.json()["detail"]
+        )
+        with SessionLocal() as session:
+            item = session.get(IntakeItem, generation_intake_id)
+            selection = session.query(SearchSelection).filter_by(
+                intake_item_id=generation_intake_id
+            ).one()
+            assert item is not None
+            self.assertEqual(item.status, "rejected")
+            self.assertEqual(item.disposition, "reject")
+            self.assertTrue(item.candidates)
+            self.assertTrue(
+                all(candidate.disposition == "rejected" for candidate in item.candidates)
+            )
+            self.assertEqual(selection.attempt_count, original_attempts)
+            self.assertEqual(
+                session.query(SearchSelectionEvent).filter_by(
+                    selection_id=selection.id
+                ).count(),
+                original_events,
+            )
+            self.assertNotIn(
+                "retry_succeeded",
+                [event.outcome for event in selection.events],
+            )
+
+    def test_archived_intake_blocks_search_writes_until_restored(self):
+        investigation_id = self.create_investigation("Archive reference topic")
+
+        async def backend(_, request):
+            return BackendSearchResponse(
+                "searxng", "searxng:web", [self.hit(88)], False
+            )
+
+        with patch("pldr_api.search.request_search", new=backend):
+            searched = self.client.post(
+                "/pldr-api/v1/search",
+                json={
+                    "keyword": "archive reference",
+                    "investigation_id": investigation_id,
+                },
+            )
+        self.assertEqual(searched.status_code, 200, searched.text)
+        result_id = searched.json()["results"][0]["id"]
+
+        selected = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={
+                "result_ids": [result_id],
+                "request_id": "archive-reference-first",
+                "investigation_id": investigation_id,
+            },
+        )
+        self.assertEqual(selected.status_code, 202, selected.text)
+        first_result = selected.json()["results"][0]
+        intake_id = first_result["intake_item_id"]
+        # Queued/running work is deliberately protected from archival. End the
+        # queued task through the public analyst action, then prove archival is
+        # metadata-only for the resulting durable selection graph.
+        cancelled = self.client.post(
+            f"/pldr-api/v1/intake/{intake_id}/cancel",
+            json={
+                "analyst": "search-archive-test",
+                "reason": "Stop processing before hiding this material",
+            },
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        original_status = cancelled.json()["intake_item"]["status"]
+
+        archived = self.client.post(
+            f"/pldr-api/v1/intake/{intake_id}/archive",
+            json={
+                "analyst": "search-archive-test",
+                "reason": "Hide this material from the active review queue",
+            },
+        )
+        self.assertEqual(archived.status_code, 200, archived.text)
+        reopened = self.client.get(f"/pldr-api/v1/intake/{intake_id}")
+        self.assertEqual(reopened.status_code, 200, reopened.text)
+        self.assertTrue(reopened.json()["archived"])
+        self.assertEqual(reopened.json()["status"], original_status)
+
+        with SessionLocal() as session:
+            from pldr_api.models import (
+                ProcessingBatch,
+                ReviewTask,
+                SearchSelection,
+                SearchSelectionEvent,
+            )
+
+            before_counts = {
+                "batches": session.query(ProcessingBatch).count(),
+                "tasks": session.query(ReviewTask).count(),
+                "events": session.query(SearchSelectionEvent).count(),
+                "selections": session.query(SearchSelection).count(),
+            }
+
+        selected_again = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={
+                "result_ids": [result_id],
+                "request_id": "archive-reference-second",
+                "investigation_id": investigation_id,
+            },
+        )
+        self.assertEqual(selected_again.status_code, 409, selected_again.text)
+        self.assertIn("Restore", selected_again.json()["detail"])
+        legacy_select = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={"result_ids": [result_id]},
+        )
+        self.assertEqual(legacy_select.status_code, 409, legacy_select.text)
+        self.assertIn("Restore", legacy_select.json()["detail"])
+        legacy_retry = self.client.post(
+            f"/pldr-api/v1/search/results/{result_id}/retry"
+        )
+        self.assertEqual(legacy_retry.status_code, 409, legacy_retry.text)
+        self.assertIn("Restore", legacy_retry.json()["detail"])
+
+        with SessionLocal() as session:
+            from pldr_api.models import (
+                IntakeItem,
+                ProcessingBatch,
+                ReviewTask,
+                SearchSelection,
+                SearchSelectionEvent,
+            )
+
+            selections = session.query(SearchSelection).all()
+            self.assertEqual(len(selections), 1)
+            self.assertEqual(selections[0].intake_item_id, intake_id)
+            self.assertEqual(selections[0].result_id, result_id)
+            self.assertEqual(session.query(IntakeItem).count(), 1)
+            self.assertEqual(session.query(ProcessingBatch).count(), before_counts["batches"])
+            self.assertEqual(session.query(ReviewTask).count(), before_counts["tasks"])
+            self.assertEqual(
+                session.query(SearchSelectionEvent).count(), before_counts["events"]
+            )
+            self.assertEqual(session.query(SearchSelection).count(), before_counts["selections"])
+            self.assertEqual(
+                session.query(ReviewTask)
+                .filter(ReviewTask.status.in_(["queued", "fetching", "generating"]))
+                .count(),
+                0,
+            )
+
+        restored = self.client.post(f"/pldr-api/v1/intake/{intake_id}/restore")
+        self.assertEqual(restored.status_code, 200, restored.text)
+        selected_after_restore = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={
+                "result_ids": [result_id],
+                "request_id": "archive-reference-after-restore",
+                "investigation_id": investigation_id,
+            },
+        )
+        self.assertEqual(
+            selected_after_restore.status_code, 202, selected_after_restore.text
+        )
+        self.assertEqual(
+            selected_after_restore.json()["results"][0]["intake_item_id"],
+            intake_id,
+        )
+
+    def test_archived_query_is_filtered_without_deleting_its_graph(self):
+        investigation_id = self.create_investigation("Archived query topic")
+
+        async def backend(_, request):
+            return BackendSearchResponse(
+                "searxng", "searxng:web", [self.hit(89)], False
+            )
+
+        with patch("pldr_api.search.request_search", new=backend):
+            searched = self.client.post(
+                "/pldr-api/v1/search",
+                json={
+                    "keyword": "query archive graph",
+                    "investigation_id": investigation_id,
+                },
+            )
+        self.assertEqual(searched.status_code, 200, searched.text)
+        run_id = searched.json()["query_run_id"]
+        result_id = searched.json()["results"][0]["id"]
+        selected = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={
+                "result_ids": [result_id],
+                "request_id": "query-archive-selection",
+                "investigation_id": investigation_id,
+            },
+        )
+        self.assertEqual(selected.status_code, 202, selected.text)
+        intake_id = selected.json()["results"][0]["intake_item_id"]
+
+        archived = self.client.post(
+            f"/pldr-api/v1/search/runs/{run_id}/archive"
+        )
+        self.assertEqual(archived.status_code, 200, archived.text)
+        self.assertEqual(
+            archived.json()["query_run"]["archive_reason"],
+            "Removed from active search history",
+        )
+
+        default_history = self.client.get(
+            "/pldr-api/v1/search/runs",
+            params={"investigation_id": investigation_id},
+        )
+        archived_history = self.client.get(
+            "/pldr-api/v1/search/runs",
+            params={
+                "investigation_id": investigation_id,
+                "visibility": "archived",
+            },
+        )
+        all_history = self.client.get(
+            "/pldr-api/v1/search/runs",
+            params={"investigation_id": investigation_id, "visibility": "all"},
+        )
+        self.assertEqual(default_history.status_code, 200, default_history.text)
+        self.assertEqual(default_history.json()["count"], 0)
+        self.assertEqual(archived_history.status_code, 200, archived_history.text)
+        self.assertEqual(archived_history.json()["count"], 1)
+        self.assertEqual(archived_history.json()["runs"][0]["query_run_id"], run_id)
+        self.assertTrue(archived_history.json()["runs"][0]["archived"])
+        self.assertEqual(all_history.status_code, 200, all_history.text)
+        self.assertEqual(all_history.json()["count"], 1)
+
+        detail = self.client.get(
+            f"/pldr-api/v1/search/runs/{run_id}",
+            params={"investigation_id": investigation_id},
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertTrue(detail.json()["archived"])
+        self.assertEqual(detail.json()["results"][0]["id"], result_id)
+        self.assertEqual(
+            detail.json()["results"][0]["selection"]["intake_item_id"], intake_id
+        )
+
+        restored = self.client.post(
+            f"/pldr-api/v1/search/runs/{run_id}/restore"
+        )
+        self.assertEqual(restored.status_code, 200, restored.text)
+        visible_again = self.client.get(
+            "/pldr-api/v1/search/runs",
+            params={"investigation_id": investigation_id},
+        )
+        self.assertEqual(visible_again.status_code, 200, visible_again.text)
+        self.assertEqual(visible_again.json()["count"], 1)
+        self.assertFalse(visible_again.json()["runs"][0]["archived"])
+
+        with SessionLocal() as session:
+            from pldr_api.models import (
+                DecisionLog,
+                IntakeItem,
+                SearchQueryRun,
+                SearchResult,
+                SearchSelection,
+            )
+
+            self.assertEqual(session.query(SearchQueryRun).count(), 1)
+            self.assertEqual(session.query(SearchResult).count(), 1)
+            self.assertEqual(session.query(SearchSelection).count(), 1)
+            self.assertEqual(session.query(IntakeItem).count(), 1)
+            action_reasons = {
+                entry.action: entry.detail_json["reason"]
+                for entry in session.query(DecisionLog).filter(
+                    DecisionLog.object_type == "search_query",
+                    DecisionLog.object_id == run_id,
+                    DecisionLog.action.in_(
+                        ["search.query_archived", "search.query_restored"]
+                    ),
+                )
+            }
+            self.assertEqual(
+                action_reasons,
+                {
+                    "search.query_archived": "Removed from active search history",
+                    "search.query_restored": "Restored to active search history",
+                },
+            )
+
     def test_searxng_operator_page_is_not_truncated_or_stranded(self):
         import asyncio
         from pldr_api.schemas import ExternalSearchRequest

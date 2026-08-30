@@ -4,7 +4,7 @@ import hashlib
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,9 +13,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .database import SessionLocal, get_session
+from .errors import (
+    ArchivedIntakeError,
+    IntakeMutationConflictError,
+    IntakeScopeError,
+    UnlinkedReviewTaskError,
+)
 from .extraction import canonicalize_url, content_hash, extract_page
 from .importers import fetch_public_text_response
-from .intake import generate_candidates
+from .intake import (
+    generate_candidates,
+    lock_intake_for_mutation,
+    lock_intake_for_status_sync,
+)
 from .models import (
     Claim,
     CollectionRun,
@@ -38,6 +48,7 @@ from .models import (
 )
 from .repository import serialize_event_card
 from .schemas import (
+    ArchiveRequest,
     IntakeConfirmationRequest,
     InvestigationCreate,
     InvestigationLinkRequest,
@@ -56,8 +67,37 @@ TERMINAL_TASK_STATUSES = {"ready", "failed", "confirmed", "rejected"}
 DEFAULT_TASK_LEASE_SECONDS = 180
 
 
+def _task_has_current_intake_link():
+    return (
+        select(InvestigationLink.id)
+        .where(
+            InvestigationLink.investigation_id == ReviewTask.investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == ReviewTask.intake_item_id,
+        )
+        .exists()
+    )
+
+
+def _task_intake_is_visible():
+    return (
+        select(IntakeItem.id)
+        .where(
+            IntakeItem.id == ReviewTask.intake_item_id,
+            IntakeItem.archived_at.is_(None),
+        )
+        .exists()
+    )
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _require_unarchived_intake(
+    session: Session, item: IntakeItem, *, action: str
+) -> None:
+    lock_intake_for_mutation(session, item.id, action=action)
 
 
 def iso(value: datetime | None) -> str | None:
@@ -237,6 +277,12 @@ def link_object(
     metadata: dict[str, Any] | None = None,
     action: str = "object.linked",
 ) -> tuple[InvestigationLink, bool]:
+    if object_type == "intake":
+        item = session.get(IntakeItem, object_id)
+        if item is not None:
+            _require_unarchived_intake(
+                session, item, action="linking it to an investigation"
+            )
     existing = session.scalar(
         select(InvestigationLink).where(
             InvestigationLink.investigation_id == investigation_id,
@@ -279,6 +325,21 @@ def _has_any_link(session: Session, object_type: str, object_id: str) -> bool:
             .where(
                 InvestigationLink.object_type == object_type,
                 InvestigationLink.object_id == object_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
+
+
+def _has_any_intake_removal_history(session: Session, item_id: str) -> bool:
+    return (
+        session.scalar(
+            select(DecisionLog.id)
+            .where(
+                DecisionLog.action == "intake.removed_from_investigation",
+                DecisionLog.object_type == "intake",
+                DecisionLog.object_id == item_id,
             )
             .limit(1)
         )
@@ -338,6 +399,17 @@ def bootstrap_legacy_investigations(session: Session) -> dict[str, int]:
         for object_id in session.scalars(select(model.id)):
             if _has_any_link(session, object_type, object_id):
                 continue
+            if object_type == "intake":
+                item = session.get(IntakeItem, object_id)
+                if item is not None and item.archived_at is not None:
+                    # Global archive is an explicit inbox decision, not a
+                    # legacy row awaiting automatic classification.
+                    continue
+                if _has_any_intake_removal_history(session, object_id):
+                    # A user may intentionally remove an item from its last
+                    # topic. Do not silently undo that decision by moving it
+                    # into the unclassified inbox on restart.
+                    continue
             _, created = link_object(
                 session,
                 unclassified.id,
@@ -363,6 +435,8 @@ def bootstrap_legacy_investigations(session: Session) -> dict[str, int]:
         "cancelled": "rejected",
     }
     for item in session.scalars(select(IntakeItem)):
+        if item.archived_at is not None:
+            continue
         if session.scalar(
             select(InvestigationLink.id).where(
                 InvestigationLink.investigation_id == unclassified.id,
@@ -508,6 +582,17 @@ def serialize_investigation(
             .order_by(InvestigationLink.created_at.asc(), InvestigationLink.id.asc())
         )
     )
+    visible_links: list[InvestigationLink] = []
+    for link in links:
+        if link.object_type == "intake":
+            item = session.get(IntakeItem, link.object_id)
+            if item is None or item.archived_at is not None:
+                continue
+        elif link.object_type == "search_query":
+            run = session.get(SearchQueryRun, link.object_id)
+            if run is None or run.archived_at is not None:
+                continue
+        visible_links.append(link)
     counts: dict[str, int] = {
         "search_queries": 0,
         "intake_items": 0,
@@ -520,7 +605,7 @@ def serialize_investigation(
         "collection_target": "collection_targets",
         "event": "events",
     }
-    for link in links:
+    for link in visible_links:
         key = count_key.get(link.object_type)
         if key:
             counts[key] += 1
@@ -532,6 +617,8 @@ def serialize_investigation(
                 .where(
                     ReviewTask.investigation_id == investigation.id,
                     ReviewTask.status == value,
+                    _task_has_current_intake_link(),
+                    _task_intake_is_visible(),
                 )
             )
             or 0
@@ -574,7 +661,7 @@ def serialize_investigation(
         "collection_targets": [],
         "events": [],
     }
-    for link in links:
+    for link in visible_links:
         if link.object_type == "search_query":
             run = session.get(SearchQueryRun, link.object_id)
             if run is not None:
@@ -624,7 +711,7 @@ def serialize_investigation(
                 # the public signal that API clients must receive as null.
                 grouped["events"].append(serialize_event_card(event))
     payload.update(grouped)
-    payload["links"] = [serialize_link(link) for link in links]
+    payload["links"] = [serialize_link(link) for link in visible_links]
     report_entries = list(
         session.scalars(
             select(DecisionLog)
@@ -826,10 +913,33 @@ def serialize_task(
             from .intake import serialize_intake, serialize_intake_summary
 
             payload["intake_item"] = (
-                serialize_intake(item)
+                serialize_intake(item, session=session)
                 if include_intake_detail
-                else serialize_intake_summary(item)
+                else serialize_intake_summary(item, session=session)
             )
+            has_link = _object_in_investigation(
+                session,
+                task.investigation_id,
+                "intake",
+                item.id,
+            )
+            payload["membership"] = "active" if has_link else "removed"
+            payload["removed_from_investigation"] = not has_link
+            payload["intake_archived"] = item.archived_at is not None
+            if (
+                item.archived_at is not None
+                or item.status == "confirmed"
+                or task.status in ACTIVE_TASK_STATUSES
+            ):
+                scoped_actions: list[str] = []
+            elif has_link:
+                scoped_actions = ["remove_from_investigation"]
+            else:
+                scoped_actions = ["restore"]
+            # Keep these topic-membership actions on the task. The embedded
+            # intake item's allowed_actions continue to describe only global
+            # inbox archive/restore semantics.
+            payload["allowed_actions"] = scoped_actions
             if item.candidate_mode in {"fallback", "fallback-after-error"}:
                 payload["degraded"] = True
             if item.candidate_mode == "fallback-after-error":
@@ -917,6 +1027,7 @@ def _record_search_selection_event(
     review["external_search"] = event.trace_json
     review["external_search_history"] = history
     selection.intake_item.review = review
+    selection.intake_item.updated_at = utcnow()
     return event
 
 
@@ -961,6 +1072,163 @@ def _candidate_fallback_class(item: IntakeItem) -> str | None:
     if item.candidate_mode == "fallback-after-error":
         return "model_fallback"
     return None
+
+
+def _task_state_for_intake(
+    item: IntakeItem,
+) -> tuple[str, str | None, str | None, str]:
+    task_status = _task_terminal_status_for_item(item) or "queued"
+    if task_status == "ready":
+        error_class = _candidate_fallback_class(item)
+        error_message = item.candidate_error if error_class else None
+        selection_status = "candidate_ready"
+    elif task_status == "failed":
+        error_class = "intake_failed"
+        error_message = item.error or item.candidate_error
+        selection_status = item.status
+    elif task_status == "queued":
+        error_class = None
+        error_message = None
+        selection_status = item.status
+    else:
+        error_class = None
+        error_message = None
+        selection_status = item.status
+    return task_status, error_class, error_message, selection_status
+
+
+def sync_review_task_with_intake(
+    session: Session,
+    task: ReviewTask,
+    item: IntakeItem,
+    *,
+    actor: str,
+    include_active: bool = False,
+) -> bool:
+    """Make a durable task reflect its Intake without reviving active work."""
+    if task.status in ACTIVE_TASK_STATUSES and not include_active:
+        return False
+    desired, error_class, error_message, selection_status = _task_state_for_intake(item)
+    now = utcnow()
+    changed = False
+    if task.status != desired:
+        if desired in TERMINAL_TASK_STATUSES:
+            _mark_task_terminal(
+                session,
+                task,
+                desired,
+                actor=actor,
+                error_class=error_class,
+                error_message=error_message,
+                detail={"synchronized_from_intake_status": item.status},
+            )
+        else:
+            task.status = "queued"
+            task.active_key = _active_task_key(
+                task.investigation_id,
+                str((task.payload_json or {}).get("result_fingerprint") or f"intake:{item.id}"),
+            )
+            task.queued_at = now
+            task.started_at = None
+            task.completed_at = None
+            task.lease_owner = None
+            task.lease_expires_at = None
+            task.error_class = None
+            task.error_message = None
+            task.updated_at = now
+            record_action(
+                session,
+                task.investigation_id,
+                "task.queued",
+                actor=actor,
+                object_type=task.subject_type,
+                object_id=task.subject_id,
+                task_id=task.id,
+                detail={
+                    "intake_item_id": item.id,
+                    "synchronized_from_intake_status": item.status,
+                },
+            )
+            _update_task_batches(session, task)
+        changed = True
+    else:
+        expected_active_key = (
+            _active_task_key(
+                task.investigation_id,
+                str((task.payload_json or {}).get("result_fingerprint") or f"intake:{item.id}"),
+            )
+            if desired == "queued"
+            else None
+        )
+        for field, value in (
+            ("active_key", expected_active_key),
+            ("error_class", error_class),
+            ("error_message", error_message[:4000] if error_message else None),
+        ):
+            if getattr(task, field) != value:
+                setattr(task, field, value)
+                changed = True
+        if desired in TERMINAL_TASK_STATUSES and task.completed_at is None:
+            task.completed_at = now
+            changed = True
+        if changed:
+            task.updated_at = now
+            _update_task_batches(session, task)
+    payload = dict(task.payload_json or {})
+    if desired == "ready" and payload.get("candidate_mode") != item.candidate_mode:
+        payload["candidate_mode"] = item.candidate_mode
+        task.payload_json = payload
+        task.updated_at = now
+        changed = True
+    selection = (
+        session.get(SearchSelection, task.selection_id) if task.selection_id else None
+    )
+    if selection is not None:
+        selection_outcome = (
+            "ready"
+            if desired == "ready"
+            else "failed"
+            if desired == "failed"
+            else selection_status
+        )
+        selection_error = error_message[:4000] if error_message else None
+        if (
+            selection.status != selection_status
+            or selection.outcome != selection_outcome
+            or selection.last_error != selection_error
+        ):
+            selection.status = selection_status
+            selection.outcome = selection_outcome
+            selection.last_error = selection_error
+            selection.updated_at = now
+            changed = True
+    return changed
+
+
+def sync_linked_review_tasks_for_intake(
+    session: Session,
+    item: IntakeItem,
+    *,
+    actor: str,
+    investigation_id: str | None = None,
+) -> int:
+    query = select(ReviewTask).where(
+        ReviewTask.intake_item_id == item.id,
+        _task_has_current_intake_link(),
+    )
+    if investigation_id is not None:
+        query = query.where(ReviewTask.investigation_id == investigation_id)
+    changed = 0
+    for task in session.scalars(query):
+        changed += int(
+            sync_review_task_with_intake(
+                session,
+                task,
+                item,
+                actor=actor,
+            )
+        )
+    return changed
 
 
 def _active_task_key(investigation_id: str, fingerprint: str) -> str:
@@ -1086,6 +1354,21 @@ def enqueue_search_result_tasks(session: Session, request: Any) -> dict[str, Any
                 raise ValueError("request_id was already used for another investigation")
             if expected_ids != set(requested_ids):
                 raise ValueError("request_id was already used with different search results")
+            archived_item_id = session.scalar(
+                select(IntakeItem.id)
+                .join(ReviewTask, ReviewTask.intake_item_id == IntakeItem.id)
+                .join(
+                    ProcessingBatchEntry,
+                    ProcessingBatchEntry.task_id == ReviewTask.id,
+                )
+                .where(
+                    ProcessingBatchEntry.batch_id == replay.id,
+                    IntakeItem.archived_at.is_not(None),
+                )
+                .limit(1)
+            )
+            if archived_item_id is not None:
+                raise ArchivedIntakeError("reusing this search selection")
             return _batch_response(session, replay)
 
     investigation, _ = resolve_investigation_context(
@@ -1148,6 +1431,9 @@ def enqueue_search_result_tasks(session: Session, request: Any) -> dict[str, Any
             item = selection.intake_item
             selection.result_id = result.id
             selection.updated_at = utcnow()
+        _require_unarchived_intake(
+            session, item, action="selecting this search result"
+        )
         _record_search_selection_event(
             session, selection, result, outcome="queued" if item.status == "queued" else "linked"
         )
@@ -1299,6 +1585,9 @@ def ensure_review_task_for_intake(
     payload_extra: dict[str, Any] | None = None,
 ) -> tuple[ReviewTask, bool]:
     """Idempotently expose a linked intake item in an investigation's task API."""
+    _require_unarchived_intake(
+        session, item, action="creating or reusing its review task"
+    )
     if item.status == "confirmed" and item.final_event_id:
         if session.get(Event, item.final_event_id) is not None:
             link_object(
@@ -1320,6 +1609,12 @@ def ensure_review_task_for_intake(
         .limit(1)
     )
     if existing is not None:
+        sync_review_task_with_intake(
+            session,
+            existing,
+            item,
+            actor=actor,
+        )
         return existing, False
     selection = session.scalar(
         select(SearchSelection).where(SearchSelection.intake_item_id == item.id)
@@ -1404,6 +1699,10 @@ def attach_collection_intake_to_investigations(
     outcome: str,
 ) -> int:
     """Propagate a new monitored version to every topic containing its target."""
+    if session.scalar(
+        select(IntakeItem.archived_at).where(IntakeItem.id == item.id)
+    ) is not None:
+        return 0
     investigation_ids = list(
         session.scalars(
             select(InvestigationLink.investigation_id).where(
@@ -1414,22 +1713,27 @@ def attach_collection_intake_to_investigations(
     )
     created_count = 0
     for investigation_id in investigation_ids:
-        link_object(
-            session,
-            investigation_id,
-            "intake",
-            item.id,
-            actor="system:collector",
-            metadata={"target_id": target_id, "run_id": run_id, "outcome": outcome},
-            action="collection.version_linked",
-        )
-        _, created = ensure_review_task_for_intake(
-            session,
-            investigation_id,
-            item,
-            actor="system:collector",
-            payload_extra={"target_id": target_id, "run_id": run_id, "outcome": outcome},
-        )
+        try:
+            link_object(
+                session,
+                investigation_id,
+                "intake",
+                item.id,
+                actor="system:collector",
+                metadata={"target_id": target_id, "run_id": run_id, "outcome": outcome},
+                action="collection.version_linked",
+            )
+            _, created = ensure_review_task_for_intake(
+                session,
+                investigation_id,
+                item,
+                actor="system:collector",
+                payload_extra={"target_id": target_id, "run_id": run_id, "outcome": outcome},
+            )
+        except ArchivedIntakeError:
+            # Collection history remains valid, but globally archived material
+            # must not be revived into a topic or hidden worker queue.
+            continue
         created_count += int(created)
     return created_count
 
@@ -1462,24 +1766,29 @@ def attach_existing_collection_versions_to_investigation(
             continue
         seen.add(item_id)
         item = session.get(IntakeItem, item_id)
-        if item is None:
+        if item is None or session.scalar(
+            select(IntakeItem.archived_at).where(IntakeItem.id == item.id)
+        ) is not None:
             continue
-        link_object(
-            session,
-            investigation_id,
-            "intake",
-            item.id,
-            actor=actor,
-            metadata={"target_id": target_id, "run_id": run.id, "outcome": run.outcome},
-            action="collection.version_linked",
-        )
-        _, created = ensure_review_task_for_intake(
-            session,
-            investigation_id,
-            item,
-            actor=actor,
-            payload_extra={"target_id": target_id, "run_id": run.id, "outcome": run.outcome},
-        )
+        try:
+            link_object(
+                session,
+                investigation_id,
+                "intake",
+                item.id,
+                actor=actor,
+                metadata={"target_id": target_id, "run_id": run.id, "outcome": run.outcome},
+                action="collection.version_linked",
+            )
+            _, created = ensure_review_task_for_intake(
+                session,
+                investigation_id,
+                item,
+                actor=actor,
+                payload_extra={"target_id": target_id, "run_id": run.id, "outcome": run.outcome},
+            )
+        except ArchivedIntakeError:
+            continue
         created_count += int(created)
     return created_count
 
@@ -1491,6 +1800,15 @@ def link_legacy_search_selection(
     intake_item_id: str,
     actor: str = "system:legacy-api",
 ) -> None:
+    item = session.get(IntakeItem, intake_item_id)
+    if item is None:
+        raise ValueError("Selected intake item not found")
+    session.rollback()
+    item = lock_intake_for_mutation(
+        session,
+        intake_item_id,
+        action="linking this search selection",
+    )
     investigation, _ = resolve_investigation_context(
         session,
         investigation_id=None,
@@ -1515,15 +1833,13 @@ def link_legacy_search_selection(
         actor=actor,
         action="search.result_selected",
     )
-    item = session.get(IntakeItem, intake_item_id)
-    if item is not None:
-        ensure_review_task_for_intake(
-            session,
-            investigation.id,
-            item,
-            actor=actor,
-            payload_extra={"legacy_api": True},
-        )
+    ensure_review_task_for_intake(
+        session,
+        investigation.id,
+        item,
+        actor=actor,
+        payload_extra={"legacy_api": True},
+    )
 
 
 def recover_expired_review_task_leases(
@@ -1572,17 +1888,42 @@ def claim_next_review_task(
     now = now or utcnow()
     recover_expired_review_task_leases(session, now=now)
     while True:
-        task_id = session.scalar(
-            select(ReviewTask.id)
-            .where(ReviewTask.status == "queued")
+        candidate = session.execute(
+            select(ReviewTask.id, ReviewTask.intake_item_id)
+            .where(
+                ReviewTask.status == "queued",
+                _task_has_current_intake_link(),
+                _task_intake_is_visible(),
+            )
             .order_by(ReviewTask.queued_at.asc(), ReviewTask.id.asc())
             .limit(1)
-        )
-        if task_id is None:
+        ).first()
+        if candidate is None:
             return None
+        task_id, intake_item_id = candidate
+        # Make the Intake fence the first write after ending the candidate read
+        # snapshot. Archive either commits first (and this claim is skipped) or
+        # waits until the fetching task is committed and is then rejected.
+        session.rollback()
+        if not intake_item_id:
+            continue
+        try:
+            lock_intake_for_mutation(
+                session,
+                intake_item_id,
+                action="claiming its review task",
+            )
+        except ArchivedIntakeError:
+            session.rollback()
+            continue
         claimed = session.execute(
             update(ReviewTask)
-            .where(ReviewTask.id == task_id, ReviewTask.status == "queued")
+            .where(
+                ReviewTask.id == task_id,
+                ReviewTask.status == "queued",
+                _task_has_current_intake_link(),
+                _task_intake_is_visible(),
+            )
             .values(
                 status="fetching",
                 started_at=now,
@@ -1702,16 +2043,173 @@ def _populate_intake_from_fetch(item: IntakeItem, fetched: Any) -> None:
     item.updated_at = utcnow()
 
 
+def _require_actionable_review_task(session: Session, task: ReviewTask) -> None:
+    if not task.intake_item_id:
+        raise ValueError("Queued review task has no intake item")
+    item_row = session.execute(
+        select(IntakeItem.id, IntakeItem.archived_at).where(
+            IntakeItem.id == task.intake_item_id
+        )
+    ).first()
+    if item_row is None:
+        raise ValueError("Queued intake item is missing")
+    if item_row.archived_at is not None:
+        raise ArchivedIntakeError("processing its review task")
+    has_link = session.scalar(
+        select(InvestigationLink.id)
+        .where(
+            InvestigationLink.investigation_id == task.investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == task.intake_item_id,
+        )
+        .limit(1)
+    )
+    if has_link is None:
+        raise UnlinkedReviewTaskError()
+
+
+def _converge_task_with_terminal_intake(
+    session: Session,
+    *,
+    item: IntakeItem,
+    task: ReviewTask,
+    selection: SearchSelection | None,
+    actor: str,
+) -> bool:
+    """Preserve an analyst terminal decision when stale worker work completes."""
+    if item.status == "confirmed":
+        selection_status = "confirmed"
+        task_status = "confirmed"
+    elif item.status in {"rejected", "cancelled"}:
+        selection_status = item.status
+        task_status = "rejected"
+    else:
+        return False
+    if selection is not None:
+        selection.status = selection_status
+        selection.outcome = selection_status
+        selection.last_error = None
+        selection.updated_at = utcnow()
+    if task.status != task_status:
+        _mark_task_terminal(session, task, task_status, actor=actor)
+    return True
+
+
+def _converge_fresh_terminal_task(
+    session: Session,
+    *,
+    task_id: str,
+    intake_item_id: str,
+    actor: str,
+) -> ReviewTask | None:
+    """Converge task/selection under a fence that also covers archived Intake."""
+    session.rollback()
+    item = lock_intake_for_status_sync(session, intake_item_id)
+    task = session.get(ReviewTask, task_id, populate_existing=True)
+    if task is None:
+        raise RuntimeError("Review task disappeared while converging its status")
+    if task.intake_item_id != item.id:
+        raise RuntimeError("Review task Intake changed while converging its status")
+    selection = (
+        session.get(SearchSelection, task.selection_id, populate_existing=True)
+        if task.selection_id
+        else None
+    )
+    if not _converge_task_with_terminal_intake(
+        session,
+        item=item,
+        task=task,
+        selection=selection,
+        actor=actor,
+    ):
+        session.rollback()
+        return None
+    session.commit()
+    return task
+
+
+def _review_intake_baseline(item: IntakeItem) -> tuple[str, str | None]:
+    return item.status, iso(item.updated_at)
+
+
+def _require_review_intake_baseline(
+    item: IntakeItem,
+    baseline: tuple[str, str | None],
+    *,
+    action: str,
+) -> None:
+    if _review_intake_baseline(item) != baseline:
+        raise IntakeMutationConflictError(action)
+
+
 async def execute_claimed_review_task(task_id: str) -> ReviewTask:
     """Process exactly one task; all failures are persisted and never escape the batch."""
     with SessionLocal() as session:
         task = session.get(ReviewTask, task_id)
         if task is None:
             raise ValueError("Review task not found")
+        actor = f"collector:{task.lease_owner or 'unknown'}"
+        if task.status in {"confirmed", "rejected"}:
+            # The claim may have committed immediately before an analyst
+            # disposition closed the task in another transaction. Treat that
+            # handoff as an idempotent completion instead of killing the loop,
+            # and reconcile its search selection when the Intake remains visible.
+            if task.intake_item_id:
+                intake_item_id = task.intake_item_id
+                session.rollback()
+                try:
+                    item = lock_intake_for_mutation(
+                        session,
+                        intake_item_id,
+                        action="finalizing its terminal review task",
+                    )
+                except ArchivedIntakeError:
+                    session.rollback()
+                    task = _converge_fresh_terminal_task(
+                        session,
+                        task_id=task_id,
+                        intake_item_id=intake_item_id,
+                        actor=actor,
+                    ) or session.get(ReviewTask, task_id)
+                    if task is None:
+                        raise ValueError("Review task not found")
+                    return task
+                task = session.get(ReviewTask, task_id)
+                if task is None:
+                    raise ValueError("Review task not found")
+                selection = (
+                    session.get(SearchSelection, task.selection_id)
+                    if task.selection_id
+                    else None
+                )
+                if _converge_task_with_terminal_intake(
+                    session,
+                    item=item,
+                    task=task,
+                    selection=selection,
+                    actor=actor,
+                ):
+                    session.commit()
+            return task
         if task.status not in {"fetching", "generating"}:
             raise ValueError(f"Review task must be claimed, got {task.status}")
-        actor = f"collector:{task.lease_owner or 'unknown'}"
+        fetch_baseline: tuple[str, str | None] | None = None
         try:
+            intake_item_id = task.intake_item_id
+            if not intake_item_id:
+                raise ValueError("Queued review task has no intake item")
+            # End the task lookup snapshot and fence the Intake before the
+            # worker records any processing state. This pairs task claim with
+            # archive's active-task CAS instead of relying on stale reads.
+            session.rollback()
+            item = lock_intake_for_mutation(
+                session,
+                intake_item_id,
+                action="processing its review task",
+            )
+            task = session.get(ReviewTask, task_id)
+            if task is None:
+                raise ValueError("Review task not found")
             payload = dict(task.payload_json or {})
             result_id = payload.get("result_id")
             if result_id is None and task.subject_type == "search_result":
@@ -1728,11 +2226,9 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             if result_id and result is None:
                 raise ValueError("Search result no longer exists")
             selection = session.get(SearchSelection, task.selection_id) if task.selection_id else None
-            item = session.get(IntakeItem, task.intake_item_id) if task.intake_item_id else None
-            if item is None:
-                raise ValueError("Queued intake item is missing")
             if task.selection_id and selection is None:
                 raise ValueError("Queued search selection is missing")
+            _require_actionable_review_task(session, task)
 
             if item.status == "confirmed":
                 _mark_task_terminal(session, task, "confirmed", actor=actor)
@@ -1772,18 +2268,57 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             if task is None or item is None:
                 raise RuntimeError("Review task disappeared during processing")
+            _require_actionable_review_task(session, task)
 
             if result is not None and (
                 not item.raw_snapshot or item.status in {"queued", "failed"}
             ):
+                fetch_baseline = _review_intake_baseline(item)
                 fetched = await fetch_public_text_response(result.original_url)
+                session.rollback()
+                item = lock_intake_for_mutation(
+                    session,
+                    intake_item_id,
+                    action="processing its fetched material",
+                )
+                _require_review_intake_baseline(
+                    item,
+                    fetch_baseline,
+                    action="applying its fetched material",
+                )
+                task = session.get(ReviewTask, task_id)
+                selection = (
+                    session.get(SearchSelection, task.selection_id)
+                    if task is not None and task.selection_id
+                    else None
+                )
+                if task is None:
+                    raise RuntimeError("Review task disappeared after fetching")
+                _require_actionable_review_task(session, task)
                 _populate_intake_from_fetch(item, fetched)
             elif result is None and not item.extracted_snapshot.strip():
                 raise ValueError("Intake has no persisted extracted content to process")
+            else:
+                session.rollback()
+                item = lock_intake_for_mutation(
+                    session,
+                    intake_item_id,
+                    action="starting candidate generation",
+                )
+                task = session.get(ReviewTask, task_id)
+                selection = (
+                    session.get(SearchSelection, task.selection_id)
+                    if task is not None and task.selection_id
+                    else None
+                )
+                if task is None:
+                    raise RuntimeError("Review task disappeared before generation")
+                _require_actionable_review_task(session, task)
 
             task.status = "generating"
             task.updated_at = utcnow()
             item.status = "parsed"
+            item.updated_at = utcnow()
             record_action(
                 session,
                 task.investigation_id,
@@ -1796,6 +2331,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             _update_task_batches(session, task)
             session.commit()
+            fetch_baseline = None
             task = session.get(ReviewTask, task_id)
             item = session.get(IntakeItem, task.intake_item_id) if task else None
             selection = (
@@ -1805,6 +2341,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             if task is None or item is None:
                 raise RuntimeError("Review task disappeared before candidate generation")
+            _require_actionable_review_task(session, task)
 
             item = await generate_candidates(session, item)
             fallback_error: str | None = None
@@ -1815,6 +2352,16 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
                 item = generate_deterministic_candidates(
                     session, item, model_error=fallback_error
                 )
+            # Candidate generation commits independently. An analyst may have
+            # confirmed/rejected/cancelled the item immediately afterward, so
+            # restart and fence before writing the selection trace or terminal
+            # task state. Always derive the outcome from the refreshed item.
+            session.rollback()
+            item = lock_intake_for_mutation(
+                session,
+                intake_item_id,
+                action="finalizing its review task",
+            )
             task = session.get(ReviewTask, task_id)
             selection = (
                 session.get(SearchSelection, task.selection_id)
@@ -1823,6 +2370,34 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             if task is None:
                 raise RuntimeError("Review task disappeared after candidate generation")
+            result = (
+                session.scalar(
+                    select(SearchResult)
+                    .where(SearchResult.id == result_id)
+                    .options(selectinload(SearchResult.query_run))
+                )
+                if result_id
+                else None
+            )
+            if result_id and result is None:
+                raise ValueError("Search result no longer exists")
+            _require_actionable_review_task(session, task)
+            if _converge_task_with_terminal_intake(
+                session,
+                item=item,
+                task=task,
+                selection=selection,
+                actor=actor,
+            ):
+                session.commit()
+                return task
+            if item.status != "candidate_ready":
+                raise IntakeMutationConflictError("finalizing its review task")
+            fallback_error = (
+                item.candidate_error
+                if item.candidate_mode == "fallback-after-error"
+                else None
+            )
             task_payload = dict(task.payload_json or {})
             task_payload["candidate_mode"] = item.candidate_mode
             task.payload_json = task_payload
@@ -1844,6 +2419,73 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             )
             session.commit()
             return task
+        except (
+            ArchivedIntakeError,
+            IntakeMutationConflictError,
+            UnlinkedReviewTaskError,
+        ) as exc:
+            session.rollback()
+            task = session.get(ReviewTask, task_id)
+            if task is None:
+                raise
+            if isinstance(exc, IntakeMutationConflictError) and task.intake_item_id:
+                # The common superseding mutation is an analyst decision made
+                # while the model was running. Reacquire the Intake fence and
+                # derive the task/selection outcome from fresh state rather
+                # than overwriting that decision with a generic worker failure.
+                intake_item_id = task.intake_item_id
+                session.rollback()
+                try:
+                    item = lock_intake_for_mutation(
+                        session,
+                        intake_item_id,
+                        action="resolving its superseded review task",
+                    )
+                except ArchivedIntakeError as archived_exc:
+                    session.rollback()
+                    task = _converge_fresh_terminal_task(
+                        session,
+                        task_id=task_id,
+                        intake_item_id=intake_item_id,
+                        actor=actor,
+                    )
+                    if task is not None:
+                        # Archive may legally follow a terminal decision. The
+                        # task and selection now reflect that decision; do not
+                        # rewrite it merely because the worker noticed later.
+                        return task
+                    exc = archived_exc
+                else:
+                    task = session.get(ReviewTask, task_id)
+                    if task is None:
+                        raise RuntimeError(
+                            "Review task disappeared while resolving superseded work"
+                        )
+                    selection = (
+                        session.get(SearchSelection, task.selection_id)
+                        if task.selection_id
+                        else None
+                    )
+                    if _converge_task_with_terminal_intake(
+                        session,
+                        item=item,
+                        task=task,
+                        selection=selection,
+                        actor=actor,
+                    ):
+                        session.commit()
+                        return task
+            _mark_task_terminal(
+                session,
+                task,
+                "failed",
+                actor=actor,
+                error_class=exc.code,
+                error_message=str(exc),
+                detail={"blocked_without_intake_mutation": True},
+            )
+            session.commit()
+            return task
         except Exception as exc:
             session.rollback()
             task = session.get(ReviewTask, task_id)
@@ -1852,6 +2494,74 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             item = session.get(IntakeItem, task.intake_item_id) if task.intake_item_id else None
             selection = session.get(SearchSelection, task.selection_id) if task.selection_id else None
             if item is not None:
+                item_id = item.id
+                session.rollback()
+                try:
+                    item = lock_intake_for_mutation(
+                        session,
+                        item_id,
+                        action="recording its worker failure",
+                    )
+                except ArchivedIntakeError as archived_exc:
+                    session.rollback()
+                    task = _converge_fresh_terminal_task(
+                        session,
+                        task_id=task_id,
+                        intake_item_id=item_id,
+                        actor=actor,
+                    )
+                    if task is not None:
+                        return task
+                    task = session.get(ReviewTask, task_id)
+                    if task is None:
+                        raise
+                    _mark_task_terminal(
+                        session,
+                        task,
+                        "failed",
+                        actor=actor,
+                        error_class=archived_exc.code,
+                        error_message=str(archived_exc),
+                        detail={"blocked_without_intake_mutation": True},
+                    )
+                    session.commit()
+                    return task
+                task = session.get(ReviewTask, task_id)
+                selection = (
+                    session.get(SearchSelection, task.selection_id)
+                    if task is not None and task.selection_id
+                    else None
+                )
+                if task is None:
+                    raise RuntimeError("Review task disappeared while recording failure")
+                if _converge_task_with_terminal_intake(
+                    session,
+                    item=item,
+                    task=task,
+                    selection=selection,
+                    actor=actor,
+                ):
+                    session.commit()
+                    return task
+                if fetch_baseline is not None:
+                    try:
+                        _require_review_intake_baseline(
+                            item,
+                            fetch_baseline,
+                            action="recording its fetch failure",
+                        )
+                    except IntakeMutationConflictError as conflict_exc:
+                        _mark_task_terminal(
+                            session,
+                            task,
+                            "failed",
+                            actor=actor,
+                            error_class=conflict_exc.code,
+                            error_message=str(conflict_exc),
+                            detail={"blocked_without_intake_mutation": True},
+                        )
+                        session.commit()
+                        return task
                 item.status = "failed"
                 item.error = str(exc)[:4000]
                 item.updated_at = utcnow()
@@ -1890,6 +2600,39 @@ def retry_review_task(
     *,
     actor: str,
 ) -> ReviewTask:
+    if task.intake_item_id:
+        task_id = task.id
+        intake_item_id = task.intake_item_id
+        item = session.get(IntakeItem, intake_item_id)
+        if item is None:
+            raise ValueError("The task intake item no longer exists")
+        if not _object_in_investigation(
+            session,
+            task.investigation_id,
+            "intake",
+            intake_item_id,
+        ):
+            raise ValueError(
+                "Restore the intake item to this investigation before retrying its review task"
+            )
+        session.rollback()
+        lock_intake_for_mutation(
+            session,
+            intake_item_id,
+            action="retrying its review task",
+        )
+        task = session.get(ReviewTask, task_id)
+        if task is None:
+            raise ValueError("Review task not found")
+        if not _object_in_investigation(
+            session,
+            task.investigation_id,
+            "intake",
+            intake_item_id,
+        ):
+            raise ValueError(
+                "Restore the intake item to this investigation before retrying its review task"
+            )
     fallback_retry = task.status == "ready" and task.error_class == "model_fallback"
     if task.status != "failed" and not fallback_retry:
         raise ValueError("Only failed tasks or model-fallback tasks can be retried")
@@ -2211,6 +2954,8 @@ def _next_review_task(
                 ReviewTask.investigation_id == investigation_id,
                 ReviewTask.intake_item_id != exclude_intake_id,
                 ReviewTask.status.in_(["ready", "failed", "queued", "fetching", "generating"]),
+                _task_has_current_intake_link(),
+                _task_intake_is_visible(),
             )
             .order_by(ReviewTask.queued_at.asc(), ReviewTask.id.asc())
             .limit(500)
@@ -2301,7 +3046,8 @@ def retry_task(
                 session,
                 task,
                 actor=request.actor if request is not None else "analyst",
-            )
+            ),
+            session=session,
         )
     except ValueError as exc:
         session.rollback()
@@ -2332,13 +3078,58 @@ def get_investigation(
 def get_investigation_intake(
     investigation_id: str,
     item_id: str,
+    visibility: Literal["active", "removed", "all"] = Query(default="active"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """Load one full material only after the analyst opens it."""
     from .intake import serialize_intake
 
+    if visibility == "active":
+        item = _require_scoped_intake(session, investigation_id, item_id)
+        if item.archived_at is not None:
+            raise HTTPException(
+                status_code=404,
+                detail="Intake item not found in this investigation",
+            )
+    else:
+        if session.get(Investigation, investigation_id) is None:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+        has_link = _object_in_investigation(
+            session, investigation_id, "intake", item_id
+        )
+        has_history = (
+            _investigation_intake_task(session, investigation_id, item_id) is not None
+            or (
+                _removed_intake_link_entry(session, investigation_id, item_id)
+                is not None
+            )
+        )
+        visible_in_scope = (
+            (visibility == "removed" and not has_link and has_history)
+            or (visibility == "all" and (has_link or has_history))
+        )
+        if not visible_in_scope:
+            # A historical task or removal log is durable proof that the item
+            # previously belonged to this topic. Do not expose unrelated IDs.
+            raise HTTPException(
+                status_code=404,
+                detail="Intake item not found in this investigation",
+            )
+        item = session.scalar(
+            select(IntakeItem)
+            .where(IntakeItem.id == item_id)
+            .options(selectinload(IntakeItem.candidates))
+        )
+        if item is None or (
+            visibility == "removed" and item.archived_at is not None
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Intake item not found in this investigation",
+            )
     return serialize_intake(
-        _require_scoped_intake(session, investigation_id, item_id)
+        item,
+        session=session,
     )
 
 
@@ -2481,29 +3272,61 @@ def confirm_investigation_intake(
                 "next_action": "Enable cross-investigation reuse explicitly and review target ownership before confirming.",
             },
         )
-    scope_payload = _review_scope_payload(
-        session,
-        investigation_id,
-        request,
-        allow_cross_investigation=allow_cross_investigation,
-    )
-    if item.status != "confirmed" and allow_cross_investigation and (
-        (scope_payload["merge_event"] and not scope_payload["merge_event"]["in_scope"])
-        or any(not entity["in_scope"] for entity in scope_payload["merge_entities"])
-    ):
-        record_action(
-            session,
-            investigation_id,
-            "review.cross_investigation_reuse_approved",
-            actor=request.analyst,
-            object_type="intake",
-            object_id=item.id,
-            detail=scope_payload,
-        )
     from .intake import confirm_intake, serialize_intake
 
+    def validate_locked_scope(locked_session: Session, locked_item: IntakeItem) -> None:
+        if not _object_in_investigation(
+            locked_session,
+            investigation_id,
+            "intake",
+            locked_item.id,
+        ):
+            raise IntakeScopeError()
+        locked_scope_errors = _confirmation_scope_errors(
+            locked_session,
+            investigation_id,
+            request,
+            allow_cross_investigation=allow_cross_investigation,
+        )
+        if locked_scope_errors:
+            raise IntakeScopeError("; ".join(locked_scope_errors))
+        locked_scope_payload = _review_scope_payload(
+            locked_session,
+            investigation_id,
+            request,
+            allow_cross_investigation=allow_cross_investigation,
+        )
+        locked_cross_scope_approval = allow_cross_investigation and (
+            (
+                locked_scope_payload["merge_event"]
+                and not locked_scope_payload["merge_event"]["in_scope"]
+            )
+            or any(
+                not entity["in_scope"]
+                for entity in locked_scope_payload["merge_entities"]
+            )
+        )
+        if locked_cross_scope_approval:
+            record_action(
+                locked_session,
+                investigation_id,
+                "review.cross_investigation_reuse_approved",
+                actor=request.analyst,
+                object_type="intake",
+                object_id=locked_item.id,
+                detail=locked_scope_payload,
+            )
+
     try:
-        item, result, created = confirm_intake(session, item, request)
+        item, result, created = confirm_intake(
+            session,
+            item,
+            request,
+            locked_validation_hook=validate_locked_scope,
+        )
+    except (ArchivedIntakeError, IntakeScopeError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2586,26 +3409,48 @@ def add_investigation_link(
         raise HTTPException(status_code=404, detail="Investigation not found")
     if not _object_exists(session, request.object_type, request.object_id):
         raise HTTPException(status_code=404, detail="Linked object not found")
-    link, created = link_object(
-        session,
-        investigation_id,
-        request.object_type,
-        request.object_id,
-        role=request.role,
-        actor=request.actor,
-    )
+    if request.object_type == "intake":
+        session.rollback()
+        try:
+            lock_intake_for_mutation(
+                session,
+                request.object_id,
+                action="linking it to an investigation",
+            )
+        except ArchivedIntakeError as exc:
+            session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        link, created = link_object(
+            session,
+            investigation_id,
+            request.object_type,
+            request.object_id,
+            role=request.role,
+            actor=request.actor,
+        )
+    except ArchivedIntakeError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     task_payload = None
     if request.object_type == "intake":
         item = session.get(IntakeItem, request.object_id)
         assert item is not None
-        task, task_created = ensure_review_task_for_intake(
-            session,
-            investigation_id,
-            item,
-            actor=request.actor,
-            payload_extra={"manual_link": True},
-        )
-        task_payload = {"created": task_created, "task": serialize_task(task)}
+        try:
+            task, task_created = ensure_review_task_for_intake(
+                session,
+                investigation_id,
+                item,
+                actor=request.actor,
+                payload_extra={"manual_link": True},
+            )
+        except ArchivedIntakeError as exc:
+            session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        task_payload = {
+            "created": task_created,
+            "task": serialize_task(task, session=session),
+        }
     version_tasks_created = 0
     if request.object_type == "collection_target":
         version_tasks_created = attach_existing_collection_versions_to_investigation(
@@ -2623,10 +3468,313 @@ def add_investigation_link(
     }
 
 
+def _investigation_intake_task(
+    session: Session, investigation_id: str, item_id: str
+) -> ReviewTask | None:
+    return session.scalar(
+        select(ReviewTask)
+        .where(
+            ReviewTask.investigation_id == investigation_id,
+            ReviewTask.intake_item_id == item_id,
+        )
+        .order_by(ReviewTask.created_at.asc())
+        .limit(1)
+    )
+
+
+def _removed_intake_link_snapshot(
+    session: Session, investigation_id: str, item_id: str
+) -> tuple[str, dict[str, Any], str | None]:
+    entry = _removed_intake_link_entry(session, investigation_id, item_id)
+    detail = entry.detail_json if entry is not None else {}
+    metadata = detail.get("metadata") if isinstance(detail, dict) else None
+    return (
+        str(detail.get("role") or "member") if isinstance(detail, dict) else "member",
+        dict(metadata) if isinstance(metadata, dict) else {},
+        str(detail.get("link_id"))
+        if isinstance(detail, dict) and detail.get("link_id")
+        else None,
+    )
+
+
+def _removed_intake_link_entry(
+    session: Session, investigation_id: str, item_id: str
+) -> DecisionLog | None:
+    return session.scalar(
+        select(DecisionLog)
+        .where(
+            DecisionLog.investigation_id == investigation_id,
+            DecisionLog.action == "intake.removed_from_investigation",
+            DecisionLog.object_type == "intake",
+            DecisionLog.object_id == item_id,
+        )
+        .order_by(DecisionLog.created_at.desc(), DecisionLog.id.desc())
+        .limit(1)
+    )
+
+
+@router.post("/{investigation_id}/intake/{item_id}/remove")
+def remove_investigation_intake(
+    investigation_id: str,
+    item_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    item = session.get(IntakeItem, item_id)
+    task = _investigation_intake_task(session, investigation_id, item_id)
+    link = session.scalar(
+        select(InvestigationLink).where(
+            InvestigationLink.investigation_id == investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == item_id,
+        )
+    )
+    if link is None:
+        removed_entry = _removed_intake_link_entry(
+            session, investigation_id, item_id
+        )
+        if item is None or (task is None and removed_entry is None):
+            raise HTTPException(
+                status_code=404,
+                detail="Intake item not found in this investigation",
+            )
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Intake item not found in this investigation",
+        )
+    session.rollback()
+    try:
+        item = lock_intake_for_mutation(
+            session,
+            item_id,
+            action="removing it from an investigation",
+        )
+    except ArchivedIntakeError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    investigation = session.get(Investigation, investigation_id)
+    task = _investigation_intake_task(session, investigation_id, item_id)
+    link = session.scalar(
+        select(InvestigationLink).where(
+            InvestigationLink.investigation_id == investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == item_id,
+        )
+    )
+    if investigation is None:
+        session.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail="Intake item not found in this investigation",
+        )
+    if link is None:
+        removed_entry = _removed_intake_link_entry(
+            session, investigation_id, item_id
+        )
+        session.rollback()
+        if removed_entry is not None or task is not None:
+            return {
+                "status": "removed",
+                "changed": False,
+                "investigation_id": investigation_id,
+                "intake_item_id": item_id,
+            }
+        raise HTTPException(
+            status_code=404,
+            detail="Intake item not found in this investigation",
+        )
+    if item.status == "confirmed":
+        raise HTTPException(
+            status_code=409,
+            detail="A confirmed intake item cannot be removed from its investigation",
+        )
+    if task is not None and task.status in ACTIVE_TASK_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail="An intake item with an active review task cannot be removed",
+        )
+    link_detail = {
+        "link_id": link.id,
+        "role": link.role,
+        "metadata": link.metadata_json or {},
+        "reason": request.reason or "Removed from investigation",
+        "status": item.status,
+    }
+    session.delete(link)
+    investigation.updated_at = utcnow()
+    record_action(
+        session,
+        investigation_id,
+        "intake.removed_from_investigation",
+        actor=request.analyst,
+        object_type="intake",
+        object_id=item_id,
+        task_id=task.id if task is not None else None,
+        detail=link_detail,
+    )
+    session.commit()
+    return {
+        "status": "removed",
+        "changed": True,
+        "investigation_id": investigation_id,
+        "intake_item_id": item_id,
+    }
+
+
+@router.post("/{investigation_id}/intake/{item_id}/restore")
+def restore_investigation_intake(
+    investigation_id: str,
+    item_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    item = session.get(IntakeItem, item_id)
+    task = _investigation_intake_task(session, investigation_id, item_id)
+    removed_entry = _removed_intake_link_entry(
+        session, investigation_id, item_id
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Removed intake relationship not found",
+        )
+    if item.archived_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Restore the intake item globally before restoring its investigation relationship",
+        )
+    if item.status == "confirmed":
+        raise HTTPException(
+            status_code=409,
+            detail="A confirmed intake item cannot be restored as an unconfirmed review task",
+        )
+    existing = session.scalar(
+        select(InvestigationLink).where(
+            InvestigationLink.investigation_id == investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == item_id,
+        )
+    )
+    if existing is None and removed_entry is None:
+        # A removal log is the durable membership proof when legacy or manual
+        # links never had a ReviewTask. Do not treat a guessed global item ID as
+        # a removed relationship.
+        raise HTTPException(
+            status_code=404,
+            detail="Removed intake relationship not found",
+        )
+    session.rollback()
+    try:
+        item = lock_intake_for_mutation(
+            session,
+            item_id,
+            action="restoring it to an investigation",
+        )
+    except ArchivedIntakeError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    investigation = session.get(Investigation, investigation_id)
+    task = _investigation_intake_task(session, investigation_id, item_id)
+    if item.status == "confirmed":
+        session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A confirmed intake item cannot be restored as an unconfirmed review task",
+        )
+    existing = session.scalar(
+        select(InvestigationLink).where(
+            InvestigationLink.investigation_id == investigation_id,
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == item_id,
+        )
+    )
+    if existing is not None:
+        if task is not None:
+            sync_review_task_with_intake(
+                session,
+                task,
+                item,
+                actor=request.analyst,
+            )
+        payload = {
+            "status": "active",
+            "changed": False,
+            "investigation_id": investigation_id,
+            "intake_item_id": item_id,
+            "link": serialize_link(existing),
+            "task": serialize_task(task, session=session) if task is not None else None,
+        }
+        session.commit()
+        return payload
+    removed_entry = _removed_intake_link_entry(
+        session, investigation_id, item_id
+    )
+    if investigation is None or removed_entry is None:
+        session.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail="Removed intake relationship not found",
+        )
+    role, metadata, removed_link_id = _removed_intake_link_snapshot(
+        session, investigation_id, item_id
+    )
+    link = InvestigationLink(
+        id=new_link_id(),
+        investigation_id=investigation_id,
+        object_type="intake",
+        object_id=item_id,
+        role=role,
+        metadata_json=metadata,
+        created_at=utcnow(),
+    )
+    session.add(link)
+    investigation.updated_at = utcnow()
+    session.flush()
+    if task is not None:
+        sync_review_task_with_intake(
+            session,
+            task,
+            item,
+            actor=request.analyst,
+        )
+    record_action(
+        session,
+        investigation_id,
+        "intake.restored_to_investigation",
+        actor=request.analyst,
+        object_type="intake",
+        object_id=item_id,
+        task_id=task.id if task is not None else None,
+        detail={
+            "reason": request.reason or "Restored to investigation",
+            "restored_from_link_id": removed_link_id,
+            "role": role,
+            "metadata": metadata,
+        },
+    )
+    session.commit()
+    return {
+        "status": "active",
+        "changed": True,
+        "investigation_id": investigation_id,
+        "intake_item_id": item_id,
+        "link": serialize_link(link),
+        "task": serialize_task(task, session=session) if task is not None else None,
+    }
+
+
 @router.get("/{investigation_id}/tasks")
 def list_investigation_tasks(
     investigation_id: str,
     status_value: str | None = Query(default=None, alias="status"),
+    visibility: Literal["active", "removed", "all"] = Query(default="active"),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
     session: Session = Depends(get_session),
@@ -2634,6 +3782,10 @@ def list_investigation_tasks(
     if session.get(Investigation, investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     query = select(ReviewTask).where(ReviewTask.investigation_id == investigation_id)
+    if visibility == "active":
+        query = query.where(_task_has_current_intake_link(), _task_intake_is_visible())
+    elif visibility == "removed":
+        query = query.where(~_task_has_current_intake_link(), _task_intake_is_visible())
     if status_value:
         query = query.where(ReviewTask.status == status_value)
     total = int(
@@ -2651,6 +3803,7 @@ def list_investigation_tasks(
         "count": total,
         "offset": offset,
         "limit": limit,
+        "visibility": visibility,
     }
 
 

@@ -5,7 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from .collection_routes import router as collection_router
 from .database import Base, REPO_ROOT, SessionLocal, engine, get_session
+from .errors import ArchivedIntakeError, IntakeMutationConflictError
 from .investigations import (
     DEMO_INVESTIGATION_ID,
     bootstrap_legacy_investigations,
@@ -25,6 +26,7 @@ from .investigations import (
     task_router as investigation_task_router,
 )
 from .intake import (
+    archive_intake,
     build_confirmation_preview,
     cancel_intake,
     confirm_intake,
@@ -37,9 +39,21 @@ from .intake import (
     submit_text_intake,
     submit_web_intake,
     generate_candidates,
+    restore_intake,
 )
 from .llm import run_model_task
-from .models import Claim, Document, Entity, Event, Evidence, IntakeItem, Investigation, Snapshot, Source
+from .models import (
+    Claim,
+    Document,
+    Entity,
+    Event,
+    Evidence,
+    IntakeItem,
+    Investigation,
+    SearchQueryRun,
+    Snapshot,
+    Source,
+)
 from .reporting import REPORT_DIR, build_report
 from .repository import (
     get_event,
@@ -52,6 +66,7 @@ from .repository import (
 from .schemas import (
     ExternalSearchRequest,
     ExternalSearchSelectionRequest,
+    ArchiveRequest,
     ImportRssRequest,
     ImportUrlRequest,
     IntakeCancelRequest,
@@ -64,12 +79,15 @@ from .schemas import (
 from .seed import counts, seed_database
 from .search import (
     ExternalSearchError,
+    archive_query_run,
     execute_external_search,
     get_query_run_payload,
     list_query_runs,
     provider_metadata,
     retry_search_result,
+    restore_query_run,
     select_search_results,
+    serialize_query_run,
 )
 
 DASHBOARD_DIR = REPO_ROOT / "apps" / "dashboard"
@@ -111,6 +129,28 @@ def ensure_compatible_schema() -> None:
         if "metadata_json" not in columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE snapshots ADD COLUMN metadata_json JSON"))
+    if "intake_items" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("intake_items")}
+        additions = {
+            "archived_at": "DATETIME",
+            "archived_by": "VARCHAR(160)",
+            "archive_reason": "TEXT",
+        }
+        missing_columns = set(additions) - columns
+        if missing_columns:
+            with engine.begin() as connection:
+                for name, definition in additions.items():
+                    if name in missing_columns:
+                        connection.execute(
+                            text(f"ALTER TABLE intake_items ADD COLUMN {name} {definition}")
+                        )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_intake_items_archived_at "
+                    "ON intake_items (archived_at)"
+                )
+            )
     if "collection_runs" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("collection_runs")}
         if "active_key" not in columns:
@@ -164,6 +204,9 @@ def ensure_compatible_schema() -> None:
             "total_known": "BOOLEAN DEFAULT 0",
             "total_count": "INTEGER",
             "updated_at": "DATETIME",
+            "archived_at": "DATETIME",
+            "archived_by": "VARCHAR(160)",
+            "archive_reason": "TEXT",
         }
         missing_columns = set(additions) - columns
         if missing_columns:
@@ -206,6 +249,13 @@ def ensure_compatible_schema() -> None:
                         "ON external_search_query_runs (updated_at)"
                     )
                 )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_external_search_query_runs_archived_at "
+                    "ON external_search_query_runs (archived_at)"
+                )
+            )
     if "external_search_results" in inspector.get_table_names():
         columns = {
             column["name"] for column in inspector.get_columns("external_search_results")
@@ -491,27 +541,35 @@ def create_report(request: ReportRequest, session: Session = Depends(get_session
 @app.post("/api/v1/import/url", include_in_schema=False)
 @app.post("/pldr-api/v1/import/url")
 async def import_url(request: ImportUrlRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
-    item = await submit_web_intake(
-        session,
-        str(request.url),
-        request.source_name,
-        request.title,
-        request.html,
-        request.language,
-    )
+    try:
+        item = await submit_web_intake(
+            session,
+            str(request.url),
+            request.source_name,
+            request.title,
+            request.html,
+            request.language,
+        )
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": item.status, "intake_item": serialize_intake(item)}
 
 
 @app.post("/api/v1/import/rss", include_in_schema=False)
 @app.post("/pldr-api/v1/import/rss")
 async def import_rss_feed(request: ImportRssRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
-    items = await submit_rss_intake(
-        session,
-        str(request.url) if request.url else None,
-        request.xml,
-        request.source_name,
-        request.language,
-    )
+    try:
+        items = await submit_rss_intake(
+            session,
+            str(request.url) if request.url else None,
+            request.xml,
+            request.source_name,
+            request.language,
+        )
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     serialized = [serialize_intake(item) for item in items]
     return {
         "status": "ok" if all(item.status != "failed" for item in items) else "partial_failure",
@@ -552,12 +610,16 @@ async def external_search(
 def external_search_runs(
     investigation_id: str = Query(min_length=1, max_length=80),
     limit: int = Query(default=10, ge=1, le=50),
+    visibility: Literal["active", "archived", "all"] = Query(default="active"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     if session.get(Investigation, investigation_id) is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return list_query_runs(
-        session, investigation_id=investigation_id, limit=limit
+        session,
+        investigation_id=investigation_id,
+        limit=limit,
+        visibility=visibility,
     )
 
 
@@ -576,6 +638,52 @@ def external_search_run(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@app.post("/api/v1/search/runs/{run_id}/archive", include_in_schema=False)
+@app.post("/pldr-api/v1/search/runs/{run_id}/archive")
+def archive_external_search_run(
+    run_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    run = session.get(SearchQueryRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Search query run not found")
+    run, changed = archive_query_run(
+        session,
+        run,
+        analyst=request.analyst,
+        reason=request.reason or "Removed from active search history",
+    )
+    return {
+        "status": "archived",
+        "changed": changed,
+        "query_run": serialize_query_run(run, []),
+    }
+
+
+@app.post("/api/v1/search/runs/{run_id}/restore", include_in_schema=False)
+@app.post("/pldr-api/v1/search/runs/{run_id}/restore")
+def restore_external_search_run(
+    run_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    run = session.get(SearchQueryRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Search query run not found")
+    run, changed = restore_query_run(
+        session,
+        run,
+        analyst=request.analyst,
+        reason=request.reason or "Restored to active search history",
+    )
+    return {
+        "status": "active",
+        "changed": changed,
+        "query_run": serialize_query_run(run, []),
+    }
+
+
 @app.post("/api/v1/search/select", include_in_schema=False)
 @app.post("/pldr-api/v1/search/select")
 async def select_external_search_results(
@@ -590,6 +698,9 @@ async def select_external_search_results(
         ):
             return JSONResponse(status_code=202, content=payload)
         return payload
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -602,6 +713,9 @@ async def retry_external_search_result(
 ) -> dict[str, Any]:
     try:
         return await retry_search_result(session, result_id)
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -610,7 +724,11 @@ async def retry_external_search_result(
 @app.post("/api/v1/intake/text", include_in_schema=False)
 @app.post("/pldr-api/v1/intake/text")
 async def intake_text(request: IntakeTextRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
-    item = await submit_text_intake(session, request)
+    try:
+        item = await submit_text_intake(session, request)
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": item.status, "intake_item": serialize_intake(item)}
 
 
@@ -622,7 +740,11 @@ async def intake_file(
     language: str = Form("en"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    item = await submit_file_intake(session, file, source_description, language)
+    try:
+        item = await submit_file_intake(session, file, source_description, language)
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"status": item.status, "intake_item": serialize_intake(item)}
 
 
@@ -632,14 +754,75 @@ def intake_list(
     status: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     include_detail: bool = Query(default=True),
+    visibility: Literal["active", "archived", "all"] = Query(default="active"),
+    include_archived: bool | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     query = select(IntakeItem).options(selectinload(IntakeItem.candidates)).order_by(IntakeItem.created_at.desc())
+    effective_visibility = "all" if include_archived is True and visibility == "active" else visibility
+    if effective_visibility == "active":
+        query = query.where(IntakeItem.archived_at.is_(None))
+    elif effective_visibility == "archived":
+        query = query.where(IntakeItem.archived_at.is_not(None))
     if status:
         query = query.where(IntakeItem.status == status)
     items = list(session.scalars(query.limit(limit)))
     serializer = serialize_intake if include_detail else serialize_intake_summary
-    return {"items": [serializer(item) for item in items], "count": len(items)}
+    return {
+        "items": [serializer(item, session=session) for item in items],
+        "count": len(items),
+        "visibility": effective_visibility,
+    }
+
+
+@app.post("/api/v1/intake/{item_id}/archive", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/archive")
+def archive_intake_item(
+    item_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    try:
+        item, changed = archive_intake(
+            session,
+            item,
+            analyst=request.analyst,
+            reason=request.reason or "Removed from active intake inbox",
+        )
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": "archived",
+        "changed": changed,
+        "intake_item": serialize_intake(item, session=session),
+    }
+
+
+@app.post("/api/v1/intake/{item_id}/restore", include_in_schema=False)
+@app.post("/pldr-api/v1/intake/{item_id}/restore")
+def restore_intake_item(
+    item_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    item = get_intake_item(session, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Intake item not found")
+    item, changed = restore_intake(
+        session,
+        item,
+        analyst=request.analyst,
+        reason=request.reason or "Restored to active intake inbox",
+    )
+    return {
+        "status": "active",
+        "changed": changed,
+        "intake_item": serialize_intake(item, session=session),
+    }
 
 
 @app.get("/api/v1/intake/options", include_in_schema=False)
@@ -662,9 +845,18 @@ async def regenerate_intake_candidates(
     item = get_intake_item(session, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Intake item not found")
+    if item.archived_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=str(ArchivedIntakeError("regenerating candidates")),
+        )
     if item.status not in {"parsed", "generation_failed"}:
         raise HTTPException(status_code=409, detail=f"Candidates cannot be regenerated from status {item.status}")
-    item = await generate_candidates(session, item)
+    try:
+        item = await generate_candidates(session, item)
+    except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return serialize_intake(item)
 
 
@@ -693,6 +885,9 @@ def intake_confirm(
         raise HTTPException(status_code=404, detail="Intake item not found")
     try:
         item, result, created = confirm_intake(session, item, request)
+    except ArchivedIntakeError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         session.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -741,7 +936,7 @@ def intake_detail(item_id: str, session: Session = Depends(get_session)) -> dict
     item = get_intake_item(session, item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Intake item not found")
-    return serialize_intake(item)
+    return serialize_intake(item, session=session)
 
 
 @app.post("/api/v1/model/task", include_in_schema=False)

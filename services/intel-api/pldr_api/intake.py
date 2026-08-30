@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree
 
-from sqlalchemy import select
+from sqlalchemy import DateTime, bindparam, select, text
 from sqlalchemy.orm import Session, selectinload
 
+from .errors import ArchivedIntakeError, IntakeMutationConflictError
 from .extraction import canonicalize_url, content_hash, extract_page, normalize_text
 from .importers import fetch_public_text
 from .llm import run_model_task
@@ -29,6 +30,8 @@ from .models import (
     Evidence,
     IntakeCandidate,
     IntakeItem,
+    InvestigationLink,
+    ReviewTask,
     Snapshot,
     Source,
 )
@@ -49,6 +52,7 @@ UNKNOWN_TITLE = "[unknown title]"
 UNKNOWN_DATETIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
 DEFAULT_EVENT_SUMMARY = "Analyst-confirmed intake material."
 DEFAULT_EVIDENCE_NOTE = "Human-confirmed from isolated intake candidate; machine candidate retained in intake."
+ACTIVE_REVIEW_TASK_STATUSES = ("queued", "fetching", "generating")
 
 
 def utcnow() -> datetime:
@@ -141,13 +145,87 @@ def _clean_known(value: Any) -> Any:
     return value
 
 
-async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
-    """Generate and persist candidate objects without touching formal tables."""
+def lock_intake_for_mutation(
+    session: Session,
+    item_id: str,
+    *,
+    action: str,
+) -> IntakeItem:
+    """Fence archive against an Intake mutation until this transaction commits.
+
+    SQLite ignores ``FOR UPDATE``.  This deliberately uses a raw no-op DML as
+    the transaction's first write: it takes SQLite's write lock (and a row lock
+    on databases that support them) without changing ``updated_at`` or firing
+    ORM on-update behavior.  Callers that crossed an await boundary must roll
+    back their old read transaction before calling this function.
+    """
+    locked = session.execute(
+        text(
+            "UPDATE intake_items SET updated_at = updated_at "
+            "WHERE id = :item_id AND archived_at IS NULL"
+        ),
+        {"item_id": item_id},
+    )
+    item = session.get(IntakeItem, item_id, populate_existing=True)
+    if not locked.rowcount:
+        if item is None:
+            raise ValueError("Intake item not found")
+        if item.archived_at is not None:
+            raise ArchivedIntakeError(action)
+        raise RuntimeError("Intake mutation lock could not be acquired")
+    if item is None:
+        raise ValueError("Intake item not found")
+    return item
+
+
+def lock_intake_for_status_sync(session: Session, item_id: str) -> IntakeItem:
+    """Fence an Intake row while propagating its status to dependent rows.
+
+    This includes archived rows, unlike ``lock_intake_for_mutation``.  It does
+    not authorize changing Intake content; callers use the no-op write only so
+    task/selection convergence is serialized with archive and restore.
+    """
+    locked = session.execute(
+        text(
+            "UPDATE intake_items SET updated_at = updated_at "
+            "WHERE id = :item_id"
+        ),
+        {"item_id": item_id},
+    )
+    item = session.get(IntakeItem, item_id, populate_existing=True)
+    if not locked.rowcount or item is None:
+        raise ValueError("Intake item not found")
+    return item
+
+
+def _clear_candidate_generation_state(session: Session, item: IntakeItem) -> None:
     for candidate in list(item.candidates):
         session.delete(candidate)
     session.flush()
     item.candidate_error = None
     item.candidate_relations = []
+
+
+def _generation_baseline(item: IntakeItem) -> tuple[str, str | None]:
+    return item.status, iso(item.updated_at)
+
+
+def _require_generation_baseline(
+    item: IntakeItem,
+    baseline: tuple[str, str | None],
+    *,
+    action: str,
+) -> None:
+    if _generation_baseline(item) != baseline:
+        raise IntakeMutationConflictError(action)
+
+
+async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
+    """Generate and persist candidate objects without touching formal tables."""
+    if item.archived_at is not None:
+        raise ArchivedIntakeError("regenerating candidates")
+    item_id = item.id
+    baseline = _generation_baseline(item)
     payload = {
         "intake_item_id": item.id,
         "input_type": item.input_type,
@@ -166,6 +244,21 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
     }
     try:
         response = await run_model_task("extract_intake_candidates", payload)
+        # End the pre-await read snapshot, then make the archive predicate the
+        # first write of the transaction that stores candidates.  The fence is
+        # held through the same commit as every candidate/status mutation.
+        session.rollback()
+        item = lock_intake_for_mutation(
+            session,
+            item_id,
+            action="regenerating candidates",
+        )
+        _require_generation_baseline(
+            item,
+            baseline,
+            action="applying the candidate result",
+        )
+        _clear_candidate_generation_state(session, item)
         if response.get("mode") == "fallback":
             result = deterministic_candidate_result(item)
             mode = "fallback"
@@ -178,10 +271,48 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
             model_name = response.get("model") or os.getenv("LLM_MODEL_NAME", "configured-model")
         _store_candidates(session, item, result, mode, model_name)
         item.status = "candidate_ready"
+        item.updated_at = utcnow()
+    except ArchivedIntakeError:
+        session.rollback()
+        raise
+    except IntakeMutationConflictError:
+        session.rollback()
+        raise
     except Exception as exc:
+        # A model or persistence error may also race with archive.  Failure
+        # state is an Intake mutation, so it needs a fresh transaction and the
+        # same fence rather than overwriting an archive in an error handler.
+        session.rollback()
+        try:
+            item = lock_intake_for_mutation(
+                session,
+                item_id,
+                action="regenerating candidates",
+            )
+        except ArchivedIntakeError as archived_exc:
+            session.rollback()
+            raise archived_exc from exc
+        try:
+            _require_generation_baseline(
+                item,
+                baseline,
+                action="recording the candidate failure",
+            )
+        except IntakeMutationConflictError as conflict_exc:
+            session.rollback()
+            raise conflict_exc from exc
+        _clear_candidate_generation_state(session, item)
         item.status = "generation_failed"
         item.candidate_mode = "failed"
         item.candidate_error = str(exc)
+        item.updated_at = utcnow()
+    from .investigations import sync_linked_review_tasks_for_intake
+
+    sync_linked_review_tasks_for_intake(
+        session,
+        item,
+        actor="system:candidate-generation",
+    )
     # _store_candidates writes child rows by foreign key, so a relationship that
     # was loaded as empty before generation would otherwise stay stale when
     # expire_on_commit=False. Expire it while the transaction is still open: the
@@ -228,6 +359,19 @@ def generate_deterministic_candidates(
     prevents a provider timeout from becoming a dead end without representing
     deterministic extraction as a model result.
     """
+    baseline = _generation_baseline(item)
+    item_id = item.id
+    session.rollback()
+    item = lock_intake_for_mutation(
+        session,
+        item_id,
+        action="generating fallback candidates",
+    )
+    _require_generation_baseline(
+        item,
+        baseline,
+        action="applying fallback candidates",
+    )
     for candidate in list(item.candidates):
         session.delete(candidate)
     session.flush()
@@ -238,6 +382,13 @@ def generate_deterministic_candidates(
     item.candidate_model = None
     item.candidate_error = model_error
     item.updated_at = utcnow()
+    from .investigations import sync_linked_review_tasks_for_intake
+
+    sync_linked_review_tasks_for_intake(
+        session,
+        item,
+        actor="system:candidate-generation",
+    )
     session.expire(item, ["candidates"])
     session.commit()
     return item
@@ -424,6 +575,13 @@ async def submit_web_intake(
         session.add(item)
         session.commit()
         return await generate_candidates(session, item)
+    except (ArchivedIntakeError, IntakeMutationConflictError):
+        # Candidate generation crosses an await boundary.  If another request
+        # archives the just-created item while the model is running, preserve
+        # that item and let the HTTP layer report the restore-required conflict
+        # instead of manufacturing a second, unrelated failed intake row.
+        session.rollback()
+        raise
     except Exception as exc:
         failure_html = html or ""
         failure_text = normalize_text(failure_html)
@@ -466,6 +624,9 @@ async def submit_text_intake(session: Session, request: Any) -> IntakeItem:
         session.commit()
         session.refresh(item)
         return await generate_candidates(session, item)
+    except (ArchivedIntakeError, IntakeMutationConflictError):
+        session.rollback()
+        raise
     except Exception as exc:
         normalized_failure = normalize_text(request.text)
         return _failed_item(
@@ -575,6 +736,9 @@ async def submit_file_intake(
         session.commit()
         session.refresh(item)
         return await generate_candidates(session, item)
+    except (ArchivedIntakeError, IntakeMutationConflictError):
+        session.rollback()
+        raise
     except Exception as exc:
         return _failed_item(
             session,
@@ -653,6 +817,9 @@ async def submit_rss_intake(
                 )
             )
         return results
+    except (ArchivedIntakeError, IntakeMutationConflictError):
+        session.rollback()
+        raise
     except Exception as exc:
         failure_xml = xml or ""
         failure_text = normalize_text(failure_xml)
@@ -695,7 +862,205 @@ def serialize_candidate(candidate: IntakeCandidate) -> dict[str, Any]:
     }
 
 
-def serialize_intake_summary(item: IntakeItem) -> dict[str, Any]:
+def _intake_has_active_review_task(session: Session, item_id: str) -> bool:
+    return session.scalar(
+        select(ReviewTask.id)
+        .where(
+            ReviewTask.intake_item_id == item_id,
+            ReviewTask.status.in_(ACTIVE_REVIEW_TASK_STATUSES),
+        )
+        .limit(1)
+    ) is not None
+
+
+def _intake_allowed_actions(item: IntakeItem, session: Session | None = None) -> list[str]:
+    if item.archived_at is not None:
+        return ["restore"]
+    if item.status == "confirmed":
+        return []
+    if session is not None and _intake_has_active_review_task(session, item.id):
+        return []
+    return ["archive"]
+
+
+def _intake_archive_payload(item: IntakeItem, session: Session | None = None) -> dict[str, Any]:
+    return {
+        "archived": item.archived_at is not None,
+        "archived_at": iso(item.archived_at),
+        "archived_by": item.archived_by,
+        "archive_reason": item.archive_reason,
+        "allowed_actions": _intake_allowed_actions(item, session),
+    }
+
+
+def _record_intake_archive_action(
+    session: Session,
+    item: IntakeItem,
+    *,
+    action: str,
+    analyst: str,
+    reason: str,
+) -> None:
+    from .investigations import record_action
+
+    investigation_ids = list(
+        session.scalars(
+            select(InvestigationLink.investigation_id).where(
+                InvestigationLink.object_type == "intake",
+                InvestigationLink.object_id == item.id,
+            )
+        )
+    )
+    for investigation_id in investigation_ids:
+        record_action(
+            session,
+            investigation_id,
+            action,
+            actor=analyst,
+            object_type="intake",
+            object_id=item.id,
+            detail={"reason": reason, "status": item.status},
+        )
+
+
+def archive_intake(
+    session: Session,
+    item: IntakeItem,
+    *,
+    analyst: str,
+    reason: str,
+) -> tuple[IntakeItem, bool]:
+    """Hide an unconfirmed, inactive intake without changing its processing state."""
+    item_id = item.id
+    now = utcnow()
+    # Discard the route's read snapshot.  This conditional write is both the
+    # idempotency CAS and SQLite's write fence; task creation/claim and Intake
+    # mutations use the inverse unarchived fence and hold it to their commit.
+    session.rollback()
+    archive_statement = text(
+        "UPDATE intake_items "
+        "SET archived_at = :archived_at, archived_by = :archived_by, "
+        "archive_reason = :archive_reason, updated_at = :updated_at "
+        "WHERE id = :item_id AND archived_at IS NULL "
+        "AND status <> 'confirmed' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM investigation_review_tasks "
+        "  WHERE intake_item_id = :item_id "
+        "  AND status IN ('queued', 'fetching', 'generating')"
+        ")"
+    ).bindparams(
+        bindparam("archived_at", type_=DateTime(timezone=True)),
+        bindparam("updated_at", type_=DateTime(timezone=True)),
+    )
+    archived = session.execute(
+        archive_statement,
+        {
+            "item_id": item_id,
+            "archived_at": now,
+            "archived_by": analyst,
+            "archive_reason": reason,
+            "updated_at": now,
+        },
+    )
+    item = session.get(IntakeItem, item_id, populate_existing=True)
+    if item is None:
+        raise ValueError("Intake item not found")
+    if not archived.rowcount:
+        if item.archived_at is not None:
+            return item, False
+        if item.status == "confirmed":
+            raise ValueError("A confirmed intake item cannot be archived")
+        if _intake_has_active_review_task(session, item.id):
+            raise ValueError("An intake item with an active review task cannot be archived")
+        raise RuntimeError("Intake archive compare-and-set did not match")
+    review = dict(item.review or {})
+    history = list(review.get("archive_history", []))
+    history.append(
+        {
+            "action": "archived",
+            "analyst": analyst,
+            "reason": reason,
+            "at": iso(now),
+            "status": item.status,
+        }
+    )
+    review["archive_history"] = history
+    item.review = review
+    _record_intake_archive_action(
+        session,
+        item,
+        action="intake.archived",
+        analyst=analyst,
+        reason=reason,
+    )
+    session.commit()
+    session.refresh(item)
+    return item, True
+
+
+def restore_intake(
+    session: Session,
+    item: IntakeItem,
+    *,
+    analyst: str,
+    reason: str,
+) -> tuple[IntakeItem, bool]:
+    """Restore inbox visibility while preserving the original processing state."""
+    item_id = item.id
+    session.rollback()
+    locked = session.execute(
+        text(
+            "UPDATE intake_items SET updated_at = updated_at "
+            "WHERE id = :item_id AND archived_at IS NOT NULL"
+        ),
+        {"item_id": item_id},
+    )
+    item = session.get(IntakeItem, item_id, populate_existing=True)
+    if item is None:
+        raise ValueError("Intake item not found")
+    if not locked.rowcount:
+        if item.archived_at is None:
+            return item, False
+        raise RuntimeError("Intake restore compare-and-set did not match")
+    now = utcnow()
+    previous_archive = {
+        "archived_at": iso(item.archived_at),
+        "archived_by": item.archived_by,
+        "archive_reason": item.archive_reason,
+    }
+    item.archived_at = None
+    item.archived_by = None
+    item.archive_reason = None
+    item.updated_at = now
+    review = dict(item.review or {})
+    history = list(review.get("archive_history", []))
+    history.append(
+        {
+            "action": "restored",
+            "analyst": analyst,
+            "reason": reason,
+            "at": iso(now),
+            "status": item.status,
+            "previous_archive": previous_archive,
+        }
+    )
+    review["archive_history"] = history
+    item.review = review
+    _record_intake_archive_action(
+        session,
+        item,
+        action="intake.restored",
+        analyst=analyst,
+        reason=reason,
+    )
+    session.commit()
+    session.refresh(item)
+    return item, True
+
+
+def serialize_intake_summary(
+    item: IntakeItem, *, session: Session | None = None
+) -> dict[str, Any]:
     """List-safe material metadata; never embeds snapshots or candidate blobs."""
     return {
         "id": item.id,
@@ -713,6 +1078,7 @@ def serialize_intake_summary(item: IntakeItem) -> dict[str, Any]:
         "language": item.language,
         "created_at": iso(item.created_at),
         "updated_at": iso(item.updated_at),
+        **_intake_archive_payload(item, session),
         "search": item.review.get("external_search") or None,
         "candidate_generation": {
             "mode": item.candidate_mode,
@@ -728,7 +1094,9 @@ def serialize_intake_summary(item: IntakeItem) -> dict[str, Any]:
     }
 
 
-def serialize_intake(item: IntakeItem) -> dict[str, Any]:
+def serialize_intake(
+    item: IntakeItem, *, session: Session | None = None
+) -> dict[str, Any]:
     candidates = [serialize_candidate(candidate) for candidate in item.candidates]
     return {
         "id": item.id,
@@ -751,6 +1119,7 @@ def serialize_intake(item: IntakeItem) -> dict[str, Any]:
         },
         "created_at": iso(item.created_at),
         "updated_at": iso(item.updated_at),
+        **_intake_archive_payload(item, session),
         "material": {
             "raw_hash": item.raw_hash or None,
             "extracted_hash": item.extracted_hash or None,
@@ -809,6 +1178,8 @@ def validate_confirmation(
     request: IntakeConfirmationRequest,
 ) -> list[str]:
     errors: list[str] = []
+    if item.archived_at is not None:
+        errors.append("Archived intake items must be restored before confirmation")
     if item.status != "candidate_ready":
         errors.append(f"Item is not candidate_ready (current status: {item.status})")
     if request.disposition == "merge":
@@ -1339,9 +1710,12 @@ def confirm_intake(
     request: IntakeConfirmationRequest,
     *,
     failure_hook: Callable[[], None] | None = None,
+    locked_validation_hook: Callable[[Session, IntakeItem], None] | None = None,
 ) -> tuple[IntakeItem, dict[str, Any], bool]:
     """Atomically promote a reviewed submission. The bool says whether this call created objects."""
     fingerprint = _confirmation_fingerprint(request)
+    if item.archived_at is not None:
+        raise ArchivedIntakeError("confirming it")
     if item.status == "confirmed":
         if item.confirmation_fingerprint != fingerprint:
             raise ValueError("Item is already confirmed with a different review decision")
@@ -1349,6 +1723,31 @@ def confirm_intake(
     errors = validate_confirmation(session, item, request)
     if errors:
         raise ValueError("; ".join(errors))
+
+    # Validation is read-only and may overlap an archive request.  Restart the
+    # transaction, acquire the Intake fence before any formal-table write, then
+    # reload and validate again under that fence.
+    item_id = item.id
+    session.rollback()
+    item = lock_intake_for_mutation(session, item_id, action="confirming it")
+    if item.status == "confirmed":
+        if item.confirmation_fingerprint != fingerprint:
+            raise ValueError("Item is already confirmed with a different review decision")
+        if locked_validation_hook is not None:
+            # A concurrent same-fingerprint confirmation may have committed
+            # while this scoped request waited for the fence. Its topic link
+            # still has to be revalidated before reporting scoped success.
+            locked_validation_hook(session, item)
+        session.commit()
+        return item, item.confirmation_result, False
+    errors = validate_confirmation(session, item, request)
+    if errors:
+        session.rollback()
+        raise ValueError("; ".join(errors))
+    if locked_validation_hook is not None:
+        # Scoped membership checks and their approval audit must run after the
+        # Intake fence and inside the exact formal-write transaction.
+        locked_validation_hook(session, item)
 
     try:
         return _confirm_validated_intake(
@@ -1543,6 +1942,7 @@ def _confirm_validated_intake(
     item.disposition = request.disposition
     item.reviewed_by = request.analyst
     item.reviewed_at = utcnow()
+    item.updated_at = item.reviewed_at
     item.confirmation_fingerprint = fingerprint
     item.confirmation_result = result
     item.final_event_id = event.id
@@ -1572,6 +1972,9 @@ def _confirm_validated_intake(
 
 
 def reject_intake(session: Session, item: IntakeItem, analyst: str, reason: str) -> IntakeItem:
+    item_id = item.id
+    session.rollback()
+    item = lock_intake_for_mutation(session, item_id, action="rejecting it")
     if item.status == "confirmed":
         raise ValueError("A confirmed item cannot be rejected; preserve its history")
     now = utcnow()
@@ -1579,6 +1982,7 @@ def reject_intake(session: Session, item: IntakeItem, analyst: str, reason: str)
     item.disposition = "reject"
     item.reviewed_by = analyst
     item.reviewed_at = now
+    item.updated_at = now
     item.rejection_reason = reason
     item.review["rejection"] = {"analyst": analyst, "reason": reason, "reviewed_at": iso(now)}
     for candidate in item.candidates:
@@ -1599,6 +2003,9 @@ def reject_intake(session: Session, item: IntakeItem, analyst: str, reason: str)
 
 
 def cancel_intake(session: Session, item: IntakeItem, analyst: str, reason: str) -> IntakeItem:
+    item_id = item.id
+    session.rollback()
+    item = lock_intake_for_mutation(session, item_id, action="cancelling it")
     if item.status == "confirmed":
         raise ValueError("A confirmed item cannot be cancelled; preserve its history")
     now = utcnow()
@@ -1606,6 +2013,7 @@ def cancel_intake(session: Session, item: IntakeItem, analyst: str, reason: str)
     item.disposition = "cancel"
     item.reviewed_by = analyst
     item.reviewed_at = now
+    item.updated_at = now
     item.error = reason
     item.review["cancellation"] = {"analyst": analyst, "reason": reason, "reviewed_at": iso(now)}
     for candidate in item.candidates:

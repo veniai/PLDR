@@ -194,6 +194,9 @@ class IntakeItem(Base):
     final_event_id: Mapped[str | None] = mapped_column(String(64), index=True)
     final_document_id: Mapped[str | None] = mapped_column(String(64), index=True)
     final_snapshot_id: Mapped[str | None] = mapped_column(String(64))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    archived_by: Mapped[str | None] = mapped_column(String(160))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     candidates: Mapped[list["IntakeCandidate"]] = relationship(
@@ -326,6 +329,9 @@ class SearchQueryRun(Base):
     total_known: Mapped[bool] = mapped_column(Boolean, default=False)
     total_count: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    archived_by: Mapped[str | None] = mapped_column(String(160))
+    archive_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
