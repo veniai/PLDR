@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import patch
 from pathlib import Path
 
@@ -46,7 +47,7 @@ from pldr_api.search import (
 )
 from pldr_api.security import UnsafeUrlError, validate_public_http_url
 from pldr_api.seed import counts, seed_database
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, func, inspect, select, text
 
 
 class P0Test(unittest.TestCase):
@@ -678,6 +679,573 @@ class P0Test(unittest.TestCase):
         self.assertIn("not an exact substring", blocked.json()["detail"])
         self.assertEqual(counts(SessionLocal()), baseline)
 
+    def test_intake_archive_is_reversible_idempotent_and_never_changes_processing_state(self):
+        with patch(
+            "pldr_api.intake.run_model_task",
+            return_value={"mode": "fallback"},
+        ):
+            created = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": "The archived note states that the public bridge remained open after inspection.",
+                    "source_description": "Archive contract note",
+                    "title": "Bridge inspection note",
+                    "language": "en",
+                },
+            )
+        self.assertEqual(created.status_code, 200, created.text)
+        item = created.json()["intake_item"]
+        item_id = item["id"]
+        original_status = item["status"]
+        before_formal = self.formal_counts()
+
+        archived = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/archive"
+        )
+        self.assertEqual(archived.status_code, 200, archived.text)
+        archived_item = archived.json()["intake_item"]
+        self.assertTrue(archived.json()["changed"])
+        self.assertTrue(archived_item["archived"])
+        self.assertEqual(archived_item["status"], original_status)
+        self.assertEqual(archived_item["archived_by"], "analyst")
+        self.assertEqual(archived_item["archive_reason"], "Removed from active intake inbox")
+        self.assertEqual(archived_item["allowed_actions"], ["restore"])
+        archived_at = archived_item["archived_at"]
+
+        repeated = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/archive",
+            json={"analyst": "another", "reason": "A repeated request must be idempotent"},
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertFalse(repeated.json()["changed"])
+        self.assertEqual(repeated.json()["intake_item"]["archived_at"], archived_at)
+        self.assertEqual(repeated.json()["intake_item"]["archived_by"], "analyst")
+
+        active_ids = {
+            entry["id"] for entry in self.client.get("/pldr-api/v1/intake?limit=500").json()["items"]
+        }
+        archived_ids = {
+            entry["id"]
+            for entry in self.client.get(
+                "/pldr-api/v1/intake?limit=500&visibility=archived"
+            ).json()["items"]
+        }
+        all_ids = {
+            entry["id"]
+            for entry in self.client.get(
+                "/pldr-api/v1/intake?limit=500&visibility=all"
+            ).json()["items"]
+        }
+        alias_ids = {
+            entry["id"]
+            for entry in self.client.get(
+                "/pldr-api/v1/intake?limit=500&include_archived=true"
+            ).json()["items"]
+        }
+        self.assertNotIn(item_id, active_ids)
+        self.assertIn(item_id, archived_ids)
+        self.assertIn(item_id, all_ids)
+        self.assertIn(item_id, alias_ids)
+        detail = self.client.get(f"/pldr-api/v1/intake/{item_id}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertTrue(detail.json()["archived"])
+        self.assertEqual(self.formal_counts(), before_formal)
+        from pldr_api.investigations import bootstrap_legacy_investigations
+        from pldr_api.models import InvestigationLink, ReviewTask
+
+        with SessionLocal() as session:
+            bootstrap_legacy_investigations(session)
+            self.assertIsNone(
+                session.scalar(
+                    select(InvestigationLink.id).where(
+                        InvestigationLink.object_type == "intake",
+                        InvestigationLink.object_id == item_id,
+                    )
+                )
+            )
+            self.assertIsNone(
+                session.scalar(
+                    select(ReviewTask.id).where(
+                        ReviewTask.intake_item_id == item_id
+                    )
+                )
+            )
+
+        blocked_confirmation = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/confirm",
+            json=self.confirmation_request(item),
+        )
+        self.assertEqual(blocked_confirmation.status_code, 409, blocked_confirmation.text)
+        self.assertIn("Restore", blocked_confirmation.json()["detail"])
+
+        restored = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/restore"
+        )
+        self.assertEqual(restored.status_code, 200, restored.text)
+        restored_item = restored.json()["intake_item"]
+        self.assertTrue(restored.json()["changed"])
+        self.assertFalse(restored_item["archived"])
+        self.assertEqual(restored_item["status"], original_status)
+        self.assertIsNone(restored_item["archived_at"])
+        self.assertEqual(restored_item["allowed_actions"], ["archive"])
+        with SessionLocal() as session:
+            persisted = session.get(IntakeItem, item_id)
+            assert persisted is not None
+            archive_history = persisted.review["archive_history"]
+            self.assertEqual(
+                [entry["reason"] for entry in archive_history[-2:]],
+                [
+                    "Removed from active intake inbox",
+                    "Restored to active intake inbox",
+                ],
+            )
+        repeated_restore = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/restore",
+            json={"analyst": "archive-tester", "reason": "Repeated restore"},
+        )
+        self.assertFalse(repeated_restore.json()["changed"])
+        self.assertIn(
+            item_id,
+            {
+                entry["id"]
+                for entry in self.client.get("/pldr-api/v1/intake?limit=500").json()["items"]
+            },
+        )
+        self.assertEqual(self.formal_counts(), before_formal)
+
+        confirmed = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/confirm",
+            json=self.confirmation_request(item),
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        forbidden = self.client.post(
+            f"/pldr-api/v1/intake/{item_id}/archive",
+            json={"analyst": "archive-tester", "reason": "Must preserve formal provenance"},
+        )
+        self.assertEqual(forbidden.status_code, 409, forbidden.text)
+
+    def test_candidate_generation_rechecks_archive_state_after_model_await(self):
+        from pldr_api.models import IntakeCandidate
+
+        item_id = "int_race_archive_after_model"
+        candidate_id = f"{item_id}:event"
+        now = datetime.now(timezone.utc)
+        original_snapshot = (
+            "The preserved candidate states that concurrent archival must win over "
+            "a model response without changing review data."
+        )
+        with SessionLocal() as session:
+            session.add(
+                IntakeItem(
+                    id=item_id,
+                    input_type="text",
+                    status="generation_failed",
+                    source_description="Concurrent archive regression",
+                    language="en",
+                    raw_snapshot=original_snapshot,
+                    raw_hash="archive-race-raw",
+                    extracted_snapshot=original_snapshot,
+                    extracted_hash="archive-race-body",
+                    candidate_mode="failed",
+                    candidate_error="Preserve this prior model error",
+                    candidate_relations=[
+                        {"type": "event_claim", "from": "claim:1", "to": "event"}
+                    ],
+                    review={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                IntakeCandidate(
+                    id=candidate_id,
+                    item_id=item_id,
+                    candidate_key="event",
+                    object_type="event",
+                    source_mode="fallback",
+                    machine_data={"fields": {"title": "Preserved proposal"}},
+                    disposition="pending",
+                    created_at=now,
+                )
+            )
+            session.commit()
+
+        async def archive_while_model_is_awaited(*_args, **_kwargs):
+            with SessionLocal() as concurrent_session:
+                raced_item = concurrent_session.get(IntakeItem, item_id)
+                assert raced_item is not None
+                raced_item.archived_at = datetime.now(timezone.utc)
+                raced_item.archived_by = "concurrent-archiver"
+                raced_item.archive_reason = "Archive committed while model was running"
+                concurrent_session.commit()
+            return {"mode": "fallback"}
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            new=archive_while_model_is_awaited,
+        ):
+            response = self.client.post(
+                f"/pldr-api/v1/intake/{item_id}/regenerate"
+            )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("Restore", response.json()["detail"])
+
+        with SessionLocal() as session:
+            item = session.get(IntakeItem, item_id)
+            candidate = session.get(IntakeCandidate, candidate_id)
+            assert item is not None and candidate is not None
+            self.assertIsNotNone(item.archived_at)
+            self.assertEqual(item.archived_by, "concurrent-archiver")
+            self.assertEqual(item.status, "generation_failed")
+            self.assertEqual(item.candidate_mode, "failed")
+            self.assertEqual(item.candidate_error, "Preserve this prior model error")
+            self.assertEqual(
+                item.candidate_relations,
+                [{"type": "event_claim", "from": "claim:1", "to": "event"}],
+            )
+            self.assertEqual(
+                candidate.machine_data,
+                {"fields": {"title": "Preserved proposal"}},
+            )
+            self.assertEqual(candidate.disposition, "pending")
+            self.assertEqual(
+                session.scalar(
+                    select(func.count())
+                    .select_from(IntakeCandidate)
+                    .where(IntakeCandidate.item_id == item_id)
+                ),
+                1,
+            )
+
+    def test_late_candidate_result_cannot_overwrite_newer_analyst_disposition(self):
+        from pldr_api.intake import reject_intake
+        from pldr_api.models import IntakeCandidate
+
+        item_id = "int_generation_baseline_conflict"
+        candidate_id = f"{item_id}:event"
+        now = datetime.now(timezone.utc)
+        snapshot = (
+            "A late model result must never replace a newer analyst rejection or "
+            "clear the candidate decision that was committed while it was running."
+        )
+        with SessionLocal() as session:
+            session.add(
+                IntakeItem(
+                    id=item_id,
+                    input_type="text",
+                    status="generation_failed",
+                    source_description="Generation baseline conflict fixture",
+                    language="en",
+                    raw_snapshot=snapshot,
+                    raw_hash="generation-baseline-raw",
+                    extracted_snapshot=snapshot,
+                    extracted_hash="generation-baseline-body",
+                    candidate_mode="failed",
+                    candidate_error="Retryable provider failure",
+                    review={},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                IntakeCandidate(
+                    id=candidate_id,
+                    item_id=item_id,
+                    candidate_key="event",
+                    object_type="event",
+                    source_mode="fallback",
+                    machine_data={"fields": {"title": "Preserve rejected candidate"}},
+                    disposition="pending",
+                    created_at=now,
+                )
+            )
+            session.commit()
+
+        async def reject_while_model_is_running(*_args, **_kwargs):
+            with SessionLocal() as concurrent_session:
+                concurrent_item = concurrent_session.get(IntakeItem, item_id)
+                assert concurrent_item is not None
+                reject_intake(
+                    concurrent_session,
+                    concurrent_item,
+                    "baseline-conflict-analyst",
+                    "Analyst rejected while the model retry was running",
+                )
+            return {"mode": "fallback"}
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            new=reject_while_model_is_running,
+        ):
+            response = self.client.post(
+                f"/pldr-api/v1/intake/{item_id}/regenerate"
+            )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("changed while work was running", response.json()["detail"])
+        with SessionLocal() as session:
+            item = session.get(IntakeItem, item_id)
+            candidate = session.get(IntakeCandidate, candidate_id)
+            assert item is not None and candidate is not None
+            self.assertEqual(item.status, "rejected")
+            self.assertEqual(item.disposition, "reject")
+            self.assertEqual(item.reviewed_by, "baseline-conflict-analyst")
+            self.assertEqual(
+                item.rejection_reason,
+                "Analyst rejected while the model retry was running",
+            )
+            self.assertEqual(candidate.disposition, "rejected")
+            self.assertEqual(
+                candidate.machine_data,
+                {"fields": {"title": "Preserve rejected candidate"}},
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count())
+                    .select_from(IntakeCandidate)
+                    .where(IntakeCandidate.item_id == item_id)
+                ),
+                1,
+            )
+
+    def test_submission_routes_preserve_concurrently_archived_item_without_duplicate_failure(self):
+        from pldr_api.models import IntakeCandidate
+
+        async def archive_during_submission_model_call(_task, payload):
+            item_id = payload["intake_item_id"]
+            with SessionLocal() as concurrent_session:
+                item = concurrent_session.get(IntakeItem, item_id)
+                assert item is not None
+                item.archived_at = datetime.now(timezone.utc)
+                item.archived_by = "concurrent-submission-archiver"
+                item.archive_reason = "Archive committed while submission model was running"
+                concurrent_session.commit()
+            # Exercise the generic generation-exception path as well as the
+            # normal post-await archive check.  Neither path may turn the race
+            # into generation_failed or let an outer submit wrapper create a
+            # second failed IntakeItem.
+            if payload["input_type"] == "text":
+                raise RuntimeError("provider failed after concurrent archive")
+            return {"mode": "fallback"}
+
+        rss_xml = """<?xml version='1.0' encoding='UTF-8'?>
+        <rss version='2.0'><channel><title>Archive race feed</title><item>
+          <title>Archive race RSS item</title>
+          <link>https://archive-race.example.org/rss-item</link>
+          <description>This RSS description is deliberately long enough to reach candidate generation before a concurrent archive wins.</description>
+        </item></channel></rss>"""
+        cases = [
+            (
+                "web",
+                lambda: self.client.post(
+                    "/pldr-api/v1/import/url",
+                    json={
+                        "url": "https://archive-race.example.org/web-item",
+                        "source_name": "Archive race web source",
+                        "html": (
+                            "<html><head><title>Archive race web item</title></head>"
+                            "<body><article>This web material is deliberately long enough "
+                            "to reach candidate generation before a concurrent archive wins."
+                            "</article></body></html>"
+                        ),
+                        "language": "en",
+                    },
+                ),
+            ),
+            (
+                "text",
+                lambda: self.client.post(
+                    "/pldr-api/v1/intake/text",
+                    json={
+                        "text": (
+                            "This pasted material is deliberately long enough to reach candidate "
+                            "generation before a concurrent archive wins."
+                        ),
+                        "source_description": "Archive race pasted source",
+                        "language": "en",
+                    },
+                ),
+            ),
+            (
+                "file",
+                lambda: self.client.post(
+                    "/pldr-api/v1/intake/files",
+                    files={
+                        "file": (
+                            "archive-race.txt",
+                            b"This local file is deliberately long enough to reach candidate generation before a concurrent archive wins.",
+                            "text/plain",
+                        )
+                    },
+                    data={"source_description": "Archive race local file", "language": "en"},
+                ),
+            ),
+            (
+                "rss",
+                lambda: self.client.post(
+                    "/pldr-api/v1/import/rss",
+                    json={
+                        "xml": rss_xml,
+                        "source_name": "Archive race RSS source",
+                        "language": "en",
+                    },
+                ),
+            ),
+        ]
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            new=archive_during_submission_model_call,
+        ):
+            for expected_type, submit in cases:
+                with self.subTest(input_type=expected_type):
+                    with SessionLocal() as session:
+                        before_ids = set(session.scalars(select(IntakeItem.id)).all())
+                    response = submit()
+                    self.assertEqual(response.status_code, 409, response.text)
+                    self.assertIn("Restore", response.json()["detail"])
+                    with SessionLocal() as session:
+                        after_ids = set(session.scalars(select(IntakeItem.id)).all())
+                        new_ids = after_ids - before_ids
+                        self.assertEqual(len(new_ids), 1, new_ids)
+                        item = session.get(IntakeItem, next(iter(new_ids)))
+                        assert item is not None
+                        self.assertEqual(item.input_type, expected_type)
+                        self.assertEqual(item.status, "parsed")
+                        self.assertIsNone(item.error)
+                        self.assertIsNone(item.candidate_mode)
+                        self.assertIsNone(item.candidate_error)
+                        self.assertIsNotNone(item.archived_at)
+                        self.assertEqual(item.archived_by, "concurrent-submission-archiver")
+                        self.assertEqual(
+                            session.scalar(
+                                select(func.count())
+                                .select_from(IntakeCandidate)
+                                .where(IntakeCandidate.item_id == item.id)
+                            ),
+                            0,
+                        )
+
+    def test_archive_wins_between_confirmation_validation_and_formal_write_fence(self):
+        from pldr_api.intake import archive_intake, lock_intake_for_mutation
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            return_value={"mode": "fallback"},
+        ):
+            created = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": (
+                        "This confirmation race fixture has exact evidence and must never "
+                        "create formal objects after a concurrent archive commits."
+                    ),
+                    "source_description": "Confirmation archive race fixture",
+                    "language": "en",
+                },
+            )
+        self.assertEqual(created.status_code, 200, created.text)
+        item = created.json()["intake_item"]
+        before_formal = self.formal_counts()
+        archive_inserted = False
+
+        def archive_before_confirmation_fence(session, item_id, *, action):
+            nonlocal archive_inserted
+            if action == "confirming it" and not archive_inserted:
+                archive_inserted = True
+                with SessionLocal() as concurrent_session:
+                    concurrent_item = concurrent_session.get(IntakeItem, item_id)
+                    assert concurrent_item is not None
+                    archive_intake(
+                        concurrent_session,
+                        concurrent_item,
+                        analyst="confirmation-race-archiver",
+                        reason="Archive committed after validation and before formal writes",
+                    )
+            return lock_intake_for_mutation(session, item_id, action=action)
+
+        with patch(
+            "pldr_api.intake.lock_intake_for_mutation",
+            new=archive_before_confirmation_fence,
+        ):
+            confirmed = self.client.post(
+                f"/pldr-api/v1/intake/{item['id']}/confirm",
+                json=self.confirmation_request(item),
+            )
+        self.assertTrue(archive_inserted)
+        self.assertEqual(confirmed.status_code, 409, confirmed.text)
+        self.assertIn("Restore", confirmed.json()["detail"])
+        self.assertEqual(self.formal_counts(), before_formal)
+        with SessionLocal() as session:
+            persisted = session.get(IntakeItem, item["id"])
+            assert persisted is not None
+            self.assertTrue(persisted.archived_at)
+            self.assertEqual(persisted.status, "candidate_ready")
+            self.assertIsNone(persisted.final_event_id)
+            self.assertIsNone(persisted.final_document_id)
+            self.assertIsNone(persisted.confirmation_fingerprint)
+
+    def test_archive_schema_migration_adds_columns_and_repairs_missing_indexes(self):
+        from pldr_api import main as main_module
+
+        migration_root = Path(tempfile.mkdtemp(prefix="pldr-archive-migration-"))
+        migration_engine = create_engine(f"sqlite:///{migration_root / 'legacy.db'}")
+        try:
+            with migration_engine.begin() as connection:
+                connection.execute(
+                    text("CREATE TABLE intake_items (id VARCHAR(80) PRIMARY KEY)")
+                )
+                connection.execute(
+                    text(
+                        "CREATE TABLE external_search_query_runs ("
+                        "id VARCHAR(96) PRIMARY KEY, result_count INTEGER DEFAULT 0, "
+                        "current_page INTEGER DEFAULT 1, page_size INTEGER DEFAULT 10, "
+                        "returned_count INTEGER DEFAULT 0, has_more BOOLEAN DEFAULT 0, "
+                        "total_known BOOLEAN DEFAULT 0, updated_at DATETIME, created_at DATETIME)"
+                    )
+                )
+            with patch.object(main_module, "engine", migration_engine):
+                main_module.ensure_compatible_schema()
+            legacy = inspect(migration_engine)
+            for table_name in ("intake_items", "external_search_query_runs"):
+                columns = {column["name"] for column in legacy.get_columns(table_name)}
+                self.assertTrue(
+                    {"archived_at", "archived_by", "archive_reason"}.issubset(columns)
+                )
+            self.assertIn(
+                "ix_intake_items_archived_at",
+                {index["name"] for index in legacy.get_indexes("intake_items")},
+            )
+            self.assertIn(
+                "ix_external_search_query_runs_archived_at",
+                {
+                    index["name"]
+                    for index in legacy.get_indexes("external_search_query_runs")
+                },
+            )
+
+            with migration_engine.begin() as connection:
+                connection.execute(text("DROP INDEX ix_intake_items_archived_at"))
+                connection.execute(
+                    text("DROP INDEX ix_external_search_query_runs_archived_at")
+                )
+            with patch.object(main_module, "engine", migration_engine):
+                main_module.ensure_compatible_schema()
+            repaired = inspect(migration_engine)
+            self.assertIn(
+                "ix_intake_items_archived_at",
+                {index["name"] for index in repaired.get_indexes("intake_items")},
+            )
+            self.assertIn(
+                "ix_external_search_query_runs_archived_at",
+                {
+                    index["name"]
+                    for index in repaired.get_indexes("external_search_query_runs")
+                },
+            )
+        finally:
+            migration_engine.dispose()
+            shutil.rmtree(migration_root, ignore_errors=True)
+
     def test_review_dispositions_are_atomic_idempotent_and_traceable(self):
         baseline = counts(SessionLocal())
 
@@ -1294,6 +1862,18 @@ class P0Test(unittest.TestCase):
         self.assertEqual(retried.status_code, 200, retried.text)
         self.assertEqual(retried.json()["intake_status"], "candidate_ready")
         self.assertEqual(retried.json()["intake_item_id"], charlie_response["intake_item_id"])
+        with SessionLocal() as session:
+            from pldr_api.models import ReviewTask
+
+            task = session.scalar(
+                select(ReviewTask).where(
+                    ReviewTask.intake_item_id == charlie_response["intake_item_id"]
+                )
+            )
+            assert task is not None
+            self.assertEqual(task.status, "ready")
+            self.assertIsNone(task.error_class)
+            self.assertIsNone(task.error_message)
         self.assertEqual(self.formal_counts(), before)
 
     def test_external_search_stays_evidence_first_and_idempotent_after_confirmation(self):
@@ -1552,6 +2132,15 @@ class P0Test(unittest.TestCase):
         self.assertIn("item.search_history", script.text)
         self.assertIn("处理追踪", script.text)
         self.assertIn('escapeHtml(result.title || "无标题")', script.text)
+        report_source = script.text.split("async function generateReport", 1)[1].split(
+            "\n}\n\nfunction openImportModal", 1
+        )[0]
+        self.assertIn("const scopeInvestigation = eventOverviewInvestigation();", report_source)
+        self.assertIn("isServerInvestigation(scopeInvestigation)", report_source)
+        self.assertIn(
+            "...(scopeInvestigationId ? { investigation_id: scopeInvestigationId } : {})",
+            report_source,
+        )
 
         styles = self.client.get("/assets/styles.css")
         self.assertEqual(styles.status_code, 200)
@@ -1560,7 +2149,7 @@ class P0Test(unittest.TestCase):
         self.assertIn(".search-modal", styles.text)
         self.assertIn(".search-result", styles.text)
 
-    def test_initial_selection_keeps_workspace_closed_without_a_deep_link(self):
+    def test_initial_route_only_opens_drawer_for_a_valid_event_deep_link(self):
         script = self.client.get("/assets/app.js")
         self.assertEqual(script.status_code, 200)
         source = script.text
@@ -1572,8 +2161,17 @@ class P0Test(unittest.TestCase):
         )
         self.assertIn("preferredEventId: requestedEvent", init_source)
         self.assertIn("syncSelectionUrl: false", init_source)
-        self.assertIn("requestedEvent && state.selectedId === requestedEvent", init_source)
-        self.assertIn("openDrawer();", init_source)
+        self.assertIn("const eventOverviewRoute =", init_source)
+        self.assertIn(
+            "requestedEvent && eventOverviewEvents().some((event) => event.id === requestedEvent)",
+            init_source,
+        )
+        self.assertIn(
+            "await selectEvent(requestedEvent, { open: true, syncUrl: false });",
+            init_source,
+        )
+        self.assertIn("showInvestigationHome({ syncUrl: false });", init_source)
+        self.assertNotIn("openDrawer();", init_source)
 
 
 if __name__ == "__main__":

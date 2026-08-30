@@ -52,6 +52,15 @@ class InvestigationLinkRequest(BaseModel):
 class ReviewTaskRetryRequest(BaseModel):
     actor: str = Field(default="analyst", min_length=1, max_length=160)
 
+
+class ArchiveRequest(BaseModel):
+    analyst: str = Field(default="analyst", min_length=1, max_length=160)
+    # The same envelope is used by archive/remove and restore endpoints.  Leave
+    # the reason unset here so each route can supply an action-accurate audit
+    # default instead of recording an archive explanation for a restore.
+    reason: str | None = Field(default=None, min_length=3, max_length=2000)
+
+
 class ReportRequest(BaseModel):
     event_ids:list[str]=Field(default_factory=list,max_length=20)
     investigation_id:str|None=Field(default=None,max_length=80)

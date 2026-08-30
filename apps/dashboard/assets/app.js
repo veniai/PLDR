@@ -6,6 +6,8 @@ const state = {
   selectedEvent: null,
   selectedEventError: null,
   selectedEventRequestSerial: 0,
+  eventOverviewScopeInvestigationId: null,
+  eventOverviewScopeRequestSerial: 0,
   sources: [],
   config: null,
   drawerTab: "overview",
@@ -15,6 +17,7 @@ const state = {
   intakeOptions: { events: [], entities: [] },
   selectedIntakeId: null,
   intakeScopeInvestigationId: null,
+  intakeScopeInvestigationTitle: null,
   intakeMobileStep: 0,
   intakeRequestSerial: 0,
   intakePreviewRequestSerial: 0,
@@ -22,6 +25,7 @@ const state = {
   intakeActionBusy: false,
   intakeActionSerial: 0,
   intakeDrafts: {},
+  intakeVisibility: "active",
   searchRun: null,
   searchResults: [],
   searchCurrentPageIds: [],
@@ -33,6 +37,7 @@ const state = {
   searchHistoryError: "",
   searchHistoryRequestSerial: 0,
   searchHistoryAvailable: true,
+  searchHistoryVisibility: "active",
   searchPage: 1,
   searchPageSize: 20,
   searchHasMore: false,
@@ -52,12 +57,15 @@ const state = {
   collectionBusy: false,
   collectionRequestSerial: 0,
   collectionDiffRequestSerial: 0,
+  collectionReviewSerial: 0,
+  collectionRefreshSerial: 0,
   collectionPollTimer: null,
   investigations: [],
   investigationMode: "loading",
   investigationError: "",
   activeInvestigationId: null,
-  activeInvestigationTab: "today",
+  activeInvestigationTab: "overview",
+  investigationSectionByTab: { materials: "discovery", outcomes: "events" },
   investigationDetails: new Map(),
   investigationTasks: new Map(),
   investigationTaskErrors: new Map(),
@@ -69,8 +77,14 @@ const state = {
   investigationEventRequestTokens: new Map(),
   investigationPollTimer: null,
   investigationRequestSerial: 0,
+  investigationCreateRequestSerial: 0,
+  importRequestSerial: 0,
+  collectionSubmitSerial: 0,
   localInvestigationState: null,
   pendingCollectionInvestigationId: null,
+  collectionScopeInvestigationId: null,
+  collectionScopeInvestigationTitle: null,
+  collectionScopeTargetIds: null,
   reportHistory: new Map(),
   loading: false,
 };
@@ -84,10 +98,13 @@ const API_ROUTES = Object.freeze({
   investigationTasks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/tasks`,
   investigationActivity: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/activity`,
   investigationLinks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/links`,
+  investigationIntakeAction: (investigationId, itemId, action) => `/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/intake/${encodeURIComponent(itemId)}/${action}`,
   taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`,
+  intakeAction: (id, action) => `/pldr-api/v1/intake/${encodeURIComponent(id)}/${action}`,
   search: "/pldr-api/v1/search",
   searchRuns: "/pldr-api/v1/search/runs",
   searchRun: (id) => `/pldr-api/v1/search/runs/${encodeURIComponent(id)}`,
+  searchRunAction: (id, action) => `/pldr-api/v1/search/runs/${encodeURIComponent(id)}/${action}`,
   searchSelect: "/pldr-api/v1/search/select",
   reports: "/pldr-api/v1/reports",
 });
@@ -95,7 +112,19 @@ const API_ROUTES = Object.freeze({
 const LOCAL_INVESTIGATION_KEY = "pldr.investigations.v1";
 const NEW_INVESTIGATION_VALUE = "__new_investigation__";
 const UNASSIGNED_VALUE = "__unassigned__";
-const INVESTIGATION_TABS = new Set(["today", "discovery", "monitoring", "review", "events", "claims", "reports", "activity"]);
+const INVESTIGATION_TABS = new Set(["overview", "materials", "review", "outcomes", "activity"]);
+const INVESTIGATION_SECTIONS = Object.freeze({
+  materials: new Set(["discovery", "monitoring"]),
+  outcomes: new Set(["events", "claims", "reports"]),
+});
+const LEGACY_INVESTIGATION_TABS = Object.freeze({
+  today: { tab: "overview" },
+  discovery: { tab: "materials", section: "discovery" },
+  monitoring: { tab: "materials", section: "monitoring" },
+  events: { tab: "outcomes", section: "events" },
+  claims: { tab: "outcomes", section: "claims" },
+  reports: { tab: "outcomes", section: "reports" },
+});
 const INVESTIGATION_TASK_PAGE_SIZE = 500;
 const INVESTIGATION_DIRECTORY_PAGE_SIZE = 500;
 const INVESTIGATION_ACTIVITY_PAGE_SIZE = 500;
@@ -120,9 +149,10 @@ const LABELS = {
     candidate_ready: "候选待审",
     generation_failed: "生成失败",
     confirmed: "已确认入档",
-    rejected: "已驳回",
+    rejected: "不采用",
     cancelled: "已撤销",
     failed: "采集失败",
+    archived: "已删除",
   },
   inputType: { web: "公共网页", text: "粘贴文本", file: "本地文件", rss: "RSS", search: "外部搜索结果", collection: "固定网页版本" },
   searchScope: { news: "新闻", web: "一般公开网页" },
@@ -149,22 +179,22 @@ const LABELS = {
   },
   investigationStatus: { active: "进行中", paused: "已暂停", closed: "已关闭", archived: "已归档" },
   taskStage: {
-    queued: "queued · 已排队",
-    waiting: "queued · 已排队",
-    fetching: "fetching · 正在抓取",
-    running: "fetching · 正在抓取",
-    generating: "generating · 正在生成候选",
-    parsed: "generating · 正在生成候选",
-    ready: "ready · 等待人工审核",
-    candidate_ready: "ready · 等待人工审核",
-    failed: "failed · 处理失败",
-    blocked: "failed · 需要恢复",
-    retrying: "queued · 已提交重试",
-    completed: "completed · 已处理",
-    confirmed: "accepted · 已确认入档",
-    accepted: "accepted · 已确认入档",
-    rejected: "rejected · 已驳回",
-    cancelled: "cancelled · 已撤销",
+    queued: "处理中",
+    waiting: "处理中",
+    fetching: "处理中",
+    running: "处理中",
+    generating: "处理中",
+    parsed: "处理中",
+    ready: "待核对",
+    candidate_ready: "待核对",
+    failed: "需要处理",
+    blocked: "需要处理",
+    retrying: "处理中",
+    completed: "已完成",
+    confirmed: "已完成",
+    accepted: "已完成",
+    rejected: "已完成",
+    cancelled: "已完成",
   },
 };
 
@@ -176,6 +206,8 @@ const ACTIVITY_ACTION_LABELS = Object.freeze({
   "search.query_linked": "把检索关联到专题",
   "search.query_completed": "公开资料检索完成",
   "search.query_failed": "公开资料检索失败",
+  "search.query_archived": "把查询记录移到已删除",
+  "search.query_restored": "恢复了查询记录",
   "search.result_selected": "选择资料进入处理队列",
   "collection.target_linked": "添加了固定监测来源",
   "collection.version_linked": "监测版本进入待审流程",
@@ -188,14 +220,18 @@ const ACTIVITY_ACTION_LABELS = Object.freeze({
   "task.ready": "候选已就绪，等待人工审核",
   "task.failed": "处理任务失败",
   "task.confirmed": "人工确认任务已完成",
-  "task.rejected": "人工驳回任务已完成",
+  "task.rejected": "人工决定不采用，任务已完成",
   "task.deduplicated": "复用了已有处理任务",
   "task.reused": "复用了已有处理任务",
   "task.lease_recovered": "超时任务已恢复到队列",
   "task.retry": "重新提交了失败任务",
   "intake.confirmed": "人工确认材料入档",
-  "intake.rejected": "人工驳回材料",
+  "intake.rejected": "人工决定不采用材料",
   "intake.cancelled": "撤销材料处理",
+  "intake.archived": "把材料移到全局已删除",
+  "intake.restored": "恢复了全局材料",
+  "intake.removed_from_investigation": "把材料从本专题移除",
+  "intake.restored_to_investigation": "把材料恢复到本专题",
   investigation_created_locally: "创建了浏览器本地专题草稿",
   linked_locally: "在本浏览器关联了资料",
 });
@@ -440,17 +476,28 @@ function renderOperationalError(input, { stage = "unknown", compact = false, act
   const error = normalizeOperationalError(input, stage);
   const trace = error.traceId ? `
     <span class="error-trace">诊断编号 <code>${escapeHtml(error.traceId)}</code><button class="text-btn" type="button" data-copy-trace="${escapeHtml(error.traceId)}">复制</button></span>` : "";
-  return `
-    <article class="operational-error ${compact ? "compact" : ""}" role="alert">
+  const detailRows = `<dl>
+      <div><dt>发生了什么</dt><dd>${escapeHtml(error.message)}</dd></div>
+      <div><dt>影响</dt><dd>${escapeHtml(error.impact)}</dd></div>
+      <div><dt>怎么办</dt><dd>${escapeHtml(error.nextAction)}</dd></div>
+    </dl>`;
+  const technical = `<div class="error-technical"><strong>诊断信息${error.code ? ` · ${escapeHtml(error.code)}` : ""}</strong><pre>${escapeHtml(error.technical)}</pre>${trace}</div>`;
+  return compact ? `
+    <article class="operational-error compact" role="alert">
       <div class="operational-error-heading">
         <span class="error-stage">${escapeHtml(ERROR_STAGE_LABELS[error.stage] || ERROR_STAGE_LABELS.unknown)}</span>
         <strong>${escapeHtml(error.title)}</strong>
       </div>
-      <dl>
-        <div><dt>发生了什么</dt><dd>${escapeHtml(error.message)}</dd></div>
-        <div><dt>影响</dt><dd>${escapeHtml(error.impact)}</dd></div>
-        <div><dt>怎么办</dt><dd>${escapeHtml(error.nextAction)}</dd></div>
-      </dl>
+      <p class="operational-error-summary">${escapeHtml(error.message)}</p>
+      ${actionHtml ? `<div class="operational-error-action">${actionHtml}</div>` : ""}
+      <details><summary>查看原因、影响与诊断</summary>${detailRows}${technical}</details>
+    </article>` : `
+    <article class="operational-error" role="alert">
+      <div class="operational-error-heading">
+        <span class="error-stage">${escapeHtml(ERROR_STAGE_LABELS[error.stage] || ERROR_STAGE_LABELS.unknown)}</span>
+        <strong>${escapeHtml(error.title)}</strong>
+      </div>
+      ${detailRows}
       ${actionHtml ? `<div class="operational-error-action">${actionHtml}</div>` : ""}
       <details><summary>技术详情${error.code ? ` · ${escapeHtml(error.code)}` : ""}</summary><pre>${escapeHtml(error.technical)}</pre>${trace}</details>
     </article>`;
@@ -520,12 +567,17 @@ function unwrapItems(payload, ...keys) {
   return [];
 }
 
-async function loadAllInvestigationTasks(investigationId) {
+function recordIsArchived(record) {
+  return Boolean(record?.archived || record?.archived_at || record?.removed || record?.removed_at
+    || record?.link?.archived || record?.link?.archived_at || record?.membership?.archived || record?.membership?.archived_at);
+}
+
+async function loadAllInvestigationTasks(investigationId, visibility = "active") {
   const tasksById = new Map();
   let offset = 0;
   let total = null;
   do {
-    const params = new URLSearchParams({ offset: String(offset), limit: String(INVESTIGATION_TASK_PAGE_SIZE) });
+    const params = new URLSearchParams({ offset: String(offset), limit: String(INVESTIGATION_TASK_PAGE_SIZE), visibility });
     const payload = await api(`${API_ROUTES.investigationTasks(investigationId)}?${params}`);
     const page = unwrapItems(payload, "items", "tasks", "review_tasks");
     page.forEach((task) => tasksById.set(task.id, task));
@@ -806,7 +858,9 @@ function taskErrorPayload(task) {
 
 function taskStatusMarkup(stage) {
   const safe = canonicalTaskStage({ status: stage });
-  return `<span class="task-stage ${escapeHtml(safe)}">${escapeHtml(LABELS.taskStage[safe] || safe)}</span>`;
+  const humanState = LABELS.taskStage[safe]
+    || (["ready"].includes(safe) ? "待核对" : ["failed", "blocked"].includes(safe) ? "需要处理" : ["accepted", "rejected", "cancelled", "completed"].includes(safe) ? "已完成" : "处理中");
+  return `<span class="task-stage ${escapeHtml(safe)}">${escapeHtml(humanState)}</span>`;
 }
 
 function linksForInvestigation(investigationId) {
@@ -978,7 +1032,7 @@ function updateDestinationFields(kind) {
           ? (unclassifiedInvestigation()
             ? "检索与材料会进入服务端“系统待归类”（inv_unclassified），异步进度仍可追踪，但不会冒充用户专题。"
             : "旧版后端未返回系统待归类专题；将保留原采集箱兼容流程，不会声称已归入用户专题。")
-          : "材料处理状态会在专题“待我审核”中持续显示。";
+          : "材料处理状态会在专题“待审核”中持续显示。";
   }
   if (kind === "search" && state.searchResults.length) renderSearchResults();
 }
@@ -1006,7 +1060,7 @@ function renderInvestigationHome() {
     note.textContent = "当前后端未提供专题接口。新建专题与归类只保存在此浏览器，并明确标注；原有事件、采集箱、来源监测和证据链仍照常使用。";
   } else if (state.investigationMode === "error") {
     note.className = "investigation-sync-note error";
-    note.textContent = `专题服务读取失败：${state.investigationError}。没有伪造同步结果；可继续使用经典事件视图与既有采集箱。`;
+    note.textContent = `专题服务读取失败：${state.investigationError}。没有伪造同步结果；可继续使用事件总览与既有采集箱。`;
   } else {
     note.className = "investigation-sync-note";
     note.textContent = "正在读取专题服务…";
@@ -1104,6 +1158,18 @@ async function refreshInvestigationDirectory() {
       // Collection is optional for the investigation shell; the existing monitor retains its own error UI.
     }
   }
+  const unavailableScopeId = state.eventOverviewScopeInvestigationId
+    && !state.investigations.some((item) => item.id === state.eventOverviewScopeInvestigationId)
+    ? state.eventOverviewScopeInvestigationId
+    : null;
+  if (unavailableScopeId) {
+    const url = new URL(window.location.href);
+    ["investigation", "tab", "section", "view", "event", "event_scope"].forEach((key) => url.searchParams.delete(key));
+    history.replaceState(null, "", url);
+    showInvestigationHome({ syncUrl: false });
+    toast("当前专题已不在可用目录中，已返回“我的专题”。没有改为显示全局事件。", "error", 7500);
+    return;
+  }
   renderInvestigationHome();
 }
 
@@ -1152,7 +1218,7 @@ async function loadInvestigationWorkspace(investigationId, { quiet = false } = {
     state.investigationActivityErrors.set(investigation.id, calls[2].reason);
   }
   const detailLinks = unwrapItems(state.investigationDetails.get(investigation.id), "links");
-  if (detailLinks.length) state.investigationLinks.set(investigation.id, detailLinks);
+  state.investigationLinks.set(investigation.id, detailLinks);
   renderInvestigationHome();
   renderInvestigationPage();
   scheduleInvestigationPoll();
@@ -1168,6 +1234,116 @@ function scheduleInvestigationPoll() {
   state.investigationPollTimer = window.setTimeout(() => loadInvestigationWorkspace(investigation.id, { quiet: true }), 2500);
 }
 
+function normalizeInvestigationRoute(tab = "overview", section = null) {
+  const legacy = LEGACY_INVESTIGATION_TABS[tab];
+  if (legacy) return { tab: legacy.tab, section: legacy.section || null };
+  const normalizedTab = INVESTIGATION_TABS.has(tab) ? tab : "overview";
+  const allowedSections = INVESTIGATION_SECTIONS[normalizedTab];
+  const fallbackSection = normalizedTab === "materials" ? "discovery" : normalizedTab === "outcomes" ? "events" : null;
+  return {
+    tab: normalizedTab,
+    section: allowedSections?.has(section) ? section : fallbackSection,
+  };
+}
+
+function activeInvestigationSection(tab = state.activeInvestigationTab) {
+  return state.investigationSectionByTab[tab] || null;
+}
+
+function investigationShowsClaims() {
+  return state.activeInvestigationTab === "outcomes" && activeInvestigationSection("outcomes") === "claims";
+}
+
+function investigationNeedsEvidence() {
+  return state.activeInvestigationTab === "overview" || investigationShowsClaims();
+}
+
+function eventOverviewInvestigation() {
+  return state.investigations.find((item) => item.id === state.eventOverviewScopeInvestigationId) || null;
+}
+
+function eventOverviewScopeUnavailable() {
+  return Boolean(state.eventOverviewScopeInvestigationId && !eventOverviewInvestigation());
+}
+
+function eventOverviewEvents() {
+  const investigation = eventOverviewInvestigation();
+  if (state.eventOverviewScopeInvestigationId && !investigation) return [];
+  return investigation ? eventsForInvestigation(investigation) : state.events;
+}
+
+function renderEventOverviewScope() {
+  const investigation = eventOverviewInvestigation();
+  const scope = $("#event-overview-scope");
+  const back = $("#event-overview-return");
+  if (scope) {
+    scope.innerHTML = eventOverviewScopeUnavailable()
+      ? "<strong>专题范围不可用</strong> · 已停止显示，不会回退到全局事件"
+      : investigation
+      ? `<strong>当前专题</strong> · 只显示“${escapeHtml(investigation.title)}”已确认的事件`
+      : "<strong>全局范围</strong> · 显示全部已确认事件";
+  }
+  if (back) {
+    back.hidden = !investigation;
+    back.textContent = investigation ? `← 返回“${investigation.title}”` : "← 返回专题";
+  }
+}
+
+function syncInvestigationUrl(investigationId, tab, section, { replace = false } = {}) {
+  const url = new URL(window.location.href);
+  url.searchParams.set("investigation", investigationId);
+  url.searchParams.set("tab", tab);
+  if (section) url.searchParams.set("section", section); else url.searchParams.delete("section");
+  url.searchParams.delete("view");
+  url.searchParams.delete("event");
+  url.searchParams.delete("event_scope");
+  history[replace ? "replaceState" : "pushState"](null, "", url);
+}
+
+async function ensureEventOverviewScopeLoaded(investigation, { force = false } = {}) {
+  if (!investigation || !isServerInvestigation(investigation) || (!force && state.investigationDetails.has(investigation.id))) return;
+  const detail = await api(API_ROUTES.investigation(investigation.id));
+  state.investigationDetails.set(investigation.id, detail);
+  const updated = normalizeInvestigation(detail.investigation || detail, "server");
+  state.investigations = state.investigations.map((item) => item.id === investigation.id
+    ? { ...item, ...updated, raw: { ...item.raw, ...updated.raw } }
+    : item);
+  const detailLinks = unwrapItems(detail, "links");
+  state.investigationLinks.set(investigation.id, detailLinks);
+}
+
+async function reconcileEventOverviewSelection() {
+  const scopedEvents = state.filteredEvents;
+  const url = new URL(window.location.href);
+  const requestedEvent = url.searchParams.get("event");
+  if (requestedEvent && !scopedEvents.some((event) => event.id === requestedEvent)) {
+    url.searchParams.delete("event");
+    history.replaceState(null, "", url);
+    if ($("#event-drawer")?.classList.contains("open")) closeDrawer();
+  }
+  if (scopedEvents.some((event) => event.id === state.selectedId)) {
+    if (state.selectedEvent?.id !== state.selectedId) {
+      await selectEvent(state.selectedId, { open: false, syncUrl: false });
+    } else {
+      renderAssessment();
+      renderGaps();
+      $("#btn-report").disabled = false;
+    }
+    return;
+  }
+  state.selectedEventRequestSerial += 1;
+  state.selectedId = null;
+  state.selectedEvent = null;
+  state.selectedEventError = null;
+  $("#btn-report").disabled = true;
+  renderAssessment();
+  renderGaps();
+  if ($("#event-drawer")?.classList.contains("open")) renderDrawer();
+  if (scopedEvents[0]) {
+    await selectEvent(scopedEvents[0].id, { open: false, syncUrl: false });
+  }
+}
+
 function setRouteVisibility(route) {
   const classic = route === "classic";
   $("#investigation-app").hidden = classic;
@@ -1176,8 +1352,20 @@ function setRouteVisibility(route) {
   $("#btn-classic-workspace").classList.toggle("active", classic);
 }
 
+function closeRouteScopedSurfaces() {
+  if ($("#intake-modal")?.open) closeIntakeModal();
+  if ($("#collection-modal")?.open) closeCollectionModal();
+  if ($("#search-modal")?.open) closeExternalSearchModal();
+  if ($("#import-modal")?.open) closeImportModal();
+  if ($("#investigation-create-modal")?.open) closeInvestigationCreateModal();
+}
+
 function showInvestigationHome({ syncUrl = true } = {}) {
+  closeRouteScopedSurfaces();
+  resetEventOverviewContext();
   state.activeInvestigationId = null;
+  state.eventOverviewScopeInvestigationId = null;
+  if ($("#event-drawer")?.classList.contains("open")) closeDrawer();
   if (state.investigationPollTimer) window.clearTimeout(state.investigationPollTimer);
   state.investigationPollTimer = null;
   setRouteVisibility("investigation");
@@ -1186,58 +1374,151 @@ function showInvestigationHome({ syncUrl = true } = {}) {
   renderInvestigationHome();
   if (syncUrl) {
     const url = new URL(window.location.href);
-    ["investigation", "tab", "view", "event"].forEach((key) => url.searchParams.delete(key));
+    ["investigation", "tab", "section", "view", "event", "event_scope"].forEach((key) => url.searchParams.delete(key));
     history.pushState(null, "", url);
   }
 }
 
-function showClassicWorkspace({ syncUrl = true } = {}) {
+async function showClassicWorkspace({ syncUrl = true, scopeInvestigationId = null } = {}) {
+  closeRouteScopedSurfaces();
+  state.activeInvestigationId = null;
+  if (state.investigationPollTimer) window.clearTimeout(state.investigationPollTimer);
+  state.investigationPollTimer = null;
+  const requestSerial = ++state.eventOverviewScopeRequestSerial;
+  const previousScopeId = state.eventOverviewScopeInvestigationId;
+  const scopeRequested = scopeInvestigationId !== null && scopeInvestigationId !== undefined;
+  const requestedScopeId = scopeRequested ? String(scopeInvestigationId).trim() : null;
+  const requestedScope = requestedScopeId ? state.investigations.find((item) => item.id === requestedScopeId) : null;
+  if (scopeRequested && !requestedScope) {
+    state.eventOverviewScopeInvestigationId = null;
+    const url = new URL(window.location.href);
+    ["view", "event_scope", "event", "investigation", "tab", "section"].forEach((key) => url.searchParams.delete(key));
+    history.replaceState(null, "", url);
+    showInvestigationHome({ syncUrl: false });
+    toast("专题范围不存在或暂时不可用，已返回“我的专题”；没有改为显示全局事件。", "error", 7000);
+    return false;
+  }
+  state.eventOverviewScopeInvestigationId = requestedScope?.id || null;
+  if (previousScopeId !== state.eventOverviewScopeInvestigationId) {
+    state.selectedEventRequestSerial += 1;
+    state.selectedId = null;
+    state.selectedEvent = null;
+    state.selectedEventError = null;
+    $("#btn-report").disabled = true;
+    if ($("#event-drawer")?.classList.contains("open")) closeDrawer();
+  }
   setRouteVisibility("classic");
+  renderTopic();
+  renderSources();
+  renderAssessment();
+  renderGaps();
+  applyFilters();
   renderMetrics();
   if (syncUrl) {
     const url = new URL(window.location.href);
-    url.searchParams.set("view", "classic");
+    url.searchParams.set("view", "events");
     url.searchParams.delete("investigation");
     url.searchParams.delete("tab");
+    url.searchParams.delete("section");
+    if (state.eventOverviewScopeInvestigationId) url.searchParams.set("event_scope", state.eventOverviewScopeInvestigationId);
+    else url.searchParams.delete("event_scope");
     history.pushState(null, "", url);
   }
+  const scopeInvestigation = eventOverviewInvestigation();
+  if (scopeInvestigation) {
+    try {
+      await ensureEventOverviewScopeLoaded(scopeInvestigation);
+    } catch (error) {
+      if (requestSerial !== state.eventOverviewScopeRequestSerial || state.eventOverviewScopeInvestigationId !== scopeInvestigation.id) return false;
+      toast(`本专题事件范围读取失败：${error.message || "未知错误"}`, "error", 7000);
+    }
+    if (requestSerial !== state.eventOverviewScopeRequestSerial || state.eventOverviewScopeInvestigationId !== scopeInvestigation.id) return false;
+    renderTopic();
+    renderSources();
+    renderGaps();
+    applyFilters();
+  }
+  await reconcileEventOverviewSelection();
+  if (requestSerial !== state.eventOverviewScopeRequestSerial) return false;
+  renderMetrics();
+  return true;
 }
 
-async function openInvestigation(investigationId, tab = "today", { syncUrl = true } = {}) {
+async function openInvestigation(investigationId, tab = "overview", { syncUrl = true, section = null } = {}) {
+  closeRouteScopedSurfaces();
+  resetEventOverviewContext();
   const investigation = state.investigations.find((item) => item.id === investigationId);
   if (!investigation) {
     toast("专题不存在或已被移除。", "error");
     showInvestigationHome({ syncUrl });
     return;
   }
+  const route = normalizeInvestigationRoute(tab, section);
+  state.eventOverviewScopeInvestigationId = null;
+  if ($("#event-drawer")?.classList.contains("open")) closeDrawer();
   state.activeInvestigationId = investigationId;
-  state.activeInvestigationTab = INVESTIGATION_TABS.has(tab) ? tab : "today";
+  state.activeInvestigationTab = route.tab;
+  if (route.section) state.investigationSectionByTab[route.tab] = route.section;
   setRouteVisibility("investigation");
   $("#investigation-home").hidden = true;
   $("#investigation-detail-page").hidden = false;
   renderInvestigationPage();
   if (syncUrl) {
+    syncInvestigationUrl(investigationId, state.activeInvestigationTab, route.section);
+  } else {
     const url = new URL(window.location.href);
-    url.searchParams.set("investigation", investigationId);
-    url.searchParams.set("tab", state.activeInvestigationTab);
-    url.searchParams.delete("view");
-    url.searchParams.delete("event");
-    history.pushState(null, "", url);
+    const before = url.search;
+    ["view", "event", "event_scope"].forEach((key) => url.searchParams.delete(key));
+    if (url.search !== before) history.replaceState(null, "", url);
   }
   await loadInvestigationWorkspace(investigationId);
-  if (["today", "claims"].includes(state.activeInvestigationTab)) await loadInvestigationEvidence(investigation);
+  if (investigationNeedsEvidence()) await loadInvestigationEvidence(investigation);
 }
 
-function setInvestigationTab(tab, { syncUrl = true } = {}) {
-  if (!INVESTIGATION_TABS.has(tab) || !activeInvestigation()) return;
-  state.activeInvestigationTab = tab;
+async function openInvestigationEvent(eventId, investigationId = state.activeInvestigationId) {
+  if (!eventId) {
+    toast("事件标识缺失，无法打开正式档案。", "error", 6500);
+    return;
+  }
+  const scope = investigationId
+    ? state.investigations.find((item) => item.id === investigationId) || null
+    : null;
+  if (investigationId && !isServerInvestigation(scope)) {
+    toast("无法确定这个事件所属的专题，已停止打开。", "error", 6500);
+    return;
+  }
+  const applied = await showClassicWorkspace({ scopeInvestigationId: scope?.id || null });
+  if (!applied) return;
+  clearFilters();
+  if (!state.filteredEvents.some((event) => event.id === eventId)) {
+    toast(scope
+      ? "这个事件已不在当前专题的正式档案中，未打开其他专题的数据。"
+      : "这个事件档案已不可用，请刷新后重试。", "error", 7000);
+    return;
+  }
+  await selectEvent(eventId, { open: true });
+}
+
+function setInvestigationTab(tab, { syncUrl = true, section = null } = {}) {
+  const investigation = activeInvestigation();
+  if (!investigation) return;
+  const route = normalizeInvestigationRoute(tab, section);
+  state.activeInvestigationTab = route.tab;
+  if (route.section) state.investigationSectionByTab[route.tab] = route.section;
   renderInvestigationPage();
   if (syncUrl) {
-    const url = new URL(window.location.href);
-    url.searchParams.set("tab", tab);
-    history.pushState(null, "", url);
+    syncInvestigationUrl(investigation.id, route.tab, route.section);
   }
-  if (["today", "claims"].includes(tab)) loadInvestigationEvidence(activeInvestigation());
+  if (investigationNeedsEvidence()) loadInvestigationEvidence(investigation);
+}
+
+function setInvestigationSection(section, { syncUrl = true } = {}) {
+  const tab = state.activeInvestigationTab;
+  if (!INVESTIGATION_SECTIONS[tab]?.has(section)) return;
+  state.investigationSectionByTab[tab] = section;
+  renderInvestigationPage();
+  if (syncUrl && activeInvestigation()) syncInvestigationUrl(activeInvestigation().id, tab, section);
+  if (investigationNeedsEvidence()) loadInvestigationEvidence(activeInvestigation());
 }
 
 function renderInvestigationPage() {
@@ -1255,29 +1536,29 @@ function renderInvestigationPage() {
     <div class="investigation-page-actions">
       <button class="btn btn-ghost" type="button" data-investigation-action="search">⌕ 发现资料</button>
       <button class="btn btn-ghost" type="button" data-investigation-action="import">＋ 导入资料</button>
-      <button class="btn btn-primary" type="button" data-investigation-action="review">审核 ${metrics.ready}</button>
+      <button class="btn btn-primary" type="button" data-investigation-action="review">核对候选（${metrics.ready}）</button>
     </div>`;
   $$("[data-investigation-tab]", $("#investigation-tabs")).forEach((button) => {
     const active = button.dataset.investigationTab === state.activeInvestigationTab;
     button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", String(active));
+    if (button.getAttribute("role") === "tab") button.setAttribute("aria-selected", String(active));
   });
+  const reviewCount = $("#investigation-review-tab-count");
+  if (reviewCount) reviewCount.textContent = String(metrics.ready);
+  $("#investigation-more-menu")?.classList.toggle("active", state.activeInvestigationTab === "activity");
   renderInvestigationPanel(investigation);
   renderMetrics();
 }
 
 function renderInvestigationPanel(investigation) {
   const renderers = {
-    today: renderInvestigationToday,
-    discovery: renderInvestigationDiscovery,
-    monitoring: renderInvestigationMonitoring,
+    overview: renderInvestigationToday,
+    materials: renderInvestigationMaterials,
     review: renderInvestigationReview,
-    events: renderInvestigationEvents,
-    claims: renderInvestigationClaims,
-    reports: renderInvestigationReports,
+    outcomes: renderInvestigationOutcomes,
     activity: renderInvestigationActivity,
   };
-  const content = (renderers[state.activeInvestigationTab] || renderers.today)(investigation);
+  const content = (renderers[state.activeInvestigationTab] || renderers.overview)(investigation);
   const taskError = state.investigationTaskErrors.get(investigation.id);
   const queueError = taskError
     ? renderOperationalError(taskError, {
@@ -1285,7 +1566,7 @@ function renderInvestigationPanel(investigation) {
       actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取完整处理队列</button>',
     })
     : "";
-  const eventErrorEntry = ["today", "claims"].includes(state.activeInvestigationTab)
+  const eventErrorEntry = investigationNeedsEvidence()
     ? eventsForInvestigation(investigation)
       .map((event) => [event, state.investigationEventErrors.get(event.id)])
       .find(([, error]) => error)
@@ -1305,8 +1586,64 @@ function renderInvestigationPanel(investigation) {
   $("#investigation-panel").innerHTML = `${queueError}${eventError}${activityError}${content}`;
 }
 
+function investigationSectionNav(tab, options) {
+  const current = activeInvestigationSection(tab);
+  return `<nav class="investigation-section-tabs" aria-label="${tab === "materials" ? "资料方式" : "成果类型"}">
+    ${options.map(([value, label, count]) => `<button type="button" class="${current === value ? "active" : ""}" data-investigation-section="${escapeHtml(value)}">${escapeHtml(label)}${count == null ? "" : ` <span>${escapeHtml(count)}</span>`}</button>`).join("")}
+  </nav>`;
+}
+
+function renderInvestigationMaterials(investigation) {
+  const section = activeInvestigationSection("materials");
+  const nav = investigationSectionNav("materials", [
+    ["discovery", "搜索资料"],
+    ["monitoring", "监测来源", targetsForInvestigation(investigation).length],
+  ]);
+  return `${nav}${section === "monitoring" ? renderInvestigationMonitoring(investigation) : renderInvestigationDiscovery(investigation)}`;
+}
+
+function renderInvestigationOutcomes(investigation) {
+  const section = activeInvestigationSection("outcomes");
+  const nav = investigationSectionNav("outcomes", [
+    ["events", "已确认事件", eventsForInvestigation(investigation).length],
+    ["claims", "主张与证据"],
+    ["reports", "报告", reportsForInvestigation(investigation).length],
+  ]);
+  const renderer = section === "claims" ? renderInvestigationClaims : section === "reports" ? renderInvestigationReports : renderInvestigationEvents;
+  return `${nav}${renderer(investigation)}`;
+}
+
 function investigationPanelHeading(eyebrow, title, description, actions = "") {
   return `<div class="investigation-panel-heading"><div><span class="panel-kicker">${escapeHtml(eyebrow)}</span><h2>${escapeHtml(title)}</h2><p>${escapeHtml(description)}</p></div>${actions ? `<div class="investigation-panel-actions">${actions}</div>` : ""}</div>`;
+}
+
+function taskFailureActionLabel(error) {
+  if (["generate", "model"].includes(error?.stage)) return "重新生成草稿";
+  if (["fetch", "parse", "extract"].includes(error?.stage)) return "重试抓取";
+  return "重试处理";
+}
+
+function taskProgressText(stage) {
+  return ({
+    ready: "草稿已经准备好，核对并明确确认前不会写入正式档案。",
+    generating: "原始材料已保存，正在准备可核对草稿。",
+    fetching: "正在保存原始页面；搜索摘要不会进入证据链。",
+    queued: "任务已进入处理队列，尚未开始抓取。",
+    accepted: "已由人工确认并保存到正式档案。",
+    rejected: "已决定不采用，正式档案没有改变。",
+    cancelled: "处理已结束，正式档案没有改变。",
+    completed: "处理已经完成。",
+  })[stage] || "进度来自服务端。";
+}
+
+function renderTaskDegradation(degradation) {
+  const message = degradation?.message || degradation?.display_message || "原文已保存；基础草稿可能不完整，请逐项核对。";
+  const detail = degradation?.next_action || degradation?.technical_detail || degradation?.error || degradation?.title || "模型未返回完整草稿，系统仅保留了可追溯的基础摘录。";
+  return `<div class="task-degradation" role="status">
+    <strong>基础草稿 · 需核对</strong>
+    <span>${escapeHtml(message)}</span>
+    <details><summary>为什么是基础草稿？</summary><small>${escapeHtml(detail)}</small></details>
+  </div>`;
 }
 
 function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") {
@@ -1316,33 +1653,40 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
     const intakeId = taskIntakeId(task);
     const taskId = task.id || task.task_id;
     const canReview = stage === "ready" && intakeId;
-    const retryAllowed = task.error?.retryable ?? task.retryable ?? true;
+    const errorPayload = stage === "failed" ? taskErrorPayload(task) : null;
+    const normalizedError = errorPayload ? normalizeOperationalError(errorPayload, errorPayload.stage || "unknown") : null;
+    const retryAllowed = normalizedError?.retryable ?? task.error?.retryable ?? task.retryable ?? true;
     const canRetryTask = retryAllowed && (stage === "failed" || task.retryable === true) && taskId && !String(taskId).startsWith("intake:") && !String(taskId).startsWith("unassigned:");
     const intake = task.intake_item || state.intakeItems.find((item) => item.id === intakeId);
     let primaryAction = "";
     if (canReview) {
-      primaryAction = `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">打开审核</button>`;
-      if (canRetryTask) {
-        primaryAction += `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">只重试 AI</button>`;
-      }
+      primaryAction = `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">核对候选</button>`;
     } else if (canRetryTask) {
-      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">重试这一步</button>`;
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">${escapeHtml(taskFailureActionLabel(normalizedError))}</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.status === "generation_failed") {
-      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">只重试候选生成</button>`;
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">重新生成草稿</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.search?.result_id) {
-      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取原始页</button>`;
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取</button>`;
+    } else if (stage === "failed") {
+      primaryAction = '<button class="btn btn-ghost" type="button" data-expand-error>查看解决办法</button>';
     }
-    const errorPayload = stage === "failed" ? taskErrorPayload(task) : null;
+    const canRemoveFromInvestigation = stage === "failed"
+      && intakeId
+      && recordAllowsAction(task, "remove_from_investigation", "remove");
+    const secondaryAction = canRemoveFromInvestigation
+      ? `<button class="text-btn task-secondary-action" type="button" data-investigation-action="remove-task" data-task-id="${escapeHtml(taskId || "")}" data-intake-id="${escapeHtml(intakeId)}">从专题移除</button>`
+      : "";
     const degradation = task.degradation || (task.degraded && task.error ? task.error : null);
     return `
       <article class="topic-task-row">
         <div>
           <h3>${escapeHtml(taskTitle(task))}</h3>
-          ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true }) : degradation ? `<div class="task-degradation"><strong>${escapeHtml(degradation.title || "已生成降级候选")}</strong><span>${escapeHtml(degradation.message || degradation.display_message || "原文已保存；请在确认前人工核对候选字段。")}</span><small>${escapeHtml(degradation.next_action || "继续人工审核。")}</small></div>` : `<p>${escapeHtml(stage === "ready" ? "AI 候选已就绪，尚未写入正式档案。" : stage === "generating" ? "原始材料已保存，候选仍在生成。" : stage === "fetching" ? "正在抓取原始页面；搜索摘要不会进入证据链。" : stage === "queued" ? "任务已持久排队，尚未开始抓取。" : "任务状态来自服务端。")}</p>`}
-          <div class="topic-task-meta">${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span>${intakeId ? `<span>intake ${escapeHtml(intakeId)}</span>` : ""}</div>
+          ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true, actionHtml: primaryAction }) : degradation ? renderTaskDegradation(degradation) : `<p>${escapeHtml(taskProgressText(stage))}</p>`}
+          <div class="topic-task-meta">${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span></div>
         </div>
         <div class="topic-task-actions">
-          ${primaryAction}
+          ${errorPayload ? "" : primaryAction}
+          ${secondaryAction}
         </div>
       </article>`;
   }).join("")}</div>`;
@@ -1447,9 +1791,9 @@ function renderInvestigationToday(investigation) {
   const processing = active.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length;
   return `${investigationPanelHeading("TODAY · ATTENTION QUEUE", "今天需要处理什么", "按处理阶段组织，不是资讯流；所有数字来自当前后端或明确标注的本地关联。", `<button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新</button>`)}
     <div class="investigation-stats">
-      <div class="investigation-stat"><span>待人工审核</span><strong>${metrics.ready}</strong><small>ready</small></div>
-      <div class="investigation-stat"><span>处理中</span><strong>${processing}</strong><small>queued / fetching / generating</small></div>
-      <div class="investigation-stat"><span>失败待恢复</span><strong>${failed}</strong><small>failed</small></div>
+      <div class="investigation-stat"><span>待核对</span><strong>${metrics.ready}</strong><small>需要你确认</small></div>
+      <div class="investigation-stat"><span>处理中</span><strong>${processing}</strong><small>排队、抓取或生成草稿</small></div>
+      <div class="investigation-stat"><span>需要处理</span><strong>${failed}</strong><small>查看原因后恢复</small></div>
       <div class="investigation-stat"><span>已确认事件</span><strong>${metrics.events}</strong><small>正式档案，不含候选</small></div>
     </div>
     <div class="investigation-today-grid">
@@ -1484,13 +1828,13 @@ function renderInvestigationMonitoring(investigation) {
 
 function renderInvestigationReview(investigation) {
   const tasks = tasksForInvestigation(investigation).filter(taskIsActive);
-  return `${investigationPanelHeading("HUMAN REVIEW BOUNDARY", "待我审核", "ready 才可打开候选；接受、编辑和驳回都进入既有人工审核流程，不会一键伪造成功。", `<button class="btn btn-ghost" type="button" data-investigation-action="open-intake">打开完整采集箱</button>`)}
-    <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>处理队列</h3><p>逐条显示 queued / fetching / generating / ready / failed</p></div><span class="count-badge warning">${tasks.length}</span></div>${renderTaskRows(tasks)}</section>`;
+  return `${investigationPanelHeading("HUMAN REVIEW BOUNDARY", "待审核", "草稿准备好后才能核对；保存到正式档案前必须预览并由你确认。", `<button class="btn btn-ghost" type="button" data-investigation-action="open-intake">查看全部材料</button>`)}
+    <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>处理队列</h3><p>待核对和需要处理的材料优先，处理中材料会自动更新</p></div><span class="count-badge warning">${tasks.length}</span></div>${renderTaskRows(tasks)}</section>`;
 }
 
 function renderInvestigationEvents(investigation) {
   const events = eventsForInvestigation(investigation);
-  return `${investigationPanelHeading("CONFIRMED TIMELINE", "事件脉络", "这里只列出已确认事件；地图降为有坐标事件的辅助入口。", `<button class="btn btn-ghost" type="button" data-investigation-action="classic">打开经典事件视图</button>`)}
+  return `${investigationPanelHeading("CONFIRMED TIMELINE", "已确认事件", "这里只列出已确认事件；地图降为有坐标事件的辅助入口。", `<button class="btn btn-ghost" type="button" data-investigation-action="classic">打开本专题事件总览</button>`)}
     <div class="investigation-events-grid">
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>已确认事件</h3><p>按开始时间排列</p></div><span class="count-badge">${events.length}</span></div>
         ${events.length ? `<div class="investigation-record-list">${[...events].sort((a, b) => new Date(a.start_at || 0) - new Date(b.start_at || 0)).map((event) => `<article class="investigation-record"><time>${formatDate(event.start_at)}</time><div><h3>${escapeHtml(event.title)}</h3><p>${escapeHtml(event.summary || "暂无摘要")}</p></div><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">打开档案</button></article>`).join("")}</div>` : '<div class="investigation-empty"><strong>该专题还没有已确认事件</strong><p>AI 候选不会在人工确认前出现在这里。</p></div>'}
@@ -1512,10 +1856,10 @@ async function loadInvestigationEvidence(investigation, { force = false } = {}) 
   if (force) invalidateInvestigationEvidence(events.map((event) => event.id));
   const missing = events.filter((event) => !state.investigationEventDetails.has(event.id));
   if (!missing.length) {
-    if (state.activeInvestigationTab === "claims") renderInvestigationPage();
+    if (investigationShowsClaims()) renderInvestigationPage();
     return;
   }
-  if (state.activeInvestigationTab === "claims") $("#investigation-panel").innerHTML = '<div class="investigation-empty"><strong>正在读取已确认主张与固定证据快照…</strong></div>';
+  if (investigationShowsClaims()) $("#investigation-panel").innerHTML = '<div class="investigation-empty"><strong>正在读取已确认主张与固定证据快照…</strong></div>';
   for (let offset = 0; offset < missing.length; offset += 20) {
     const batch = missing.slice(offset, offset + 20);
     const requests = batch.map((event) => {
@@ -1536,7 +1880,7 @@ async function loadInvestigationEvidence(investigation, { force = false } = {}) 
       }
     });
   }
-  if (state.activeInvestigationId === investigation.id && ["today", "claims"].includes(state.activeInvestigationTab)) renderInvestigationPage();
+  if (state.activeInvestigationId === investigation.id && investigationNeedsEvidence()) renderInvestigationPage();
 }
 
 function renderInvestigationClaims(investigation) {
@@ -1693,10 +2037,15 @@ function closeInvestigationCreateModal() {
   const modal = $("#investigation-create-modal");
   if (typeof modal.close === "function") modal.close();
   else modal.removeAttribute("open");
+  state.investigationCreateRequestSerial += 1;
+  const button = $("#investigation-create-submit");
+  button.disabled = false;
+  button.textContent = "创建并进入专题";
 }
 
 async function submitInvestigationCreate(event) {
   event.preventDefault();
+  const requestSerial = ++state.investigationCreateRequestSerial;
   const button = $("#investigation-create-submit");
   button.disabled = true;
   button.textContent = "正在创建…";
@@ -1707,16 +2056,27 @@ async function submitInvestigationCreate(event) {
       question: $("#investigation-create-question").value,
       description: $("#investigation-create-description").value,
     });
+    if (requestSerial !== state.investigationCreateRequestSerial || !$("#investigation-create-modal").open) {
+      renderInvestigationHome();
+      toast("专题已创建；你已切换页面，所以没有自动跳转。", "info", 6500);
+      return;
+    }
     closeInvestigationCreateModal();
     renderInvestigationHome();
     toast(investigation.sync_mode === "local" ? "已创建浏览器本地专题草稿；尚未同步服务端。" : "专题已在服务端持久创建。", investigation.sync_mode === "local" ? "info" : "success", 6500);
-    await openInvestigation(investigation.id, "today");
+    await openInvestigation(investigation.id, "overview");
   } catch (error) {
+    if (requestSerial !== state.investigationCreateRequestSerial) {
+      toast(`后台创建专题失败：${error.message || "未知错误"}`, "error", 7000);
+      return;
+    }
     $("#investigation-create-result").className = "import-result error";
     $("#investigation-create-result").textContent = `创建失败：${error.message}。未显示虚假成功。`;
   } finally {
-    button.disabled = false;
-    button.textContent = "创建并进入专题";
+    if (requestSerial === state.investigationCreateRequestSerial) {
+      button.disabled = false;
+      button.textContent = "创建并进入专题";
+    }
   }
 }
 
@@ -1769,16 +2129,16 @@ async function handleInvestigationAction(action, node) {
   if (action === "search") return openExternalSearchModal(investigation?.id);
   if (action === "import") return openImportModal(investigation?.id);
   if (action === "review") return setInvestigationTab("review");
-  if (action === "claims") return setInvestigationTab("claims");
-  if (action === "monitoring") return setInvestigationTab("monitoring");
-  if (action === "classic") return showClassicWorkspace();
+  if (action === "claims") return setInvestigationTab("outcomes", { section: "claims" });
+  if (action === "monitoring") return setInvestigationTab("materials", { section: "monitoring" });
+  if (action === "classic") return showClassicWorkspace({ scopeInvestigationId: investigation?.id || null });
   if (action === "open-intake") return openIntakeModal(null, false, isServerInvestigation(investigation) ? investigation.id : null);
   if (action === "refresh") {
     await refreshData({ keepSelection: true, quiet: true });
     await refreshInvestigationDirectory();
     if (investigation) await loadInvestigationWorkspace(investigation.id, { quiet: true });
     const refreshedInvestigation = activeInvestigation();
-    if (refreshedInvestigation && ["today", "claims"].includes(state.activeInvestigationTab)) {
+    if (refreshedInvestigation && investigationNeedsEvidence()) {
       await loadInvestigationEvidence(refreshedInvestigation, { force: true });
     }
     toast("专题数据已刷新。", "success");
@@ -1786,19 +2146,52 @@ async function handleInvestigationAction(action, node) {
   }
   if (action === "add-source") {
     state.pendingCollectionInvestigationId = investigation?.id || null;
-    return openCollectionModal();
+    return openCollectionModal(
+      null,
+      isServerInvestigation(investigation) ? investigation.id : null,
+    );
   }
   if (action === "open-source") {
-    state.pendingCollectionInvestigationId = null;
-    const modal = $("#collection-modal");
-    if (typeof modal.showModal === "function") modal.showModal(); else modal.setAttribute("open", "");
-    return refreshCollectionData(node.dataset.targetId);
+    state.pendingCollectionInvestigationId = investigation?.id || null;
+    return openCollectionModal(
+      node.dataset.targetId,
+      isServerInvestigation(investigation) ? investigation.id : null,
+    );
   }
   if (["open-review", "accept-entry", "reject-entry"].includes(action)) {
     const intakeId = node.dataset.intakeId;
     await openIntakeModal(intakeId, false, isServerInvestigation(investigation) ? investigation.id : null);
     if (action === "accept-entry") toast("请核对或编辑候选，预览影响后再确认入档。", "info", 6000);
-    if (action === "reject-entry") toast("请在审核页填写驳回原因后执行驳回。", "info", 6000);
+    if (action === "reject-entry") toast("请在审核页展开“不采用”，填写原因后再次确认。", "info", 6000);
+    return;
+  }
+  if (action === "remove-task") {
+    const taskId = node.dataset.taskId;
+    const intakeId = node.dataset.intakeId;
+    const task = tasksForInvestigation(investigation).find((item) => (
+      (!taskId || String(item.id || item.task_id || "") === taskId)
+      && taskIntakeId(item) === intakeId
+    ));
+    if (
+      !isServerInvestigation(investigation)
+      || !intakeId
+      || canonicalTaskStage(task) !== "failed"
+      || !recordAllowsAction(task, "remove_from_investigation", "remove")
+    ) {
+      toast("当前任务不允许从专题移除，请刷新后重试。", "error", 6000);
+      return;
+    }
+    if (!window.confirm(`从“${investigation.title}”移除“${taskTitle(task)}”？\n\n它会移到本专题“已删除”，之后可以恢复；全局材料和正式档案不会改变。`)) return;
+    try {
+      await api(API_ROUTES.investigationIntakeAction(investigation.id, intakeId, "remove"), { method: "POST" });
+      toast("材料已从本专题移除；可在“已删除”中恢复。", "success", 5600);
+      await refreshInvestigationDirectory();
+      if (state.activeInvestigationId === investigation.id) {
+        await loadInvestigationWorkspace(investigation.id, { quiet: true });
+      }
+    } catch (error) {
+      toast(`从专题移除失败：${error.message || "未知错误"}`, "error", 7000);
+    }
     return;
   }
   if (action === "retry-task") return retryInvestigationTask(node.dataset.taskId);
@@ -1835,13 +2228,36 @@ function eventSearchText(event) {
   ].join(" ").toLocaleLowerCase();
 }
 
+function clearEventOverviewSelection({ closeOpenDrawer = false, clearUrl = false } = {}) {
+  state.selectedEventRequestSerial += 1;
+  state.selectedId = null;
+  state.selectedEvent = null;
+  state.selectedEventError = null;
+  $("#btn-report").disabled = true;
+  if (clearUrl) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("event");
+    history.replaceState(null, "", url);
+  }
+  if (closeOpenDrawer && $("#event-drawer")?.classList.contains("open")) closeDrawer();
+}
+
+function resetEventOverviewContext() {
+  clearEventOverviewSelection({ closeOpenDrawer: true });
+  $("#search").value = "";
+  $("#importance-filter").value = "";
+  $("#language-filter").value = "";
+  $("#contested-filter").checked = false;
+  state.filteredEvents = [];
+}
+
 function applyFilters() {
   const query = $("#search").value.trim().toLocaleLowerCase();
   const importance = $("#importance-filter").value;
   const language = $("#language-filter").value;
   const contestedOnly = $("#contested-filter").checked;
 
-  state.filteredEvents = state.events.filter((event) => {
+  state.filteredEvents = eventOverviewEvents().filter((event) => {
     if (query && !eventSearchText(event).includes(query)) return false;
     if (importance && event.importance !== importance) return false;
     if (language && !(event.languages || []).includes(language)) return false;
@@ -1849,18 +2265,50 @@ function applyFilters() {
     return true;
   });
 
+  const selectionBecameHidden = Boolean(state.selectedId)
+    && !state.filteredEvents.some((event) => event.id === state.selectedId);
+  if (selectionBecameHidden) {
+    clearEventOverviewSelection({ closeOpenDrawer: true, clearUrl: true });
+  }
+
   renderEvents();
   renderMap();
   renderTimeline();
+  if (selectionBecameHidden) {
+    renderAssessment();
+    renderGaps();
+  }
 }
 
 function renderTopic() {
   const topic = state.overview?.topic || {};
-  $("#topic-title").textContent = topic.title || "未命名专题";
-  $("#topic-description").textContent = topic.description || topic.subtitle || "";
-  $("#topic-mode").textContent = LABELS.mode[topic.mode] || topic.mode || "专题模式";
-  $("#topic-range").textContent = `${formatDate(topic.time_range?.start)} 至 ${formatDate(topic.time_range?.end)}`;
-  $("#topic-updated").textContent = `更新 ${formatDate(state.overview?.last_updated, true)}`;
+  const scopeInvestigation = eventOverviewInvestigation();
+  if (eventOverviewScopeUnavailable()) {
+    $("#topic-title").textContent = "专题范围不可用";
+    $("#topic-description").textContent = "这个专题可能已删除、权限已变化或目录读取失败。为避免混入其他专题，当前保持空白。";
+    $("#topic-mode").textContent = "已失效关闭";
+    $("#topic-range").textContent = "未显示任何事件";
+    $("#topic-updated").textContent = "请返回我的专题";
+    $("#map-title").textContent = "专题范围不可用";
+    renderEventOverviewScope();
+    return;
+  }
+  $("#topic-title").textContent = scopeInvestigation ? `${scopeInvestigation.title} · 事件总览` : topic.title || "事件总览";
+  $("#topic-description").textContent = scopeInvestigation ? scopeInvestigation.question : topic.description || topic.subtitle || "";
+  if (scopeInvestigation) {
+    const scopedEvents = eventOverviewEvents();
+    const eventDates = scopedEvents.map((event) => event.start_at).filter(Boolean).sort((a, b) => new Date(a) - new Date(b));
+    $("#topic-mode").textContent = "仅本专题正式事件";
+    $("#topic-range").textContent = eventDates.length ? `${formatDate(eventDates[0])} 至 ${formatDate(eventDates[eventDates.length - 1])}` : "暂无已确认事件";
+    $("#topic-updated").textContent = `专题更新 ${formatDate(scopeInvestigation.updated_at, true)}`;
+    $("#map-title").textContent = "本专题事件态势";
+  } else {
+    $("#topic-mode").textContent = LABELS.mode[topic.mode] || topic.mode || "专题模式";
+    $("#topic-range").textContent = `${formatDate(topic.time_range?.start)} 至 ${formatDate(topic.time_range?.end)}`;
+    $("#topic-updated").textContent = `更新 ${formatDate(state.overview?.last_updated, true)}`;
+    $("#map-title").textContent = "全局事件态势";
+  }
+  renderEventOverviewScope();
 }
 
 function renderMetrics() {
@@ -1872,15 +2320,37 @@ function renderMetrics() {
   const investigation = !classicVisible ? activeInvestigation() : null;
   let items;
   if (classicVisible) {
-    items = [
-      ["events", overviewMetrics.events ?? 0, "全局事件"],
-      ["documents", overviewMetrics.documents ?? 0, "全局文档"],
-      ["independence", overviewMetrics.independence_groups ?? 0, "独立源组"],
-      ["contested", overviewMetrics.contested_claims ?? 0, "争议主张"],
-      ["intake", intake.candidate_ready ?? 0, "全局待审"],
-      ["collection", changed, "监测待审"],
-    ];
-    $("#metrics").setAttribute("aria-label", "经典事件视图全局指标");
+    const scopeInvestigation = eventOverviewInvestigation();
+    if (eventOverviewScopeUnavailable()) {
+      items = [
+        ["events", 0, "专题事件"],
+        ["documents", 0, "关联文档"],
+        ["contested", 0, "待核实主张"],
+        ["sources", 0, "专题来源"],
+      ];
+      $("#metrics").setAttribute("aria-label", "专题范围不可用，未显示全局指标");
+    } else if (scopeInvestigation) {
+      const scopedEvents = eventOverviewEvents();
+      const documents = scopedEvents.reduce((sum, event) => sum + Number(event.document_count || 0), 0);
+      const contested = scopedEvents.reduce((sum, event) => sum + Number(event.claim_counts?.contested || 0) + Number(event.claim_counts?.unverified || 0), 0);
+      items = [
+        ["events", scopedEvents.length, "专题事件"],
+        ["documents", documents, "关联文档"],
+        ["contested", contested, "待核实主张"],
+        ["sources", investigationMetrics(scopeInvestigation).sources, "专题来源"],
+      ];
+      $("#metrics").setAttribute("aria-label", `${scopeInvestigation.title} 事件总览指标`);
+    } else {
+      items = [
+        ["events", overviewMetrics.events ?? 0, "全局事件"],
+        ["documents", overviewMetrics.documents ?? 0, "全局文档"],
+        ["independence", overviewMetrics.independence_groups ?? 0, "独立源组"],
+        ["contested", overviewMetrics.contested_claims ?? 0, "争议主张"],
+        ["intake", intake.candidate_ready ?? 0, "全局待审"],
+        ["collection", changed, "监测待审"],
+      ];
+      $("#metrics").setAttribute("aria-label", "事件总览全局指标");
+    }
   } else if (investigation) {
     const metrics = investigationMetrics(investigation);
     items = [
@@ -1896,10 +2366,10 @@ function renderMetrics() {
     items = [
       ["investigations", userInvestigations.length, "我的专题"],
       ["queue", assignments.length, "待我处理"],
-      ["review", assignments.filter(({ task }) => canonicalTaskStage(task) === "ready").length, "待我审核"],
+      ["review", assignments.filter(({ task }) => canonicalTaskStage(task) === "ready").length, "待审核"],
       ["failed", assignments.filter(({ task }) => canonicalTaskStage(task) === "failed").length, "失败待恢复"],
     ];
-    $("#metrics").setAttribute("aria-label", "专题首页指标");
+    $("#metrics").setAttribute("aria-label", "我的专题指标");
   }
   $("#collection-alert-count").textContent = String(changed);
   $("#metrics").innerHTML = items.map(([key, value, label]) => `
@@ -1915,11 +2385,12 @@ function renderEvents() {
   $("#event-count").textContent = String(state.filteredEvents.length);
 
   if (!state.filteredEvents.length) {
+    const hasEventsInScope = eventOverviewEvents().length > 0;
     root.innerHTML = `
       <div class="list-empty">
         <span>⌕</span>
-        <p>当前筛选条件下没有事件。</p>
-        <button type="button" class="text-btn" data-action="clear-filters">清除筛选</button>
+        <p>${hasEventsInScope ? "当前筛选条件下没有事件。" : "当前范围还没有已确认事件。"}</p>
+        ${hasEventsInScope ? '<button type="button" class="text-btn" data-action="clear-filters">清除筛选</button>' : ""}
       </div>`;
     return;
   }
@@ -1965,7 +2436,7 @@ function mapPosition(event) {
 
 function renderMap() {
   const visibleIds = new Set(state.filteredEvents.map((event) => event.id));
-  $("#markers").innerHTML = state.events.map((event) => {
+  $("#markers").innerHTML = eventOverviewEvents().map((event) => {
     const position = mapPosition(event);
     if (!position) return "";
     const muted = !visibleIds.has(event.id);
@@ -1975,7 +2446,7 @@ function renderMap() {
         type="button"
         class="map-marker ${escapeHtml(event.importance)} ${active ? "active" : ""} ${muted ? "muted" : ""}"
         style="left:${position.left}%;top:${position.top}%"
-        data-event-id="${escapeHtml(event.id)}"
+        ${muted ? "disabled aria-hidden=\"true\"" : `data-event-id="${escapeHtml(event.id)}"`}
         aria-label="${escapeHtml(event.title)}"
       >
         <span class="marker-core"></span>
@@ -2007,6 +2478,47 @@ function renderTimeline() {
 }
 
 function renderSources() {
+  const scopeInvestigation = eventOverviewInvestigation();
+  if (eventOverviewScopeUnavailable()) {
+    $("#source-title").textContent = "专题来源不可用";
+    $("#source-summary").textContent = "0 / 0";
+    $("#sources").innerHTML = '<div class="panel-empty">专题范围已失效；没有回退显示全局来源。</div>';
+    return;
+  }
+  if (scopeInvestigation) {
+    const targets = targetsForInvestigation(scopeInvestigation);
+    const targetRows = targets.map((target) => {
+      const actualStatus = collectionTargetStatus(target);
+      const tone = actualStatus === "healthy" ? "healthy" : ["error", "degraded"].includes(actualStatus) ? "error" : actualStatus === "paused" ? "disabled" : "stale";
+      return { target, actualStatus, tone };
+    });
+    const counts = {
+      healthy: targetRows.filter((item) => item.tone === "healthy").length,
+      attention: targetRows.filter((item) => ["stale", "disabled"].includes(item.tone)).length,
+      error: targetRows.filter((item) => item.tone === "error").length,
+    };
+    $("#source-title").textContent = "专题来源状态";
+    $("#source-summary").textContent = `${counts.healthy} / ${targets.length}`;
+    $("#sources").innerHTML = targets.length ? `
+      <div class="source-overview">
+        <div><strong>${counts.healthy}</strong><span>正常</span></div>
+        <div><strong>${counts.attention}</strong><span>需检查</span></div>
+        <div><strong>${counts.error}</strong><span>异常</span></div>
+      </div>
+      <div class="source-scroll">
+        ${targetRows.slice(0, 12).map(({ target, actualStatus, tone }) => `
+          <div class="source-row">
+            <span class="source-status ${escapeHtml(tone)}"></span>
+            <div>
+              <strong>${escapeHtml(target.name || target.title || "未命名监测来源")}</strong>
+              <small>${escapeHtml(target.url || target.canonical_url || "地址未知")}${collectionIntervalMinutes(target) ? ` · ${escapeHtml(collectionIntervalMinutes(target))} 分钟` : ""}</small>
+            </div>
+            <span class="source-label ${escapeHtml(tone)}">${escapeHtml(LABELS.collectionStatus[actualStatus] || "需检查")}</span>
+          </div>`).join("")}
+      </div>` : '<div class="panel-empty">当前专题没有关联监测来源；这里不会混入全局来源状态。</div>';
+    return;
+  }
+  $("#source-title").textContent = "来源状态";
   const counts = { healthy: 0, stale: 0, error: 0, disabled: 0 };
   state.sources.forEach((source) => {
     counts[source.status] = (counts[source.status] || 0) + 1;
@@ -2039,13 +2551,20 @@ function renderSources() {
 }
 
 function currentGaps() {
-  const eventGaps = state.selectedEvent?.assessment?.information_gaps || [];
+  if (eventOverviewScopeUnavailable()) return [];
+  const scopeInvestigation = eventOverviewInvestigation();
+  const selectedBelongsToScope = state.filteredEvents.some((event) => event.id === state.selectedEvent?.id);
+  const eventGaps = selectedBelongsToScope ? state.selectedEvent?.assessment?.information_gaps || [] : [];
+  if (scopeInvestigation) return [...new Set(eventGaps)].slice(0, 10);
   const topicGaps = state.overview?.information_gaps || [];
   return [...new Set([...eventGaps, ...topicGaps])].slice(0, 10);
 }
 
 function renderGaps() {
   const gaps = currentGaps();
+  const unavailableScope = eventOverviewScopeUnavailable();
+  const scoped = Boolean(state.eventOverviewScopeInvestigationId);
+  $("#gap-title").textContent = scoped ? "专题信息缺口" : "信息缺口";
   $("#gap-count").textContent = String(gaps.length);
   $("#gaps").innerHTML = gaps.length
     ? gaps.map((gap, index) => `
@@ -2053,16 +2572,38 @@ function renderGaps() {
           <span>${String(index + 1).padStart(2, "0")}</span>
           <p>${escapeHtml(gap)}</p>
         </div>`).join("")
-    : '<div class="panel-empty">当前没有登记的信息缺口。</div>';
+    : `<div class="panel-empty">${unavailableScope ? "专题范围已失效；没有回退显示全局信息缺口。" : scoped ? "当前专题所选事件没有登记的信息缺口；这里不会混入全局缺口。" : "当前没有登记的信息缺口。"}</div>`;
 }
 
 function renderAssessment() {
   const root = $("#assessment");
-  const assessment = state.selectedEvent?.assessment;
+  const scopedEvents = state.filteredEvents;
+  const selectedIdBelongsToScope = Boolean(state.selectedId)
+    && scopedEvents.some((event) => event.id === state.selectedId);
+  const selectedBelongsToScope = selectedIdBelongsToScope
+    && state.selectedEvent?.id === state.selectedId;
+  const assessment = selectedBelongsToScope ? state.selectedEvent?.assessment : null;
   if (!assessment) {
-    $("#assessment-confidence").textContent = "未选择事件";
+    if (state.selectedEventError && selectedIdBelongsToScope) {
+      $("#assessment-confidence").textContent = "读取失败";
+      root.className = "panel-body";
+      root.innerHTML = renderOperationalError(state.selectedEventError, {
+        stage: "fetch",
+        actionHtml: '<button class="btn btn-ghost" type="button" data-retry-selected-event>重新读取事件档案</button>',
+      });
+      return;
+    }
+    $("#assessment-confidence").textContent = selectedIdBelongsToScope ? "正在读取" : "未选择事件";
     root.className = "panel-body empty-state";
-    root.innerHTML = '<div class="empty-icon">◎</div><p>选择一个事件，查看当前判断、关键假设、替代解释与证伪条件。</p>';
+    if (selectedIdBelongsToScope) {
+      root.innerHTML = '<div class="empty-icon">◎</div><p>正在读取所选事件的研判与信息缺口…</p>';
+    } else if (!state.filteredEvents.length && eventOverviewEvents().length) {
+      root.innerHTML = '<div class="empty-icon">⌕</div><p>当前筛选没有匹配事件。清除或调整筛选后再查看研判。</p>';
+    } else if (!eventOverviewEvents().length) {
+      root.innerHTML = '<div class="empty-icon">◎</div><p>当前范围还没有已确认事件可供研判。</p>';
+    } else {
+      root.innerHTML = '<div class="empty-icon">◎</div><p>选择一个可见事件，查看当前判断、关键假设、替代解释与证伪条件。</p>';
+    }
     return;
   }
 
@@ -2272,22 +2813,34 @@ function closeDrawer() {
 
 async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = true } = {}) {
   if (!eventId) return;
+  const scopeId = state.eventOverviewScopeInvestigationId;
+  if (scopeId && !eventOverviewEvents().some((event) => event.id === eventId)) return;
+  if (!state.filteredEvents.some((event) => event.id === eventId)) return;
   const requestSerial = ++state.selectedEventRequestSerial;
   state.selectedId = eventId;
+  state.selectedEvent = null;
   state.selectedEventError = null;
   renderEvents();
   renderMap();
   renderTimeline();
+  renderAssessment();
+  renderGaps();
   $("#btn-report").disabled = false;
 
   if (open) {
-    state.selectedEvent = null;
     openDrawer(tab);
+  } else if ($("#event-drawer")?.classList.contains("open")) {
+    renderDrawer();
   }
 
   try {
     const event = await api(`/pldr-api/v1/events/${encodeURIComponent(eventId)}`);
-    if (requestSerial !== state.selectedEventRequestSerial || state.selectedId !== eventId) return;
+    if (
+      requestSerial !== state.selectedEventRequestSerial
+      || state.selectedId !== eventId
+      || state.eventOverviewScopeInvestigationId !== scopeId
+      || !state.filteredEvents.some((item) => item.id === eventId)
+    ) return;
     state.selectedEvent = event;
     renderAssessment();
     renderGaps();
@@ -2298,9 +2851,15 @@ async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = 
       history.replaceState(null, "", url);
     }
   } catch (error) {
-    if (requestSerial !== state.selectedEventRequestSerial || state.selectedId !== eventId) return;
+    if (
+      requestSerial !== state.selectedEventRequestSerial
+      || state.selectedId !== eventId
+      || state.eventOverviewScopeInvestigationId !== scopeId
+    ) return;
     state.selectedEvent = null;
     state.selectedEventError = error;
+    renderAssessment();
+    renderGaps();
     if (open || $("#event-drawer").classList.contains("open")) renderDrawer();
     toast(`事件加载失败：${error.message}`, "error");
   }
@@ -2308,8 +2867,14 @@ async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = 
 
 async function generateReport(eventIds = null) {
   const ids = eventIds || (state.selectedId ? [state.selectedId] : []);
-  if (!ids.length) {
-    toast("请先选择一个事件。", "error");
+  const scopeInvestigation = eventOverviewInvestigation();
+  const scopeInvestigationId = isServerInvestigation(scopeInvestigation)
+    ? scopeInvestigation.id
+    : null;
+  const selectedIsVisible = ids.length === 1
+    && state.filteredEvents.some((event) => event.id === ids[0]);
+  if (!selectedIsVisible) {
+    toast("请先从当前可见结果中选择一个事件。", "error");
     return;
   }
   const event = state.events.find((item) => item.id === ids[0]);
@@ -2320,6 +2885,7 @@ async function generateReport(eventIds = null) {
       body: JSON.stringify({
         event_ids: ids,
         title: event ? `PLDR 证据简报：${event.title}` : null,
+        ...(scopeInvestigationId ? { investigation_id: scopeInvestigationId } : {}),
       }),
     });
     toast(`简报已生成，共 ${result.evidence_count} 条证据。`, "success");
@@ -2347,6 +2913,10 @@ function closeImportModal() {
   const modal = $("#import-modal");
   if (typeof modal.close === "function") modal.close();
   else modal.removeAttribute("open");
+  state.importRequestSerial += 1;
+  const submit = $("#import-submit");
+  submit.disabled = false;
+  submit.textContent = "提交到采集箱";
 }
 
 function setImportMode(mode) {
@@ -2374,6 +2944,8 @@ function setImportMode(mode) {
 
 async function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId) {
   const modal = $("#search-modal");
+  const openSerial = state.searchRequestSerial;
+  state.searchHistoryVisibility = "active";
   renderDestinationPickers(preferredInvestigationId);
   if (typeof modal.showModal === "function" && !modal.open) modal.showModal();
   else if (!modal.open) modal.setAttribute("open", "");
@@ -2384,6 +2956,7 @@ async function openExternalSearchModal(preferredInvestigationId = state.activeIn
   renderSearchResults();
   updateSearchSelectionCount();
   await loadSearchHistory(destinationId);
+  if (openSerial !== state.searchRequestSerial || !modal.open) return;
   $("#search-keyword").focus();
 }
 
@@ -2393,6 +2966,12 @@ function closeExternalSearchModal() {
   if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
   if (typeof modal.close === "function") modal.close();
   else modal.removeAttribute("open");
+  state.searchRequestSerial += 1;
+  state.searchBusy = false;
+  $("#search-destination").disabled = false;
+  $("#search-submit").disabled = false;
+  $("#search-submit").textContent = "开始搜索";
+  $("#search-select").textContent = "加入专题并开始处理";
 }
 
 function detectSearchLanguage(keyword) {
@@ -2510,10 +3089,23 @@ function normalizeSearchRun(raw) {
 function upsertSearchHistory(raw) {
   const run = normalizeSearchRun(raw);
   if (!run.id) return;
+  const archived = recordIsArchived(run);
+  if ((state.searchHistoryVisibility === "archived") !== archived) return;
   state.searchHistory = [run, ...state.searchHistory.filter((item) => item.id !== run.id)]
     .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
     .slice(0, 20);
   renderSearchHistory();
+}
+
+function searchRunAllowsAction(run, action) {
+  const allowed = run?.allowed_actions;
+  if (Array.isArray(allowed)) return allowed.includes(action);
+  if (allowed && typeof allowed === "object" && Object.prototype.hasOwnProperty.call(allowed, action)) {
+    return allowed[action] === true || allowed[action]?.allowed === true;
+  }
+  const archived = recordIsArchived(run) || state.searchHistoryVisibility === "archived";
+  if (action === "restore") return archived;
+  return action === "archive" && !archived;
 }
 
 function renderSearchHistory() {
@@ -2524,18 +3116,27 @@ function renderSearchHistory() {
     return;
   }
   const currentId = currentSearchRunId();
+  $$('[data-search-history-visibility]').forEach((button) => button.classList.toggle("active", button.dataset.searchHistoryVisibility === state.searchHistoryVisibility));
   const errorMarkup = state.searchHistoryError
     ? `<div class="search-history-error" role="alert"><span>查询记录读取失败：${escapeHtml(state.searchHistoryError)}</span><button class="text-btn" type="button" data-search-history-retry>重试</button></div>`
     : "";
   const historyMarkup = state.searchHistory.length ? state.searchHistory.map((raw) => {
     const run = normalizeSearchRun(raw);
+    const archived = recordIsArchived(run) || state.searchHistoryVisibility === "archived";
+    const action = archived ? "restore" : "archive";
+    const actionButton = searchRunAllowsAction(run, action)
+      ? `<button class="text-btn search-history-record-action" type="button" data-search-run-action="${action}" data-search-run-id="${escapeHtml(run.id)}">${archived ? "恢复" : "删除本次查询"}</button>`
+      : "";
     return `
-      <button class="search-history-item ${run.id === currentId ? "active" : ""}" type="button" data-search-history-run="${escapeHtml(run.id)}">
-        <span class="search-history-topline"><strong>${escapeHtml(run.keyword)}</strong><time>${formatDate(run.created_at, true)}</time></span>
-        <span>${escapeHtml(LABELS.searchScope[run.scope] || run.scope)} · ${run.language ? escapeHtml(searchLanguageLabel(run.language)) : "语言未知"}</span>
-        <small>已加载 ${Number(run.loaded_count ?? run.returned_count ?? 0)} 条${run.status === "failed" || run.error ? " · 查询失败" : ""}</small>
-      </button>`;
-  }).join("") : `<p class="search-history-empty">${state.searchHistoryAvailable ? "还没有查询记录。完成一次搜索后可从这里重新打开。" : "当前后端未提供历史接口；本次页面中的查询仍会保留。"}</p>`;
+      <article class="search-history-record">
+        <button class="search-history-item ${run.id === currentId ? "active" : ""}" type="button" data-search-history-run="${escapeHtml(run.id)}">
+          <span class="search-history-topline"><strong>${escapeHtml(run.keyword)}</strong><time>${formatDate(run.created_at, true)}</time></span>
+          <span>${escapeHtml(LABELS.searchScope[run.scope] || run.scope)} · ${run.language ? escapeHtml(searchLanguageLabel(run.language)) : "语言未知"}</span>
+          <small>${archived ? "已删除" : `已加载 ${Number(run.loaded_count ?? run.returned_count ?? 0)} 条${run.status === "failed" || run.error ? " · 查询失败" : ""}`}</small>
+        </button>
+        ${actionButton}
+      </article>`;
+  }).join("") : `<p class="search-history-empty">${state.searchHistoryVisibility === "archived" ? "没有可恢复的已删除查询。" : state.searchHistoryAvailable ? "还没有查询记录。完成一次搜索后可从这里重新打开。" : "当前后端未提供历史接口；本次页面中的查询仍会保留。"}</p>`;
   root.innerHTML = errorMarkup + historyMarkup;
 }
 
@@ -2551,16 +3152,17 @@ async function loadSearchHistory(investigationId = state.activeInvestigationId) 
   state.searchHistoryError = "";
   renderSearchHistory();
   try {
-    const params = new URLSearchParams({ limit: "12" });
+    const params = new URLSearchParams({ limit: "12", visibility: state.searchHistoryVisibility });
     params.set("investigation_id", destinationId);
     const payload = await api(`${API_ROUTES.searchRuns}?${params}`);
     if (requestSerial !== state.searchHistoryRequestSerial || destinationId !== state.searchHistoryInvestigationId) return;
     const runs = unwrapItems(payload, "runs", "items").map(normalizeSearchRun);
     const current = currentSearchRunId()
       && state.searchRun?.investigation_id === destinationId
+      && (state.searchHistoryVisibility === "archived") === recordIsArchived(state.searchRun)
       ? [normalizeSearchRun(state.searchRun)]
       : [];
-    const byId = new Map([...current, ...runs, ...state.searchHistory].filter((run) => run.id).map((run) => [run.id, run]));
+    const byId = new Map([...current, ...runs].filter((run) => run.id).map((run) => [run.id, run]));
     state.searchHistory = [...byId.values()].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)).slice(0, 20);
     state.searchHistoryError = "";
   } catch (error) {
@@ -2572,6 +3174,45 @@ async function loadSearchHistory(investigationId = state.activeInvestigationId) 
       state.searchHistoryBusy = false;
       renderSearchHistory();
     }
+  }
+}
+
+async function setSearchHistoryVisibility(visibility) {
+  if (!new Set(["active", "archived"]).has(visibility) || state.searchHistoryVisibility === visibility) return;
+  state.searchHistoryVisibility = visibility;
+  state.searchHistory = [];
+  renderSearchHistory();
+  await loadSearchHistory(state.searchHistoryInvestigationId || currentSearchDestinationId());
+}
+
+async function updateSearchRunVisibility(runId, action) {
+  const run = state.searchHistory.find((item) => item.id === runId) || (currentSearchRunId() === runId ? state.searchRun : null);
+  if (!run) return;
+  if (!searchRunAllowsAction(normalizeSearchRun(run), action)) {
+    toast("当前查询状态不允许执行这项删除或恢复操作，请刷新后重试。", "error", 6000);
+    return;
+  }
+  const restoring = action === "restore";
+  const question = restoring
+    ? `恢复查询“${normalizeSearchRun(run).keyword}”？\n\n恢复只会让查询重新出现在历史记录中。`
+    : `删除查询“${normalizeSearchRun(run).keyword}”？\n\n只会隐藏这次查询记录，不会删除已经选择、抓取或保存的材料；之后可以恢复。`;
+  if (!window.confirm(question)) return;
+  try {
+    const payload = await api(API_ROUTES.searchRunAction(runId, action), { method: "POST" });
+    if (currentSearchRunId() === runId) {
+      state.searchRun = {
+        ...state.searchRun,
+        ...(payload?.query_run || payload?.run || payload || {}),
+        archived: !restoring,
+        archived_at: restoring ? null : payload?.archived_at || new Date().toISOString(),
+      };
+    }
+    state.searchHistory = state.searchHistory.filter((item) => item.id !== runId);
+    renderSearchHistory();
+    await loadSearchHistory(state.searchHistoryInvestigationId || currentSearchDestinationId());
+    toast(restoring ? "查询记录已恢复。" : "查询记录已移到“已删除”；已选材料不受影响。", "success", 5200);
+  } catch (error) {
+    toast(`${restoring ? "恢复" : "删除"}查询失败：${error.message || "未知错误"}`, "error", 7000);
   }
 }
 
@@ -2648,10 +3289,9 @@ async function openSearchHistoryRun(runId) {
     else {
       const rawDestinationId = $("#search-destination")?.value;
       const destinationId = rawDestinationId === UNASSIGNED_VALUE ? unclassifiedInvestigation()?.id : rawDestinationId;
-      const query = destinationId && destinationId !== NEW_INVESTIGATION_VALUE
-        ? `?investigation_id=${encodeURIComponent(destinationId)}`
-        : "";
-      payload = await api(`${API_ROUTES.searchRun(runId)}${query}`);
+      const params = new URLSearchParams({ visibility: "all" });
+      if (destinationId && destinationId !== NEW_INVESTIGATION_VALUE) params.set("investigation_id", destinationId);
+      payload = await api(`${API_ROUTES.searchRun(runId)}?${params}`);
     }
     if (!searchRequestIsCurrent(requestContext)) return;
     applySearchPayload(payload, { append: false });
@@ -2737,7 +3377,7 @@ function renderSearchResults() {
     const selectionError = result.selection?.error || result.selection?.last_error;
     const selectionStage = selectionError ? normalizeOperationalError(selectionError, "fetch").stage : "fetch";
     const retryAction = result.selection?.retryable
-      ? `<button class="btn btn-ghost warning" type="button" data-search-retry="${escapeHtml(result.id)}">${selectionStage === "generate" ? "只重试 AI 候选" : "重试抓取原始页"}</button>`
+      ? `<button class="btn btn-ghost warning" type="button" data-search-retry="${escapeHtml(result.id)}">${selectionStage === "generate" ? "重新生成草稿" : "重试抓取"}</button>`
       : "";
     return `
     <article class="search-result ${linked ? "selected" : result.selection ? "existing" : ""}" role="listitem">
@@ -3073,7 +3713,11 @@ async function submitSelectedSearchResults() {
       body: JSON.stringify({ result_ids: selectedIds, request_id: makeClientId("search-request"), actor: "analyst", ...context }),
     });
     requestAccepted = true;
-    if (!searchRequestIsCurrent(requestContext)) return;
+    if (!searchRequestIsCurrent(requestContext) || !$("#search-modal").open) {
+      refreshInvestigationDirectory().catch(() => null);
+      toast("处理请求已被服务端接受；你已切换页面，所以没有自动跳转。", "info", 7500);
+      return;
+    }
     let investigation = intent.investigation || null;
     if (intent.type === "new") {
       if (payload.investigation) {
@@ -3104,6 +3748,12 @@ async function submitSelectedSearchResults() {
       association = await associateInvestigationObjects(investigation, "intake", intakeIds, { origin: "external_search" });
     } else if (isServerInvestigation(investigation) && !asynchronous && intakeIds.length) {
       association = await associateInvestigationObjects(investigation, "intake", intakeIds, { origin: "external_search_legacy" });
+    }
+
+    if (!searchRequestIsCurrent(requestContext) || !$("#search-modal").open) {
+      refreshInvestigationDirectory().catch(() => null);
+      toast("处理任务已保存；你已切换页面，所以没有改变当前专题。", "info", 7500);
+      return;
     }
 
     state.searchSelectedIds.clear();
@@ -3181,6 +3831,7 @@ async function retryExternalSearchResult(resultId) {
 
 async function submitImport(event) {
   event.preventDefault();
+  const requestSerial = ++state.importRequestSerial;
   let intent;
   try {
     intent = destinationIntent("import");
@@ -3243,8 +3894,19 @@ async function submitImport(event) {
       association = { linked: 0, failed: count, mode: "failed", errors: [associationError.message] };
     }
 
+    if (requestSerial !== state.importRequestSerial || !$("#import-modal").open) {
+      refreshData({ keepSelection: true, quiet: true }).catch(() => null);
+      refreshInvestigationDirectory().catch(() => null);
+      toast(`已保存 ${count} 条材料；你已切换页面，所以没有自动跳转。`, association.failed ? "error" : "info", 8000);
+      return;
+    }
+
     await refreshData({ keepSelection: true, quiet: true });
     await refreshInvestigationDirectory();
+    if (requestSerial !== state.importRequestSerial || !$("#import-modal").open) {
+      toast(`已保存 ${count} 条材料；你已切换页面，所以没有自动跳转。`, association.failed ? "error" : "info", 8000);
+      return;
+    }
     closeImportModal();
     if (investigation && association.failed === 0) {
       toast(investigation.sync_mode === "local"
@@ -3259,14 +3921,22 @@ async function submitImport(event) {
       await openIntakeModal(items[0].id);
     }
   } catch (error) {
+    if (requestSerial !== state.importRequestSerial) {
+      toast(persistedCount
+        ? `服务端已保存 ${persistedCount} 条材料，但后续归类失败：${error.message || "未知错误"}`
+        : `后台导入失败：${error.message || "未知错误"}`, "error", 9000);
+      return;
+    }
     $("#import-result").className = `import-result ${persistedCount ? "success" : "error"}`;
     $("#import-result").textContent = persistedCount
       ? `服务端已保存 ${persistedCount} 条材料，但后续归类或页面刷新失败：${error.message}。请到采集箱核对。`
       : `导入失败：${error.message}。未显示虚假成功。`;
     if (persistedCount) toast(`材料已保存，但后续归类或页面刷新失败：${error.message}`, "error", 9000);
   } finally {
-    submit.disabled = false;
-    submit.textContent = "提交到采集箱";
+    if (requestSerial === state.importRequestSerial) {
+      submit.disabled = false;
+      submit.textContent = "提交到采集箱";
+    }
   }
 }
 
@@ -3285,23 +3955,62 @@ function candidateList(item, type) {
   return (item.candidates || []).filter((candidate) => candidate.object_type === type);
 }
 
+function recordAllowsAction(item, ...names) {
+  const allowed = item?.allowed_actions;
+  if (Array.isArray(allowed)) return names.some((name) => allowed.includes(name));
+  if (allowed && typeof allowed === "object") return names.some((name) => allowed[name] === true || allowed[name]?.allowed === true);
+  return false;
+}
+
+function intakeRecordActionAllowed(item, action) {
+  const archived = state.intakeVisibility === "archived" || recordIsArchived(item);
+  // The API derives these actions from the real ReviewTask state. Do not guess
+  // whether a record is running from the intake status and hide an action that
+  // the scoped/global serializer explicitly allowed. Confirmed records remain
+  // a client-side hard stop so the formal archive boundary is never presented
+  // as deletable even if an older response is stale.
+  if (["confirmed", "accepted"].includes(item?.status)) return false;
+  if (action === "restore-record") return archived && recordAllowsAction(item, "restore");
+  if (archived) return false;
+  if (action === "remove-record") return Boolean(state.intakeScopeInvestigationId) && recordAllowsAction(item, "remove", "remove_from_investigation");
+  if (action === "archive-record") return !state.intakeScopeInvestigationId && recordAllowsAction(item, "archive");
+  return false;
+}
+
+function renderIntakeRecordActions(item) {
+  if (intakeRecordActionAllowed(item, "restore-record")) {
+    return '<button class="btn btn-ghost record-restore" type="button" data-intake-action="restore-record">恢复</button>';
+  }
+  if (intakeRecordActionAllowed(item, "remove-record")) {
+    return '<button class="btn btn-ghost record-delete" type="button" data-intake-action="remove-record">从本专题移除</button>';
+  }
+  if (intakeRecordActionAllowed(item, "archive-record")) {
+    return '<button class="btn btn-ghost record-delete" type="button" data-intake-action="archive-record">删除</button>';
+  }
+  return "";
+}
+
 function renderIntakeList() {
   const root = $("#intake-list");
   if (!root) return;
   const activeCount = state.intakeItems.filter((item) => ["queued", "parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status)).length;
+  const globalActiveCount = state.globalIntakeItems.filter((item) => ["queued", "parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status)).length;
   const badge = $("#intake-count");
-  if (badge) badge.textContent = String(activeCount);
-  $("#intake-summary").textContent = state.intakeScopeInvestigationId
-    ? `本专题 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`
-    : `全局 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录 · 列表加载最近最多 ${GLOBAL_INTAKE_LOAD_LIMIT} 条，指定旧记录会单独读取`;
+  if (badge) badge.textContent = String(globalActiveCount);
+  $$('[data-intake-visibility]').forEach((button) => button.classList.toggle("active", button.dataset.intakeVisibility === state.intakeVisibility));
+  $("#intake-summary").textContent = state.intakeVisibility === "archived"
+    ? `${state.intakeScopeInvestigationId ? "本专题已移除" : "全局已删除"} · ${state.intakeItems.length} 条记录`
+    : state.intakeScopeInvestigationId
+      ? `本专题 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`
+      : `全局 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`;
   root.innerHTML = state.intakeItems.length ? state.intakeItems.map((item) => `
     <button class="intake-item ${item.id === state.selectedIntakeId ? "active" : ""}" type="button" role="listitem" data-intake-id="${escapeHtml(item.id)}">
       <span class="intake-type">${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</span>
       <strong>${escapeHtml(intakeTitle(item))}</strong>
-      <small>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)} · ${formatDate(item.created_at, true)}</small>
+      <small>${state.intakeVisibility === "archived" || recordIsArchived(item) ? "已删除" : escapeHtml(LABELS.intakeStatus[item.status] || item.status)} · ${formatDate(item.archived_at || item.removed_at || item.created_at, true)}</small>
       ${item.error ? `<em>${escapeHtml(normalizeOperationalError(item.error, item.status === "generation_failed" ? "generate" : "fetch").title)}</em>` : ""}
     </button>
-  `).join("") : '<p class="muted intake-empty">采集箱暂无条目。</p>';
+  `).join("") : `<p class="muted intake-empty">${state.intakeVisibility === "archived" ? "没有可恢复的已删除记录。" : "采集箱暂无条目。"}</p>`;
 }
 
 function renderReadonlyCandidate(candidate) {
@@ -3316,7 +4025,7 @@ function renderReadonlyCandidate(candidate) {
   else body = `<p>当前版本无法用语义卡展示这个候选，请在技术详情中核对。</p>`;
   return `
     <article class="candidate-card readonly semantic-candidate">
-      <header><b>${escapeHtml(title)}</b><span>${escapeHtml(candidate.source_mode || "机器生成")}</span></header>
+      <header><b>${escapeHtml(title)}</b><span>${escapeHtml(["fallback", "fallback-after-error"].includes(candidate.source_mode) ? "基础草稿" : "机器草稿")}</span></header>
       <div class="semantic-candidate-body">${body}</div>
       ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}</p>` : ""}
       <details><summary>机器原值</summary><pre>${escapeHtml(JSON.stringify(candidate.machine, null, 2))}</pre></details>
@@ -3330,7 +4039,8 @@ function renderIntakeDetail(item = null) {
     root.innerHTML = '<div class="panel-empty">请选择一个采集箱条目查看材料、候选和人工处置。</div>';
     return;
   }
-  if (item.status === "candidate_ready") {
+  const archived = state.intakeVisibility === "archived" || recordIsArchived(item);
+  if (item.status === "candidate_ready" && !archived) {
     root.innerHTML = renderIntakeReview(item);
     return;
   }
@@ -3339,24 +4049,26 @@ function renderIntakeDetail(item = null) {
   const errorValue = item.error || item.candidate_generation?.error;
   const errorStage = item.status === "generation_failed" ? "generate" : "fetch";
   const normalizedItemError = errorValue ? normalizeOperationalError(errorValue, errorStage) : null;
+  const recordActions = renderIntakeRecordActions(item);
   const errorAction = normalizedItemError?.retryable !== false && item.status === "generation_failed"
-    ? '<button class="btn btn-ghost" type="button" data-intake-action="regenerate">只重试候选生成</button>'
+    ? '<button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新生成草稿</button>'
     : normalizedItemError?.retryable !== false && item.status === "failed" && item.search?.result_id
-      ? `<button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取原始页</button>`
+      ? `<button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取</button>`
       : "";
   root.innerHTML = `
     <article class="intake-status-card ${intakeStatusClass(item.status)}">
       <div>
-        <span>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)}</span>
+        <span>${archived ? "已删除 · 可恢复" : escapeHtml(LABELS.intakeStatus[item.status] || item.status)}</span>
         <strong>${escapeHtml(intakeTitle(item))}</strong>
       </div>
-      ${errorValue ? renderOperationalError(errorValue, { stage: errorStage, actionHtml: errorAction }) : ""}
+      ${errorValue ? renderOperationalError(errorValue, { stage: errorStage, compact: true, actionHtml: archived ? "" : errorAction }) : ""}
     </article>
     ${renderIntakeFacts(item)}
     ${renderIntakeSnapshots(item)}
     ${machineCandidates ? `<section class="candidate-stack"><h3>机器候选保留</h3>${machineCandidates}</section>` : ""}
     ${item.status === "confirmed" ? renderConfirmedRecord(item, final) : ""}
-    ${item.rejection_reason ? `<p class="validation-error">驳回原因：${escapeHtml(item.rejection_reason)}</p>` : ""}
+    ${item.rejection_reason ? `<p class="validation-error">不采用原因：${escapeHtml(item.rejection_reason)}</p>` : ""}
+    ${recordActions ? `<div class="intake-record-actions"><p>${archived ? "恢复后会重新出现在当前列表；正式档案不会因此改变。" : "删除或移除只会隐藏这条待处理记录，不会改动已经确认的正式档案。"}</p>${recordActions}</div>` : ""}
   `;
 }
 
@@ -3365,7 +4077,7 @@ function renderIntakeFacts(item) {
   const collectionBoundary = {
     queued: "材料占位与处理任务已持久排队，尚未开始抓取；未进入正式档案。",
     confirmed: "已由人工确认并进入正式档案；证据固定到本版本快照。",
-    rejected: "已由人工驳回，未进入正式档案。",
+    rejected: "已由人工决定不采用，未进入正式档案。",
     cancelled: "已由人工撤销，未进入正式档案。",
     generation_failed: "材料已保存，但候选生成失败；尚未进入正式档案，可重新生成。",
     parsed: "材料已保存，尚未生成可审核候选；未进入正式档案。",
@@ -3461,7 +4173,7 @@ function renderConfirmationPreview(preview) {
       <section><h4>主张 ${formal.claims?.length || 0}</h4>${formal.claims?.length ? `<ul>${formal.claims.map((claim) => `<li><span>${escapeHtml(previewActionLabel(claim.action))}</span>${escapeHtml(claim.text || claim.merge_claim_id || "主张未知")}<small>${escapeHtml(LABELS.claim[claim.status] || claim.status || "状态未知")} · 置信度 ${percent(claim.confidence)}${claim.temporal_scope ? ` · ${escapeHtml(claim.temporal_scope)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要写入的主张。</p>"}</section>
       <section><h4>证据 ${formal.evidence?.length || 0}</h4>${formal.evidence?.length ? `<ul>${formal.evidence.map((evidence) => `<li><span>${escapeHtml(LABELS.stance[evidence.stance] || evidence.stance || "背景")}</span><q>${escapeHtml(evidence.snippet || "证据原句未知")}</q><small>强度 ${percent(evidence.strength)}${evidence.note ? ` · ${escapeHtml(evidence.note)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要固定的证据原句。</p>"}</section>
     </div>
-    ${formal.actions?.length ? `<section class="preview-action-summary"><h4>确认后按顺序执行</h4><ol>${formal.actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ol>${formal.candidate_generation?.degraded ? `<p>${escapeHtml(formal.candidate_generation.warning || "当前为降级候选，必须人工核对。")}</p>` : ""}</section>` : ""}
+    ${formal.actions?.length ? `<section class="preview-action-summary"><h4>确认保存后将执行</h4><ol>${formal.actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ol>${formal.candidate_generation?.degraded ? "<p>这份基础草稿已经过当前表单校验，仍以你的本次确认为准。</p>" : ""}</section>` : ""}
     ${formal.scope?.mode ? `<div class="preview-scope-note">对象范围：${formal.scope.mode === "investigation-only" ? "仅限当前专题" : "已显式允许跨专题复用"}</div>` : ""}
     <details class="preview-technical"><summary>审计追踪</summary><pre>${escapeHtml(JSON.stringify(preview.trace || {}, null, 2))}</pre></details>`;
 }
@@ -3496,9 +4208,9 @@ function renderIntakeReview(item) {
   const degraded = ["fallback", "fallback-after-error"].includes(generation.mode);
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">
-      <strong>当前是规则降级候选，不是模型研判结果</strong>
-      <span>系统只做了确定性摘录，字段可能不完整或语义不准确。请逐项对照固定快照，必要时修改或驳回后再确认。</span>
-      ${generation.error ? `<small>模型失败原因：${escapeHtml(generation.error)}</small>` : ""}
+      <strong>基础草稿 · 需要逐项核对</strong>
+      <span>原文已经保存；这份草稿由基础规则整理，可能不完整。请对照固定快照修改或选择不采用，确认前不会进入正式档案。</span>
+      ${generation.error ? `<details><summary>为什么使用基础草稿？</summary><small>${escapeHtml(generation.error)}</small></details>` : ""}
     </div>` : "";
   return `
     <section class="intake-review-material">
@@ -3586,16 +4298,17 @@ function renderIntakeReview(item) {
           ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${fields.start_offset}-${fields.end_offset}</p>`}
         </div>`;
       }).join("")}</section>
-      <section class="review-section">
-        <h3>驳回</h3>
-        <label><span>驳回原因</span><textarea id="intake-reject-reason" rows="2" placeholder="填写原因后执行驳回"></textarea></label>
+      <section id="intake-reject-panel" class="review-section review-reject-section" hidden>
+        <div class="review-reject-heading"><div><h3>不采用这份草稿</h3><p>材料和机器草稿会保留用于审计，正式档案不会改变。</p></div><button class="text-btn" type="button" data-intake-action="cancel-reject">取消</button></div>
+        <label><span>原因</span><textarea id="intake-reject-reason" rows="2" placeholder="填写原因后再次点“确认不采用”"></textarea></label>
       </section>
-      <div id="intake-preview" class="intake-preview" aria-live="polite"><p class="muted">先预览正式区变化；只有预览通过且字段未再修改，才能确认入档。</p></div>
+      <div id="intake-preview" class="intake-preview" aria-live="polite"><p class="muted">点击“核对并保存到档案”会先检查证据定位并展示保存摘要，不会立即写入正式档案。</p></div>
       <div class="review-actions">
-        <button class="btn btn-ghost" type="button" data-intake-action="preview">预览入档</button>
-        <button class="btn btn-ghost warning" type="button" data-intake-action="cancel">撤销处理</button>
-        <button class="btn btn-danger" type="button" data-intake-action="reject">驳回</button>
-        <button class="btn btn-primary" type="button" data-intake-action="confirm" disabled title="请先预览并通过校验">先预览再确认</button>
+        <p class="review-later-note">关闭窗口即可稍后处理，正式档案不会改变。</p>
+        ${renderIntakeRecordActions(item)}
+        <button class="btn btn-ghost" type="button" data-intake-action="reject-toggle" aria-expanded="false" aria-controls="intake-reject-panel">不采用</button>
+        <button class="btn btn-primary" type="button" data-intake-action="preview">核对并保存到档案</button>
+        <button class="btn btn-primary" type="button" data-intake-action="confirm" hidden disabled title="请先核对并通过校验">确认保存</button>
       </div>
     </form>
     </section>`;
@@ -3618,18 +4331,25 @@ async function loadIntakeDetail(
   const existing = state.intakeItems.find((item) => item.id === itemId);
   if (existing?.material && Array.isArray(existing.candidates)) return existing;
   const route = requestContext.scopeInvestigationId
-    ? `/pldr-api/v1/investigations/${encodeURIComponent(requestContext.scopeInvestigationId)}/intake/${encodeURIComponent(itemId)}`
-    : `/pldr-api/v1/intake/${encodeURIComponent(itemId)}`;
+    ? `/pldr-api/v1/investigations/${encodeURIComponent(requestContext.scopeInvestigationId)}/intake/${encodeURIComponent(itemId)}?visibility=all`
+    : `/pldr-api/v1/intake/${encodeURIComponent(itemId)}?visibility=all`;
   const detail = await api(route);
   if (
     requestContext.serial !== state.intakeRequestSerial
     || requestContext.scopeInvestigationId !== state.intakeScopeInvestigationId
   ) return null;
-  state.intakeItems = state.intakeItems.map((item) => item.id === itemId ? detail : item);
-  if (!requestContext.scopeInvestigationId) {
-    state.globalIntakeItems = state.globalIntakeItems.map((item) => item.id === itemId ? detail : item);
+  const mergedDetail = {
+    ...existing,
+    ...detail,
+    allowed_actions: requestContext.scopeInvestigationId
+      ? (existing?.allowed_actions ?? [])
+      : (detail.allowed_actions !== undefined ? detail.allowed_actions : existing?.allowed_actions),
+  };
+  state.intakeItems = state.intakeItems.map((item) => item.id === itemId ? mergedDetail : item);
+  if (!requestContext.scopeInvestigationId && state.intakeVisibility === "active") {
+    state.globalIntakeItems = state.globalIntakeItems.map((item) => item.id === itemId ? mergedDetail : item);
   }
-  return detail;
+  return mergedDetail;
 }
 
 async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
@@ -3642,29 +4362,40 @@ async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
   let preferredError = null;
   if (requestContext.scopeInvestigationId) {
     const investigationId = requestContext.scopeInvestigationId;
+    const visibility = state.intakeVisibility === "archived" ? "removed" : "active";
     const [tasks, options] = await Promise.all([
-      loadAllInvestigationTasks(investigationId),
-      api(`/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/review-options`),
+      loadAllInvestigationTasks(investigationId, visibility),
+      state.intakeVisibility === "active"
+        ? api(`/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/review-options`)
+        : Promise.resolve({ events: [], entities: [], claims: [] }),
     ]);
     if (requestContext.serial !== state.intakeRequestSerial || investigationId !== state.intakeScopeInvestigationId) return { found: false, stale: true };
-    state.investigationTasks.set(investigationId, tasks);
+    if (state.intakeVisibility === "active") state.investigationTasks.set(investigationId, tasks);
     const byId = new Map();
     tasks.forEach((task) => {
-      if (task.intake_item?.id) byId.set(task.intake_item.id, task.intake_item);
+      if (task.intake_item?.id) {
+        byId.set(task.intake_item.id, {
+          ...task.intake_item,
+          allowed_actions: task.allowed_actions ?? [],
+          archived: task.intake_item.archived ?? task.archived,
+          archived_at: task.intake_item.archived_at || task.archived_at || task.removed_at,
+          removed_at: task.intake_item.removed_at || task.removed_at,
+        });
+      }
     });
     state.intakeItems = [...byId.values()];
     state.intakeOptions = options || { events: [], entities: [], claims: [] };
   } else {
     const [list, options] = await Promise.all([
-      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false`),
-      api("/pldr-api/v1/intake/options"),
+      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false&visibility=${encodeURIComponent(state.intakeVisibility)}`),
+      state.intakeVisibility === "active" ? api("/pldr-api/v1/intake/options") : Promise.resolve({ events: [], entities: [], claims: [] }),
     ]);
     if (requestContext.serial !== state.intakeRequestSerial || state.intakeScopeInvestigationId) return { found: false, stale: true };
     state.intakeItems = list.items || [];
-    state.globalIntakeItems = [...state.intakeItems];
+    if (state.intakeVisibility === "active") state.globalIntakeItems = [...state.intakeItems];
     state.intakeOptions = options || { events: [], entities: [], claims: [] };
   }
-  if (!state.intakeScopeInvestigationId && preferredItemId && !state.intakeItems.some((item) => item.id === preferredItemId)) {
+  if (state.intakeVisibility === "active" && !state.intakeScopeInvestigationId && preferredItemId && !state.intakeItems.some((item) => item.id === preferredItemId)) {
     try {
       const olderItem = await api(`/pldr-api/v1/intake/${encodeURIComponent(preferredItemId)}`);
       if (requestContext.serial !== state.intakeRequestSerial || state.intakeScopeInvestigationId) return { found: false, stale: true };
@@ -3677,7 +4408,7 @@ async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
   const target = (preferredItemId && state.intakeItems.some((item) => item.id === preferredItemId)
     ? preferredItemId
     : null)
-    || state.intakeItems.find((item) => item.status === "candidate_ready")?.id
+    || (state.intakeVisibility === "active" ? state.intakeItems.find((item) => item.status === "candidate_ready")?.id : null)
     || state.intakeItems[0]?.id
     || null;
   if (target) {
@@ -3702,6 +4433,21 @@ async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
   return { found: !preferredItemId || target === preferredItemId, error: preferredError };
 }
 
+async function setIntakeVisibility(visibility) {
+  if (!new Set(["active", "archived"]).has(visibility) || state.intakeVisibility === visibility) return;
+  state.intakeVisibility = visibility;
+  state.selectedIntakeId = null;
+  invalidateIntakePreview();
+  $("#intake-detail").innerHTML = `<div class="panel-empty">正在读取${visibility === "archived" ? "已删除" : "当前"}材料…</div>`;
+  try {
+    await refreshIntakeData(null);
+    setIntakeMobileStep(0);
+  } catch (error) {
+    $("#intake-detail").innerHTML = renderOperationalError(error, { stage: "fetch" });
+    toast(`材料列表读取失败：${error.message || "未知错误"}`, "error", 7000);
+  }
+}
+
 function setIntakeMobileStep(step) {
   state.intakeMobileStep = clamp(Number(step) || 0, 0, 2);
   const modal = $("#intake-modal");
@@ -3720,6 +4466,13 @@ async function openIntakeModal(itemId = null, quiet = false, scopeInvestigationI
   setIntakeActionBusy(false);
   invalidateIntakePreview();
   state.intakeScopeInvestigationId = scopeInvestigationId;
+  state.intakeScopeInvestigationTitle = state.investigations.find((item) => item.id === scopeInvestigationId)?.title || null;
+  const modalTitle = state.intakeScopeInvestigationTitle
+    ? `“${state.intakeScopeInvestigationTitle}”待审核材料`
+    : "待处理采集箱";
+  $("#intake-modal-title").textContent = modalTitle;
+  $("#intake-modal-title").title = modalTitle;
+  state.intakeVisibility = "active";
   setIntakeMobileStep(itemId ? 1 : 0);
   if (!quiet && typeof modal.showModal === "function") modal.showModal();
   else if (!quiet) modal.setAttribute("open", "");
@@ -3754,6 +4507,10 @@ function closeIntakeModal() {
   setIntakeActionBusy(false);
   invalidateIntakePreview();
   state.intakeScopeInvestigationId = null;
+  state.intakeScopeInvestigationTitle = null;
+  $("#intake-modal-title").textContent = "待处理采集箱";
+  $("#intake-modal-title").removeAttribute("title");
+  state.intakeVisibility = "active";
   if (state.globalIntakeItems.length) {
     state.intakeItems = [...state.globalIntakeItems];
     state.selectedIntakeId = state.intakeItems.find((item) => item.id === state.selectedIntakeId)?.id || state.intakeItems[0]?.id || null;
@@ -3765,21 +4522,87 @@ function selectedIntakeItem() {
   return state.intakeItems.find((item) => item.id === state.selectedIntakeId) || null;
 }
 
+async function updateIntakeRecordVisibility(item, action) {
+  if (!intakeRecordActionAllowed(item, action)) {
+    toast("当前状态不允许执行这项删除或恢复操作，请刷新后重试。", "error", 6000);
+    return;
+  }
+  const actionScopeId = state.intakeScopeInvestigationId;
+  const actionScopeTitle = state.intakeScopeInvestigationTitle;
+  const scoped = Boolean(actionScopeId);
+  const copy = action === "archive-record"
+    ? {
+      question: `删除“${intakeTitle(item)}”？\n\n它会移到“已删除”，之后可以恢复。已经保存的材料、快照和正式档案不会改变。`,
+      route: API_ROUTES.intakeAction(item.id, "archive"),
+      success: "材料已移到“已删除”；正式档案没有改变。",
+      }
+    : action === "remove-record"
+      ? {
+        question: `从“${actionScopeTitle || "当前专题"}”移除“${intakeTitle(item)}”？\n\n它会移到本专题“已删除”，之后可以恢复。全局材料和正式档案不会改变。`,
+        route: API_ROUTES.investigationIntakeAction(actionScopeId, item.id, "remove"),
+        success: "材料已从本专题移除；全局材料和正式档案没有改变。",
+      }
+      : {
+        question: `恢复“${intakeTitle(item)}”？\n\n恢复只会让这条记录重新出现在${scoped ? `专题“${actionScopeTitle || "当前专题"}”` : "采集箱"}，不会改变正式档案。`,
+        route: scoped
+          ? API_ROUTES.investigationIntakeAction(actionScopeId, item.id, "restore")
+          : API_ROUTES.intakeAction(item.id, "restore"),
+        success: `材料已恢复到${scoped ? `专题“${actionScopeTitle || "当前专题"}”` : "采集箱"}。`,
+      };
+  if (!window.confirm(copy.question)) return;
+  setIntakeActionBusy(true);
+  try {
+    await api(copy.route, { method: "POST" });
+    invalidateIntakePreview();
+    state.selectedIntakeId = null;
+    await refreshIntakeData(null);
+    if (actionScopeId) await loadInvestigationWorkspace(actionScopeId, { quiet: true });
+    else if (state.activeInvestigationId) await loadInvestigationWorkspace(state.activeInvestigationId, { quiet: true });
+    await refreshInvestigationDirectory();
+    toast(copy.success, "success", 5600);
+  } catch (error) {
+    toast(`${action === "restore-record" ? "恢复" : "删除"}失败：${error.message || "未知错误"}`, "error", 7000);
+  } finally {
+    setIntakeActionBusy(false);
+  }
+}
+
 function confirmationFingerprint(payload) {
   return JSON.stringify(payload);
 }
 
 function setIntakeConfirmEnabled(enabled) {
-  const button = $('[data-intake-action="confirm"]', $("#intake-modal") || document);
-  if (!button) return;
-  button.disabled = state.intakeActionBusy || !enabled;
-  button.textContent = enabled ? "确认入档" : "先预览再确认";
-  button.title = enabled ? "预览已通过；确认将写入正式区" : "请先预览并通过校验";
+  const modal = $("#intake-modal") || document;
+  const confirmButton = $('[data-intake-action="confirm"]', modal);
+  const previewButton = $('[data-intake-action="preview"]', modal);
+  if (confirmButton) {
+    confirmButton.hidden = !enabled;
+    confirmButton.disabled = state.intakeActionBusy || !enabled;
+    confirmButton.textContent = "确认保存";
+    confirmButton.title = enabled ? "核对已通过；确认后才会写入正式档案" : "请先核对并通过校验";
+  }
+  if (previewButton) {
+    previewButton.hidden = Boolean(enabled);
+    previewButton.disabled = state.intakeActionBusy;
+  }
+}
+
+function setIntakeRejectExpanded(expanded) {
+  const panel = $("#intake-reject-panel");
+  const button = $('[data-intake-action="reject-toggle"]', $("#intake-modal") || document);
+  if (!panel || !button) return;
+  panel.hidden = !expanded;
+  button.textContent = expanded ? "确认不采用" : "不采用";
+  button.classList.toggle("btn-danger", expanded);
+  button.classList.toggle("btn-ghost", !expanded);
+  button.setAttribute("aria-expanded", String(expanded));
+  if (expanded) window.setTimeout(() => $("#intake-reject-reason")?.focus(), 0);
+  else window.setTimeout(() => button.focus(), 0);
 }
 
 function setIntakeActionBusy(busy) {
   state.intakeActionBusy = busy;
-  $$('[data-intake-action="preview"], [data-intake-action="reject"], [data-intake-action="cancel"]', $("#intake-modal") || document)
+  $$('[data-intake-action="preview"], [data-intake-action="reject-toggle"], [data-intake-action="cancel-reject"], [data-intake-action$="-record"]', $("#intake-modal") || document)
     .forEach((button) => { button.disabled = busy; });
   setIntakeConfirmEnabled(Boolean(state.intakePreviewApproval));
 }
@@ -3858,20 +4681,38 @@ function buildConfirmation(item) {
 }
 
 async function continueInvestigationReview(completedIntakeId) {
-  const investigation = activeInvestigation();
-  if (!investigation) return;
-  if (isServerInvestigation(investigation)) await loadInvestigationWorkspace(investigation.id, { quiet: true });
-  else renderInvestigationPage();
-  const next = tasksForInvestigation(investigation).find((task) => canonicalTaskStage(task) === "ready" && taskIntakeId(task) && taskIntakeId(task) !== completedIntakeId);
-  if (next) {
-    await refreshIntakeData(taskIntakeId(next));
-    setIntakeMobileStep(1);
-    toast("已打开专题中的下一条 ready 材料。", "success", 4200);
+  const scopeInvestigationId = state.intakeScopeInvestigationId;
+  const modal = $("#intake-modal");
+  const refreshPromise = refreshIntakeData(null);
+  const requestSerial = state.intakeRequestSerial;
+  let refreshResult;
+  try {
+    refreshResult = await refreshPromise;
+  } catch (error) {
+    if (
+      requestSerial !== state.intakeRequestSerial
+      || scopeInvestigationId !== state.intakeScopeInvestigationId
+      || !modal.open
+    ) return;
+    toast(`下一条材料读取失败：${error.message || "未知错误"}`, "error", 7000);
     return;
   }
-  closeIntakeModal();
-  setInvestigationTab("review", { syncUrl: false });
-  toast("本专题当前没有下一条 ready 材料，已返回处理队列。", "info", 5200);
+  if (
+    refreshResult?.stale
+    || requestSerial !== state.intakeRequestSerial
+    || scopeInvestigationId !== state.intakeScopeInvestigationId
+    || !modal.open
+  ) return;
+  const next = selectedIntakeItem();
+  if (next?.status === "candidate_ready" && next.id !== completedIntakeId) {
+    setIntakeMobileStep(1);
+    toast(scopeInvestigationId ? "已打开本专题的下一条待核对材料。" : "已打开采集箱中的下一条待核对材料。", "success", 4200);
+    return;
+  }
+  setIntakeMobileStep(0);
+  toast(scopeInvestigationId
+    ? "本专题当前没有下一条待核对材料，已返回材料列表。"
+    : "采集箱当前没有下一条待核对材料，已返回材料列表。", "info", 5200);
 }
 
 async function handleIntakeAction(action, domEvent = null) {
@@ -3889,6 +4730,21 @@ async function handleIntakeAction(action, domEvent = null) {
   }
   const item = selectedIntakeItem();
   if (!item) return;
+  if (action === "cancel-reject") {
+    setIntakeRejectExpanded(false);
+    return;
+  }
+  if (action === "reject-toggle") {
+    if ($("#intake-reject-panel")?.hidden) {
+      setIntakeRejectExpanded(true);
+      return;
+    }
+    action = "reject";
+  }
+  if (["archive-record", "remove-record", "restore-record"].includes(action)) {
+    await updateIntakeRecordVisibility(item, action);
+    return;
+  }
   if (action === "retry-detail") {
     const requestContext = {
       serial: ++state.intakeRequestSerial,
@@ -3907,8 +4763,9 @@ async function handleIntakeAction(action, domEvent = null) {
   }
   if (action === "open-event") {
     const eventId = domEvent?.target?.closest?.("[data-event-target]")?.dataset?.eventTarget || domEvent?.target?.dataset?.eventTarget;
+    const investigationId = state.intakeScopeInvestigationId;
     closeIntakeModal();
-    await selectEvent(eventId, { open: true });
+    await openInvestigationEvent(eventId, investigationId);
     return;
   }
   if (action === "continue-review") {
@@ -4005,12 +4862,12 @@ async function handleIntakeAction(action, domEvent = null) {
       if (finalEventId) {
         invalidateInvestigationEvidence([finalEventId]);
       }
-      toast("人工确认已完成，正式事件与固定快照已经建立回链。", "success", 6200);
+      toast("确认保存完成，正式事件与固定快照已经建立回链。", "success", 6200);
       await refreshData({ keepSelection: false, quiet: true, preferredEventId: finalEventId });
       await refreshInvestigationDirectory();
       if (workspaceId && state.activeInvestigationId === workspaceId) {
         await loadInvestigationWorkspace(workspaceId, { quiet: true });
-        if (["today", "claims"].includes(state.activeInvestigationTab)) await loadInvestigationEvidence(activeInvestigation());
+        if (investigationNeedsEvidence()) await loadInvestigationEvidence(activeInvestigation());
       }
       if (!actionIsCurrent()) return;
       await refreshIntakeData(item.id);
@@ -4021,13 +4878,13 @@ async function handleIntakeAction(action, domEvent = null) {
     }
     if (action === "reject") {
       const reason = $("#intake-reject-reason")?.value.trim();
-      if (!reason) throw new Error("请填写驳回原因。");
+      if (!reason) throw new Error("请填写不采用的原因。");
       await api(`/pldr-api/v1/intake/${item.id}/reject`, {
         method: "POST",
         body: JSON.stringify({ analyst: $("#intake-analyst")?.value.trim() || "analyst", reason }),
       });
       dispositionCommitted = true;
-      toast("候选已驳回，未写入正式区。", "success");
+      toast("这份草稿已标记为不采用，未写入正式档案。", "success");
     } else if (action === "cancel") {
       await api(`/pldr-api/v1/intake/${item.id}/cancel`, {
         method: "POST",
@@ -4061,6 +4918,20 @@ function collectionMetrics() {
   return state.collectionSummary?.metrics || state.collectionSummary || {};
 }
 
+function collectionVisibleTargets() {
+  if (!state.collectionScopeInvestigationId) return state.collectionTargets;
+  const allowedIds = state.collectionScopeTargetIds;
+  if (!(allowedIds instanceof Set)) return [];
+  return state.collectionTargets.filter((target) => allowedIds.has(target.id));
+}
+
+function collectionTargetIsInScope(targetId) {
+  return Boolean(targetId) && (
+    !state.collectionScopeInvestigationId
+    || state.collectionScopeTargetIds?.has(targetId)
+  );
+}
+
 function collectionIntervalMinutes(target) {
   if (target.interval_minutes != null) return Number(target.interval_minutes);
   if (target.interval_seconds != null) return Math.max(1, Math.round(Number(target.interval_seconds) / 60));
@@ -4081,6 +4952,21 @@ function collectionTargetStatus(target) {
 }
 
 function renderCollectionSummary() {
+  if (state.collectionScopeInvestigationId) {
+    const visibleTargets = collectionVisibleTargets();
+    const statuses = visibleTargets.map(collectionTargetStatus);
+    const cards = [
+      [visibleTargets.length, "专题来源"],
+      [statuses.filter((status) => status === "healthy").length, "运行正常"],
+      [statuses.filter((status) => ["error", "degraded", "stale"].includes(status)).length, "需要恢复"],
+      [statuses.filter((status) => ["pending", "new"].includes(status)).length, "待首次运行"],
+      ["逐项查看", "版本与队列"],
+    ];
+    $("#collection-summary").innerHTML = cards.map(([value, label]) => `
+      <div><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>
+    `).join("");
+    return;
+  }
   const metrics = collectionMetrics();
   const targets = metrics.targets || {};
   const runs = metrics.runs || {};
@@ -4098,15 +4984,16 @@ function renderCollectionSummary() {
 
 function renderCollectionTargets() {
   const root = $("#collection-target-list");
-  if (!state.collectionTargets.length) {
+  const visibleTargets = collectionVisibleTargets();
+  if (!visibleTargets.length) {
     root.innerHTML = `
       <div class="collection-empty">
-        <strong>还没有固定来源</strong>
-        <p>在上方添加一个无需登录的公共网页。PLDR 不会用演示运行记录填充这里。</p>
+        <strong>${state.collectionScopeInvestigationId ? "本专题还没有固定来源" : "还没有固定来源"}</strong>
+        <p>在上方添加一个无需登录的公共网页。${state.collectionScopeInvestigationId ? "这里不会显示其他专题或全局来源。" : "PLDR 不会用演示运行记录填充这里。"}</p>
       </div>`;
     return;
   }
-  root.innerHTML = state.collectionTargets.map((target) => {
+  root.innerHTML = visibleTargets.map((target) => {
     const status = collectionTargetStatus(target);
     const active = target.id === state.selectedCollectionTargetId;
     return `
@@ -4245,6 +5132,14 @@ function renderCollectionDetail(detail = state.selectedCollectionTarget) {
 
 async function loadCollectionTarget(targetId, { preserveDiff = false } = {}) {
   const requestSerial = ++state.collectionRequestSerial;
+  if (targetId && !collectionTargetIsInScope(targetId)) {
+    state.selectedCollectionTargetId = null;
+    state.selectedCollectionTarget = null;
+    state.collectionDiff = null;
+    renderCollectionTargets();
+    $("#collection-detail").innerHTML = '<div class="collection-empty"><strong>来源不在当前专题</strong><p>已停止读取，避免显示或操作其他专题来源。</p></div>';
+    return;
+  }
   if (!targetId) {
     state.collectionDiffRequestSerial += 1;
     state.collectionDiff = null;
@@ -4291,42 +5186,104 @@ async function refreshCollectionData(preferredTargetId = null) {
     scheduleCollectionPoll();
     return;
   }
+  const refreshSerial = ++state.collectionRefreshSerial;
+  const scopeInvestigationId = state.collectionScopeInvestigationId;
   state.collectionBusy = true;
   let collectionRetryDelayMs = null;
   const previousTargetId = state.selectedCollectionTargetId;
   try {
-    const [summary, targets] = await Promise.all([
+    const [summary, targets, scopeDetail] = await Promise.all([
       api("/pldr-api/v1/collection/summary"),
       api("/pldr-api/v1/collection/targets"),
+      scopeInvestigationId
+        ? api(API_ROUTES.investigation(scopeInvestigationId))
+        : Promise.resolve(null),
     ]);
+    if (
+      refreshSerial !== state.collectionRefreshSerial
+      || scopeInvestigationId !== state.collectionScopeInvestigationId
+      || !$("#collection-modal").open
+    ) return;
     state.collectionSummary = summary;
     state.collectionTargets = targets.items || targets.targets || [];
+    if (scopeInvestigationId) {
+      state.collectionScopeTargetIds = new Set((scopeDetail?.collection_targets || []).map((target) => target.id));
+      state.investigationDetails.set(scopeInvestigationId, scopeDetail);
+    } else {
+      state.collectionScopeTargetIds = null;
+    }
     renderCollectionSummary();
-    const targetId = preferredTargetId
-      || (state.collectionTargets.some((target) => target.id === state.selectedCollectionTargetId) ? state.selectedCollectionTargetId : null)
-      || state.collectionTargets[0]?.id
-      || null;
+    const visibleTargets = collectionVisibleTargets();
+    const requestedTargetId = preferredTargetId || previousTargetId || null;
+    const requestedTargetIsVisible = visibleTargets.some((target) => target.id === requestedTargetId);
+    const targetLeftScope = Boolean(requestedTargetId && !requestedTargetIsVisible && scopeInvestigationId);
+    const targetId = requestedTargetIsVisible
+      ? requestedTargetId
+      : targetLeftScope
+        ? null
+        : visibleTargets[0]?.id || null;
     state.selectedCollectionTargetId = targetId;
+    if (!targetId) {
+      state.collectionRequestSerial += 1;
+      state.collectionDiffRequestSerial += 1;
+      state.selectedCollectionTarget = null;
+      state.collectionDiff = null;
+    }
     renderCollectionTargets();
-    await loadCollectionTarget(targetId, { preserveDiff: targetId === previousTargetId });
+    if (targetLeftScope) {
+      $("#collection-detail").innerHTML = '<div class="collection-empty"><strong>来源已不在本专题</strong><p>为避免误操作其他专题来源，当前选择已清除。请刷新专题或选择仍在本专题的来源。</p></div>';
+      toast("原来源已不属于当前专题，已停止显示和操作。", "error", 7000);
+    } else {
+      await loadCollectionTarget(targetId, { preserveDiff: targetId === previousTargetId });
+    }
     renderMetrics();
   } catch (error) {
+    if (
+      refreshSerial !== state.collectionRefreshSerial
+      || scopeInvestigationId !== state.collectionScopeInvestigationId
+      || !$("#collection-modal").open
+    ) return;
     collectionRetryDelayMs = 15000;
+    if (scopeInvestigationId) state.collectionScopeTargetIds = new Set();
+    state.selectedCollectionTargetId = null;
     state.selectedCollectionTarget = null;
+    state.collectionDiff = null;
     $("#collection-summary").innerHTML = `<div class="collection-error"><strong>来源监测不可用</strong><p>${escapeHtml(error.message)}</p></div>`;
     $("#collection-target-list").innerHTML = '<div class="collection-empty"><p>没有伪造运行记录；请检查后端服务。</p></div>';
-    $("#collection-detail").innerHTML = '<div class="collection-error"><strong>无法读取运行与版本</strong><p>请恢复后端连接后重试。</p></div>';
+    $("#collection-detail").innerHTML = `<div class="collection-error"><strong>无法读取运行与版本</strong><p>${scopeInvestigationId ? "无法确认专题范围，因此没有显示任何全局来源。" : "请恢复后端连接后重试。"}</p></div>`;
   } finally {
-    state.collectionBusy = false;
-    scheduleCollectionPoll(collectionRetryDelayMs);
+    if (refreshSerial === state.collectionRefreshSerial) {
+      state.collectionBusy = false;
+      scheduleCollectionPoll(collectionRetryDelayMs);
+    }
   }
 }
 
-async function openCollectionModal() {
+async function openCollectionModal(preferredTargetId = null, scopeInvestigationId = null) {
   const modal = $("#collection-modal");
+  const destination = state.investigations.find((item) => item.id === state.pendingCollectionInvestigationId) || null;
+  const scope = state.investigations.find((item) => item.id === scopeInvestigationId) || null;
+  state.collectionRefreshSerial += 1;
+  state.collectionRequestSerial += 1;
+  state.collectionDiffRequestSerial += 1;
+  state.selectedCollectionTargetId = null;
+  state.selectedCollectionTarget = null;
+  state.collectionDiff = null;
+  state.collectionScopeInvestigationId = scopeInvestigationId;
+  state.collectionScopeInvestigationTitle = scope?.title || null;
+  state.collectionScopeTargetIds = scopeInvestigationId ? new Set() : null;
+  const modalTitle = preferredTargetId && scope
+    ? `“${scope.title}”的固定网页来源`
+    : destination
+    ? `为“${destination.title}”添加固定网页`
+    : scope
+      ? `“${scope.title}”的固定网页来源`
+      : "固定网页来源监测";
+  $("#collection-modal-title").textContent = modalTitle;
+  $("#collection-modal-title").title = modalTitle;
   if (typeof modal.showModal === "function") modal.showModal();
   else modal.setAttribute("open", "");
-  await refreshCollectionData();
+  await refreshCollectionData(preferredTargetId);
 }
 
 function closeCollectionModal() {
@@ -4335,12 +5292,57 @@ function closeCollectionModal() {
   else modal.removeAttribute("open");
   if (state.collectionPollTimer) window.clearTimeout(state.collectionPollTimer);
   state.collectionPollTimer = null;
+  state.collectionRequestSerial += 1;
+  state.collectionDiffRequestSerial += 1;
+  state.collectionReviewSerial += 1;
+  state.collectionRefreshSerial += 1;
+  state.collectionSubmitSerial += 1;
+  state.collectionBusy = false;
   state.pendingCollectionInvestigationId = null;
+  state.collectionScopeInvestigationId = null;
+  state.collectionScopeInvestigationTitle = null;
+  state.collectionScopeTargetIds = null;
+  state.selectedCollectionTargetId = null;
+  state.selectedCollectionTarget = null;
+  state.collectionDiff = null;
+  $("#collection-modal-title").textContent = "固定网页来源监测";
+  $("#collection-modal-title").removeAttribute("title");
+  const button = $("#collection-add");
+  button.disabled = false;
+  button.textContent = "添加来源";
+}
+
+async function verifyCollectionActionScope(targetId, { intakeId = null } = {}) {
+  const scopeInvestigationId = state.collectionScopeInvestigationId;
+  if (!scopeInvestigationId) return { allowed: true, stale: false };
+  const detail = await api(API_ROUTES.investigation(scopeInvestigationId));
+  if (
+    scopeInvestigationId !== state.collectionScopeInvestigationId
+    || !$("#collection-modal").open
+  ) return { allowed: false, stale: true };
+  const linkedTargetIds = new Set((detail.collection_targets || []).map((target) => target.id));
+  const linkedIntakeIds = new Set((detail.intake_items || []).map((item) => item.id));
+  state.collectionScopeTargetIds = linkedTargetIds;
+  state.investigationDetails.set(scopeInvestigationId, detail);
+  renderCollectionSummary();
+  renderCollectionTargets();
+  const allowed = linkedTargetIds.has(targetId) && (!intakeId || linkedIntakeIds.has(intakeId));
+  if (!allowed) {
+    state.collectionRequestSerial += 1;
+    state.selectedCollectionTargetId = null;
+    state.selectedCollectionTarget = null;
+    state.collectionDiff = null;
+    renderCollectionTargets();
+    $("#collection-detail").innerHTML = `<div class="collection-empty"><strong>${intakeId ? "来源或材料已不在本专题" : "来源已不在本专题"}</strong><p>已停止本次操作；这里不会改为操作全局或其他专题来源。</p></div>`;
+    toast(intakeId ? "这份来源或材料已不属于当前专题，已停止打开审核。" : "这个来源已不属于当前专题，已停止操作。", "error", 7500);
+  }
+  return { allowed, stale: false };
 }
 
 async function submitCollectionTarget(event) {
   event.preventDefault();
   if (state.collectionBusy) return;
+  const requestSerial = ++state.collectionSubmitSerial;
   state.collectionBusy = true;
   const button = $("#collection-add");
   button.disabled = true;
@@ -4373,7 +5375,12 @@ async function submitCollectionTarget(event) {
         toast(`来源已保存，但专题关联失败：${associationError.message}`, "error", 7500);
       }
     }
-    state.pendingCollectionInvestigationId = null;
+    if (requestSerial !== state.collectionSubmitSerial || !$("#collection-modal").open) {
+      refreshData({ keepSelection: true, quiet: true }).catch(() => null);
+      refreshInvestigationDirectory().catch(() => null);
+      toast("固定来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
+      return;
+    }
     $("#collection-source-form").reset();
     $("#collection-run-immediately").checked = true;
     state.collectionBusy = false;
@@ -4381,16 +5388,26 @@ async function submitCollectionTarget(event) {
     try {
       await refreshData({ keepSelection: true, quiet: true });
       await refreshInvestigationDirectory();
+      if (requestSerial !== state.collectionSubmitSerial || !$("#collection-modal").open) {
+        toast("固定来源已保存；你已切换页面，所以没有改变当前视图。", "info", 7500);
+        return;
+      }
       if (destination && state.activeInvestigationId === destination.id) await loadInvestigationWorkspace(destination.id, { quiet: true });
     } catch (error) {
       toast(`来源已保存，但专题指标刷新失败：${error.message}`, "warning", 7000);
     }
   } catch (error) {
+    if (requestSerial !== state.collectionSubmitSerial) {
+      toast(`后台添加来源失败：${error.message || "未知错误"}`, "error", 7500);
+      return;
+    }
     toast(`添加来源失败：${error.message}`, "error", 7000);
   } finally {
-    state.collectionBusy = false;
-    button.disabled = false;
-    button.textContent = "添加来源";
+    if (requestSerial === state.collectionSubmitSerial) {
+      state.collectionBusy = false;
+      button.disabled = false;
+      button.textContent = "添加来源";
+    }
   }
 }
 
@@ -4398,15 +5415,42 @@ async function handleCollectionAction(action, node) {
   if (state.collectionBusy) return;
   if (action === "review") {
     const intakeId = node.dataset.intakeId;
+    const scopeInvestigationId = state.collectionScopeInvestigationId;
+    const targetId = state.selectedCollectionTargetId;
+    const requestSerial = ++state.collectionReviewSerial;
+    if (scopeInvestigationId) {
+      state.collectionBusy = true;
+      try {
+        const verification = await verifyCollectionActionScope(targetId, { intakeId });
+        if (
+          requestSerial !== state.collectionReviewSerial
+          || !$("#collection-modal").open
+          || targetId !== state.selectedCollectionTargetId
+          || scopeInvestigationId !== state.collectionScopeInvestigationId
+        ) return;
+        if (!verification.allowed || verification.stale) return;
+      } catch (error) {
+        if (requestSerial === state.collectionReviewSerial) {
+          toast(`无法确认专题范围：${error.message || "专题可能已不存在"}`, "error", 7500);
+        }
+        return;
+      } finally {
+        if (requestSerial === state.collectionReviewSerial) state.collectionBusy = false;
+      }
+    }
+    if (requestSerial !== state.collectionReviewSerial || !$("#collection-modal").open) return;
     closeCollectionModal();
-    await openIntakeModal(intakeId);
+    await openIntakeModal(intakeId, false, scopeInvestigationId);
     return;
   }
   if (action === "diff") {
     const targetId = state.selectedCollectionTargetId;
     const runId = node.dataset.runId;
     const requestSerial = ++state.collectionDiffRequestSerial;
+    state.collectionBusy = true;
     try {
+      const verification = await verifyCollectionActionScope(targetId);
+      if (verification.stale || !verification.allowed || requestSerial !== state.collectionDiffRequestSerial) return;
       const diff = await api(`/pldr-api/v1/collection/runs/${encodeURIComponent(runId)}/diff`);
       if (
         requestSerial !== state.collectionDiffRequestSerial
@@ -4419,6 +5463,11 @@ async function handleCollectionAction(action, node) {
       if (diffRoot) diffRoot.innerHTML = renderCollectionDiff(state.collectionDiff);
     } catch (error) {
       toast(`版本对比失败：${error.message}`, "error", 7000);
+    } finally {
+      if (requestSerial === state.collectionDiffRequestSerial) {
+        state.collectionBusy = false;
+        scheduleCollectionPoll();
+      }
     }
     return;
   }
@@ -4432,6 +5481,8 @@ async function handleCollectionAction(action, node) {
     state.collectionBusy = true;
     node.disabled = true;
     try {
+      const verification = await verifyCollectionActionScope(targetId);
+      if (verification.stale || !verification.allowed) return;
       const page = await api(`/pldr-api/v1/collection/targets/${encodeURIComponent(targetId)}/${key}?offset=${currentItems.length}&limit=100`);
       if (targetId !== state.selectedCollectionTargetId) return;
       if (Number(page.count) !== knownTotal) {
@@ -4446,6 +5497,7 @@ async function handleCollectionAction(action, node) {
       toast(`加载历史失败：${error.message}`, "error", 7000);
     } finally {
       state.collectionBusy = false;
+      if (node.isConnected) node.disabled = false;
       scheduleCollectionPoll();
     }
     return;
@@ -4457,7 +5509,11 @@ async function handleCollectionAction(action, node) {
   state.collectionBusy = true;
   node.disabled = true;
   let actionSucceeded = false;
+  let actionAttempted = false;
   try {
+    const verification = await verifyCollectionActionScope(targetId);
+    if (verification.stale || !verification.allowed) return;
+    actionAttempted = true;
     const result = await api(path, { method: "POST" });
     actionSucceeded = true;
     const run = result.run || result;
@@ -4472,9 +5528,10 @@ async function handleCollectionAction(action, node) {
     toast(`来源操作失败：${error.message}`, "error", 7000);
   } finally {
     state.collectionBusy = false;
-    await refreshCollectionData(targetId);
+    if (node.isConnected) node.disabled = false;
+    if (actionAttempted) await refreshCollectionData(targetId);
     try {
-      await refreshData({ keepSelection: true, quiet: true });
+      if (actionAttempted) await refreshData({ keepSelection: true, quiet: true });
     } catch (error) {
       if (actionSucceeded) {
         toast(`来源操作已完成，但专题指标刷新失败：${error.message}`, "warning", 7000);
@@ -4517,7 +5574,7 @@ async function refreshData({
       api("/pldr-api/v1/overview"),
       api("/pldr-api/v1/sources/health"),
       api("/pldr-api/v1/config").catch(() => null),
-      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false`).catch(() => ({ items: [] })),
+      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false&visibility=active`).catch(() => ({ items: [] })),
       api("/pldr-api/v1/collection/summary").catch(() => null),
     ]);
     state.overview = overview;
@@ -4527,7 +5584,7 @@ async function refreshData({
     state.collectionSummary = collectionSummary;
     renderSearchProvider();
     state.globalIntakeItems = intakeList.items || [];
-    if (!state.intakeScopeInvestigationId) {
+    if (!state.intakeScopeInvestigationId && state.intakeVisibility === "active") {
       state.intakeItems = [...state.globalIntakeItems];
       if (!state.selectedIntakeId) {
         state.selectedIntakeId = state.intakeItems.find((item) => item.status === "candidate_ready")?.id || null;
@@ -4539,26 +5596,31 @@ async function refreshData({
     renderSources();
     applyFilters();
 
+    const selectableEvents = state.filteredEvents;
     const preferredSelection = preferredEventId
-      && state.events.some((event) => event.id === preferredEventId)
+      && selectableEvents.some((event) => event.id === preferredEventId)
       ? preferredEventId
       : null;
-    const target = previousSelection && state.events.some((event) => event.id === previousSelection)
+    const target = previousSelection && selectableEvents.some((event) => event.id === previousSelection)
       ? previousSelection
-      : preferredSelection || state.events[0]?.id;
+      : preferredSelection || selectableEvents[0]?.id;
     const shouldSyncUrl = syncSelectionUrl
       ?? new URL(window.location.href).searchParams.has("event");
     if (target) await selectEvent(target, { open: false, syncUrl: shouldSyncUrl });
     else {
+      state.selectedEventRequestSerial += 1;
       state.selectedId = null;
       state.selectedEvent = null;
+      state.selectedEventError = null;
+      $("#btn-report").disabled = true;
       renderAssessment();
       renderGaps();
+      if ($("#event-drawer")?.classList.contains("open")) renderDrawer();
     }
 
     $("#system-state-text").textContent = config?.model_configured
       ? "证据链已连接 · 模型已配置"
-      : "证据链已连接 · 确定性降级";
+      : "证据链已连接 · 基础草稿模式";
     if (state.investigations.length) {
       renderInvestigationHome();
       if (activeInvestigation()) renderInvestigationPage();
@@ -4576,6 +5638,10 @@ async function refreshData({
 function bindEvents() {
   $("#btn-workbench-home").addEventListener("click", () => showInvestigationHome());
   $("#btn-classic-workspace").addEventListener("click", () => showClassicWorkspace());
+  $("#event-overview-return").addEventListener("click", () => {
+    const investigationId = state.eventOverviewScopeInvestigationId;
+    if (investigationId) openInvestigation(investigationId, "outcomes", { section: "events" });
+  });
   $("#btn-create-investigation").addEventListener("click", openInvestigationCreateModal);
   $("#btn-home-search").addEventListener("click", () => openExternalSearchModal());
   $("#btn-home-import").addEventListener("click", () => openImportModal());
@@ -4597,14 +5663,33 @@ function bindEvents() {
   $("#language-filter").addEventListener("change", applyFilters);
   $("#contested-filter").addEventListener("change", applyFilters);
   $("#btn-refresh").addEventListener("click", async () => {
+    const scopedInvestigationId = state.eventOverviewScopeInvestigationId;
     await refreshData();
     await refreshInvestigationDirectory();
-    if (activeInvestigation()) await loadInvestigationWorkspace(state.activeInvestigationId, { quiet: true });
+    if (scopedInvestigationId && state.eventOverviewScopeInvestigationId === scopedInvestigationId) {
+      const scopedInvestigation = eventOverviewInvestigation();
+      if (scopedInvestigation) {
+        try {
+          await ensureEventOverviewScopeLoaded(scopedInvestigation, { force: true });
+          if (state.eventOverviewScopeInvestigationId !== scopedInvestigationId) return;
+          renderTopic();
+          renderSources();
+          applyFilters();
+          await reconcileEventOverviewSelection();
+          renderGaps();
+          renderMetrics();
+        } catch (error) {
+          toast(`本专题事件范围刷新失败：${error.message || "未知错误"}`, "error", 7000);
+        }
+      }
+    } else if (activeInvestigation()) {
+      await loadInvestigationWorkspace(state.activeInvestigationId, { quiet: true });
+    }
   });
   $("#btn-report").addEventListener("click", () => generateReport());
   $("#btn-collection").addEventListener("click", () => {
     state.pendingCollectionInvestigationId = null;
-    openCollectionModal();
+    openCollectionModal(null, null);
   });
   $("#btn-search").addEventListener("click", openExternalSearchModal);
   $("#btn-import").addEventListener("click", openImportModal);
@@ -4643,7 +5728,7 @@ function bindEvents() {
   $("#collection-source-form").addEventListener("submit", submitCollectionTarget);
   $("#intake-close").addEventListener("click", closeIntakeModal);
   const invalidateReviewForm = (event) => {
-    if (event.target.closest(".review-form")) {
+    if (event.target.closest(".review-form") && !event.target.closest("#intake-reject-panel")) {
       invalidateIntakePreview("字段已变化；请重新预览正式区变化后再确认。");
     }
   };
@@ -4651,6 +5736,15 @@ function bindEvents() {
   $("#intake-modal").addEventListener("change", invalidateReviewForm);
 
   document.addEventListener("click", async (event) => {
+    const errorExpander = event.target.closest("[data-expand-error]");
+    if (errorExpander) {
+      const details = errorExpander.closest(".operational-error")?.querySelector("details");
+      if (details) {
+        details.open = true;
+        details.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+      return;
+    }
     if (event.target.closest("[data-retry-selected-event]")) {
       await selectEvent(state.selectedId, { open: true, tab: state.drawerTab, syncUrl: false });
       return;
@@ -4661,6 +5755,16 @@ function bindEvents() {
         () => toast("诊断编号已复制。", "success", 2600),
         () => toast("浏览器未授予剪贴板权限。", "error", 4200),
       );
+      return;
+    }
+    const searchVisibility = event.target.closest("[data-search-history-visibility]");
+    if (searchVisibility) {
+      await setSearchHistoryVisibility(searchVisibility.dataset.searchHistoryVisibility);
+      return;
+    }
+    const searchRunAction = event.target.closest("[data-search-run-action]");
+    if (searchRunAction) {
+      await updateSearchRunVisibility(searchRunAction.dataset.searchRunId, searchRunAction.dataset.searchRunAction);
       return;
     }
     const historyRun = event.target.closest("[data-search-history-run]");
@@ -4680,6 +5784,12 @@ function bindEvents() {
     const investigationTab = event.target.closest("[data-investigation-tab]");
     if (investigationTab) {
       setInvestigationTab(investigationTab.dataset.investigationTab);
+      $("#investigation-more-menu")?.removeAttribute("open");
+      return;
+    }
+    const investigationSection = event.target.closest("[data-investigation-section]");
+    if (investigationSection) {
+      setInvestigationSection(investigationSection.dataset.investigationSection);
       return;
     }
     const investigationAction = event.target.closest("[data-investigation-action]");
@@ -4689,7 +5799,7 @@ function bindEvents() {
     }
     const investigationEvent = event.target.closest("[data-investigation-event]");
     if (investigationEvent) {
-      selectEvent(investigationEvent.dataset.investigationEvent, { open: true, syncUrl: false });
+      await openInvestigationEvent(investigationEvent.dataset.investigationEvent, state.activeInvestigationId);
       return;
     }
     const assignment = event.target.closest("[data-investigation-assignment]");
@@ -4701,7 +5811,7 @@ function bindEvents() {
     }
     const investigationCard = event.target.closest("[data-investigation-id]");
     if (investigationCard && investigationCard.classList.contains("investigation-card")) {
-      openInvestigation(investigationCard.dataset.investigationId, "today");
+      openInvestigation(investigationCard.dataset.investigationId, "overview");
       return;
     }
     const collectionTarget = event.target.closest("[data-collection-target]");
@@ -4721,6 +5831,11 @@ function bindEvents() {
     }
     if (event.target.closest("[data-search-retry-query]")) {
       retryCurrentSearchQuery();
+      return;
+    }
+    const intakeVisibility = event.target.closest("[data-intake-visibility]");
+    if (intakeVisibility) {
+      await setIntakeVisibility(intakeVisibility.dataset.intakeVisibility);
       return;
     }
     const intakeNode = event.target.closest("[data-intake-id]");
@@ -4793,12 +5908,22 @@ function bindEvents() {
     }
   });
 
-  window.addEventListener("popstate", () => {
+  window.addEventListener("popstate", async () => {
+    const routeHref = window.location.href;
     const params = new URLSearchParams(window.location.search);
     const investigationId = params.get("investigation");
-    const tab = params.get("tab") || "today";
-    if (params.get("view") === "classic" || params.get("event")) showClassicWorkspace({ syncUrl: false });
-    else if (investigationId) openInvestigation(investigationId, tab, { syncUrl: false });
+    const tab = params.get("tab") || "overview";
+    const view = params.get("view");
+    const requestedEvent = params.get("event");
+    if (["classic", "events"].includes(view) || (!investigationId && (requestedEvent || params.get("event_scope")))) {
+      const applied = await showClassicWorkspace({ syncUrl: false, scopeInvestigationId: params.get("event_scope") });
+      if (!applied || window.location.href !== routeHref) return;
+      if (requestedEvent && eventOverviewEvents().some((event) => event.id === requestedEvent)) {
+        await selectEvent(requestedEvent, { open: true, syncUrl: false });
+      } else if ($("#event-drawer")?.classList.contains("open")) {
+        closeDrawer();
+      }
+    } else if (investigationId) openInvestigation(investigationId, tab, { syncUrl: false, section: params.get("section") });
     else showInvestigationHome({ syncUrl: false });
   });
 }
@@ -4807,6 +5932,7 @@ async function init() {
   bindEvents();
   try {
     const routeParams = new URLSearchParams(window.location.search);
+    const initialRouteHref = window.location.href;
     const requestedEvent = routeParams.get("event");
     await refreshData({
       keepSelection: false,
@@ -4815,18 +5941,23 @@ async function init() {
       syncSelectionUrl: false,
     });
     await refreshInvestigationDirectory();
-    if (requestedEvent && state.selectedId === requestedEvent) {
-      showClassicWorkspace({ syncUrl: false });
-      openDrawer();
-    } else if (requestedEvent) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("event");
-      history.replaceState(null, "", url);
-      showInvestigationHome({ syncUrl: false });
-    } else if (routeParams.get("view") === "classic") {
-      showClassicWorkspace({ syncUrl: false });
-    } else if (routeParams.get("investigation")) {
-      await openInvestigation(routeParams.get("investigation"), routeParams.get("tab") || "today", { syncUrl: false });
+    if (window.location.href !== initialRouteHref) return;
+    const requestedInvestigation = routeParams.get("investigation");
+    const eventOverviewRoute = ["classic", "events"].includes(routeParams.get("view"))
+      || Boolean(!requestedInvestigation && (requestedEvent || routeParams.get("event_scope")));
+    if (eventOverviewRoute) {
+      const applied = await showClassicWorkspace({ syncUrl: false, scopeInvestigationId: routeParams.get("event_scope") });
+      if (!applied || window.location.href !== initialRouteHref) return;
+      if (requestedEvent && eventOverviewEvents().some((event) => event.id === requestedEvent)) {
+        await selectEvent(requestedEvent, { open: true, syncUrl: false });
+      } else if (requestedEvent) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("event");
+        history.replaceState(null, "", url);
+        if ($("#event-drawer")?.classList.contains("open")) closeDrawer();
+      }
+    } else if (requestedInvestigation) {
+      await openInvestigation(requestedInvestigation, routeParams.get("tab") || "overview", { syncUrl: false, section: routeParams.get("section") });
     } else {
       showInvestigationHome({ syncUrl: false });
     }

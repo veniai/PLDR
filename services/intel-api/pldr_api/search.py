@@ -16,9 +16,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from .errors import ArchivedIntakeError, IntakeMutationConflictError
 from .extraction import canonicalize_url, extract_page, normalize_text
 from .importers import fetch_public_text
-from .intake import generate_candidates, iso, submit_web_intake
+from .intake import (
+    generate_candidates,
+    iso,
+    lock_intake_for_mutation,
+    submit_web_intake,
+)
 from .models import (
     IntakeItem,
     Investigation,
@@ -690,11 +696,99 @@ def serialize_query_run(
         "latency_ms": run.latency_ms,
         "created_at": iso(run.created_at),
         "updated_at": iso(run.updated_at),
+        "archived": run.archived_at is not None,
+        "archived_at": iso(run.archived_at),
+        "archived_by": run.archived_by,
+        "archive_reason": run.archive_reason,
+        "allowed_actions": ["restore"] if run.archived_at is not None else ["archive"],
         "provider": provider_metadata(run.provider),
         "results": serialized_results,
         "items": serialized_results,
     }
     return payload
+
+
+def _record_query_archive_action(
+    session: Session,
+    run: SearchQueryRun,
+    *,
+    action: str,
+    analyst: str,
+    reason: str,
+) -> None:
+    from .investigations import record_action
+
+    investigation_ids = list(
+        session.scalars(
+            select(InvestigationLink.investigation_id).where(
+                InvestigationLink.object_type == "search_query",
+                InvestigationLink.object_id == run.id,
+            )
+        )
+    )
+    for investigation_id in investigation_ids:
+        record_action(
+            session,
+            investigation_id,
+            action,
+            actor=analyst,
+            object_type="search_query",
+            object_id=run.id,
+            detail={"reason": reason, "status": run.status},
+        )
+
+
+def archive_query_run(
+    session: Session,
+    run: SearchQueryRun,
+    *,
+    analyst: str,
+    reason: str,
+) -> tuple[SearchQueryRun, bool]:
+    """Hide a query from history without touching its result or intake graph."""
+    if run.archived_at is not None:
+        return run, False
+    now = datetime.now(timezone.utc)
+    run.archived_at = now
+    run.archived_by = analyst
+    run.archive_reason = reason
+    run.updated_at = now
+    _record_query_archive_action(
+        session,
+        run,
+        action="search.query_archived",
+        analyst=analyst,
+        reason=reason,
+    )
+    session.commit()
+    session.refresh(run)
+    return run, True
+
+
+def restore_query_run(
+    session: Session,
+    run: SearchQueryRun,
+    *,
+    analyst: str,
+    reason: str,
+) -> tuple[SearchQueryRun, bool]:
+    if run.archived_at is None:
+        return run, False
+    now = datetime.now(timezone.utc)
+    run.archived_at = None
+    run.archived_by = None
+    run.archive_reason = None
+    run.updated_at = now
+    _record_query_archive_action(
+        session,
+        run,
+        action="search.query_restored",
+        analyst=analyst,
+        reason=reason,
+    )
+    session.commit()
+    session.refresh(run)
+    return run, True
 
 
 def _run_investigation(
@@ -789,6 +883,7 @@ def list_query_runs(
     *,
     investigation_id: str,
     limit: int,
+    visibility: str = "active",
 ) -> dict[str, Any]:
     association = (
         InvestigationLink.object_type == "search_query",
@@ -799,13 +894,24 @@ def list_query_runs(
         .join(InvestigationLink, InvestigationLink.object_id == SearchQueryRun.id)
         .where(*association)
     )
+    if visibility == "active":
+        base = base.where(SearchQueryRun.archived_at.is_(None))
+    elif visibility == "archived":
+        base = base.where(SearchQueryRun.archived_at.is_not(None))
+    elif visibility != "all":
+        raise ValueError("visibility must be active, archived, or all")
+    count_query = (
+        select(func.count())
+        .select_from(SearchQueryRun)
+        .join(InvestigationLink, InvestigationLink.object_id == SearchQueryRun.id)
+        .where(*association)
+    )
+    if visibility == "active":
+        count_query = count_query.where(SearchQueryRun.archived_at.is_(None))
+    elif visibility == "archived":
+        count_query = count_query.where(SearchQueryRun.archived_at.is_not(None))
     total = int(
-        session.scalar(
-            select(func.count())
-            .select_from(SearchQueryRun)
-            .join(InvestigationLink, InvestigationLink.object_id == SearchQueryRun.id)
-            .where(*association)
-        )
+        session.scalar(count_query)
         or 0
     )
     runs = list(
@@ -817,6 +923,7 @@ def list_query_runs(
     summaries = [serialize_query_run(run, []) for run in runs]
     return {
         "investigation_id": investigation_id,
+        "visibility": visibility,
         "count": total,
         "returned_count": len(summaries),
         "runs": summaries,
@@ -1170,6 +1277,21 @@ def _attach_trace(
     review["external_search"] = latest
     review["external_search_history"] = history
     item.review = review
+    item.updated_at = datetime.now(timezone.utc)
+
+
+def _retry_intake_baseline(item: IntakeItem) -> tuple[str, str | None]:
+    return item.status, iso(item.updated_at)
+
+
+def _require_retry_intake_baseline(
+    item: IntakeItem,
+    baseline: tuple[str, str | None],
+    *,
+    action: str,
+) -> None:
+    if _retry_intake_baseline(item) != baseline:
+        raise IntakeMutationConflictError(action)
 
 
 def _existing_intake_for_result(session: Session, result: SearchResult) -> IntakeItem | None:
@@ -1241,11 +1363,33 @@ def _record_selection_event(
 async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> IntakeItem:
     item = selection.intake_item
     result = selection.result
-    selection.attempt_count += 1
-    selection.last_attempt_at = datetime.now(timezone.utc)
-    selection.outcome = "retry"
+    if item.archived_at is not None:
+        raise ArchivedIntakeError("retrying this search result")
+    item_id = item.id
+    selection_id = selection.id
+    result_id = result.id
     if item.status == "generation_failed":
         item = await generate_candidates(session, item)
+        generated_baseline = _retry_intake_baseline(item)
+        session.rollback()
+        item = lock_intake_for_mutation(
+            session, item_id, action="recording this search retry"
+        )
+        try:
+            _require_retry_intake_baseline(
+                item,
+                generated_baseline,
+                action="recording this search retry",
+            )
+        except IntakeMutationConflictError:
+            session.rollback()
+            raise
+        selection = session.get(SearchSelection, selection_id)
+        result = session.get(SearchResult, result_id)
+        assert selection is not None and result is not None
+        selection.attempt_count += 1
+        selection.last_attempt_at = datetime.now(timezone.utc)
+        selection.outcome = "retry"
         selection.status = item.status
         selection.last_error = item.candidate_error
         event = _record_selection_event(
@@ -1258,6 +1402,19 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         session.commit()
         return item
     if item.status != "failed":
+        # No await is needed in this branch, but the item was loaded in a read
+        # transaction that may now be stale. Restart and fence before adding a
+        # retry event/trace to its review graph.
+        session.rollback()
+        item = lock_intake_for_mutation(
+            session, item_id, action="recording this search retry"
+        )
+        selection = session.get(SearchSelection, selection_id)
+        result = session.get(SearchResult, result_id)
+        assert selection is not None and result is not None
+        selection.attempt_count += 1
+        selection.last_attempt_at = datetime.now(timezone.utc)
+        selection.outcome = "retry"
         selection.status = item.status
         event = _record_selection_event(session, selection, result, outcome="retry_not_needed")
         _attach_trace(item, selection, result, event)
@@ -1265,12 +1422,28 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         return item
 
     fetched_at = datetime.now(timezone.utc)
+    fetch_baseline = _retry_intake_baseline(item)
     try:
         resolved_url, html = await fetch_public_text(result.original_url)
         resolved_url = canonicalize_url(resolved_url)
         page = extract_page(html)
         if len(page.body) < 40:
             raise ValueError("Fetched page body is too short")
+        session.rollback()
+        item = lock_intake_for_mutation(
+            session, item_id, action="retrying this search result"
+        )
+        _require_retry_intake_baseline(
+            item,
+            fetch_baseline,
+            action="applying this search retry fetch",
+        )
+        selection = session.get(SearchSelection, selection_id)
+        result = session.get(SearchResult, result_id)
+        assert selection is not None and result is not None
+        selection.attempt_count += 1
+        selection.last_attempt_at = datetime.now(timezone.utc)
+        selection.outcome = "retry"
         item.status = "parsed"
         item.error = None
         item.canonical_url = resolved_url
@@ -1281,11 +1454,25 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item.extracted_hash = hashlib.sha256(page.body.encode("utf-8")).hexdigest()
         item.candidate_error = None
         item.candidate_relations = []
+        item.updated_at = datetime.now(timezone.utc)
         review = dict(item.review or {})
         review["material"] = {"resolved_url": resolved_url, "fetched_at": iso(fetched_at)}
         item.review = review
         session.commit()
         item = await generate_candidates(session, item)
+        generated_baseline = _retry_intake_baseline(item)
+        session.rollback()
+        item = lock_intake_for_mutation(
+            session, item_id, action="recording this search retry"
+        )
+        _require_retry_intake_baseline(
+            item,
+            generated_baseline,
+            action="recording this search retry",
+        )
+        selection = session.get(SearchSelection, selection_id)
+        result = session.get(SearchResult, result_id)
+        assert selection is not None and result is not None
         selection.status = item.status
         selection.last_error = item.candidate_error
         event = _record_selection_event(
@@ -1297,20 +1484,41 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         _attach_trace(item, selection, result, event)
         session.commit()
         return item
+    except (ArchivedIntakeError, IntakeMutationConflictError):
+        session.rollback()
+        raise
     except Exception as exc:
         session.rollback()
-        item = session.get(IntakeItem, item.id)
-        selection = session.get(SearchSelection, selection.id)
-        assert item is not None and selection is not None
+        item = lock_intake_for_mutation(
+            session, item_id, action="recording this search retry failure"
+        )
+        try:
+            _require_retry_intake_baseline(
+                item,
+                fetch_baseline,
+                action="recording this search retry failure",
+            )
+        except IntakeMutationConflictError:
+            session.rollback()
+            raise
+        selection = session.get(SearchSelection, selection_id)
+        result = session.get(SearchResult, result_id)
+        assert selection is not None and result is not None
         selection.attempt_count += 1
         selection.last_attempt_at = datetime.now(timezone.utc)
         selection.outcome = "retry"
         item.status = "failed"
         item.error = str(exc)
+        item.updated_at = datetime.now(timezone.utc)
         selection.status = "failed"
         selection.last_error = str(exc)
-        result = session.get(SearchResult, result.id)
-        assert result is not None
+        from .investigations import sync_linked_review_tasks_for_intake
+
+        sync_linked_review_tasks_for_intake(
+            session,
+            item,
+            actor="system:search-retry",
+        )
         event = _record_selection_event(session, selection, result, outcome="retry_failed")
         _attach_trace(item, selection, result, event)
         session.commit()
@@ -1362,16 +1570,30 @@ async def select_search_results(
             )
         )
         if existing is not None:
+            if existing.intake_item.archived_at is not None:
+                raise ArchivedIntakeError("selecting this search result")
             outcome = "already_added"
             if retry and existing.intake_item.status in {"failed", "generation_failed"}:
                 existing.result = result
                 await _retry_failed_fetch(session, existing)
                 outcome = "retried"
             else:
+                existing_id = existing.id
+                intake_item_id = existing.intake_item_id
+                result_id = result.id
+                session.rollback()
+                locked_item = lock_intake_for_mutation(
+                    session,
+                    intake_item_id,
+                    action="recording this search selection",
+                )
+                existing = session.get(SearchSelection, existing_id)
+                result = session.get(SearchResult, result_id)
+                assert existing is not None and result is not None
                 existing.outcome = "already_added"
                 existing.result = result
                 event = _record_selection_event(session, existing, result, outcome=outcome)
-                _attach_trace(existing.intake_item, existing, result, event)
+                _attach_trace(locked_item, existing, result, event)
                 session.commit()
             responses.append(
                 {
@@ -1395,6 +1617,18 @@ async def select_search_results(
 
         existing_item = _existing_intake_for_result(session, result)
         if existing_item is not None:
+            if existing_item.archived_at is not None:
+                raise ArchivedIntakeError("selecting this search result")
+            existing_item_id = existing_item.id
+            result_id = result.id
+            session.rollback()
+            existing_item = lock_intake_for_mutation(
+                session,
+                existing_item_id,
+                action="selecting this search result",
+            )
+            result = session.get(SearchResult, result_id)
+            assert result is not None
             selection = _new_selection(
                 session, result, existing_item, outcome="linked_existing_intake", attempt_count=0
             )
@@ -1412,6 +1646,11 @@ async def select_search_results(
                 None,
                 result.query_run.language,
                 input_type="search",
+            )
+            item = lock_intake_for_mutation(
+                session,
+                item.id,
+                action="recording this search selection",
             )
             selection = _new_selection(session, result, item, outcome="added", attempt_count=1)
             event = _record_selection_event(session, selection, result, outcome="added")
@@ -1462,6 +1701,8 @@ async def retry_search_result(session: Session, result_id: str) -> dict[str, Any
     if selection is None:
         request = ExternalSearchSelectionRequest(result_ids=[result.id])
         return await select_search_results(session, request)
+    if selection.intake_item.archived_at is not None:
+        raise ArchivedIntakeError("retrying this search result")
     selection.result = result
     item = await _retry_failed_fetch(session, selection)
     return {

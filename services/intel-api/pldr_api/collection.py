@@ -23,7 +23,7 @@ from .importers import (
     UnsupportedContentTypeError,
     fetch_public_text_response,
 )
-from .intake import generate_candidates, submit_web_intake
+from .intake import generate_candidates, lock_intake_for_mutation, submit_web_intake
 from .models import CollectionRun, CollectionTarget, IntakeItem
 from .security import UnsafeUrlError
 
@@ -555,7 +555,6 @@ def _recoverable_intake(
 async def execute_claimed_run(run_id: str) -> CollectionRun:
     """Fetch one claimed target and atomically finish its durable run record."""
     started_clock = time.monotonic()
-    created_item_id: str | None = None
     with SessionLocal() as session:
         run = session.get(CollectionRun, run_id)
         if run is None:
@@ -675,12 +674,8 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                         target.language,
                         input_type="collection",
                     )
-                    created_item_id = item.id
                     if item.status == "failed":
                         error = item.error or "Collection intake creation failed"
-                        session.delete(item)
-                        session.commit()
-                        created_item_id = None
                         raise ValueError(error)
                 trace = {
                     "target_id": target.id,
@@ -699,6 +694,14 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                     "raw_hash": raw_hash,
                     "body_hash": body_hash,
                 }
+                # submit/generate commit independently. Reacquire the Intake
+                # fence before attaching collection provenance so a concurrent
+                # archive cannot be followed by a hidden review mutation.
+                item = lock_intake_for_mutation(
+                    session,
+                    item.id,
+                    action="recording its collection provenance",
+                )
                 existing_review = item.review or {}
                 item.review = {
                     **existing_review,
@@ -708,6 +711,7 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                     },
                     "collection": trace,
                 }
+                item.updated_at = utcnow()
                 session.add(item)
                 session.commit()
                 run = session.get(CollectionRun, run_id)
@@ -772,15 +776,11 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
             target = session.get(CollectionTarget, run.target_id) if run else None
             if run is None or target is None:
                 raise
-            if created_item_id:
-                orphan = session.get(IntakeItem, created_item_id)
-                if orphan is not None:
-                    session.delete(orphan)
-                    session.commit()
-                    run = session.get(CollectionRun, run_id)
-                    target = session.get(CollectionTarget, run.target_id) if run else None
-                    if run is None or target is None:
-                        raise
+            # submit_web_intake commits a user-visible material record before
+            # this worker continues with provenance/linking. From that boundary
+            # onward the Intake may already carry analyst decisions or formal
+            # references, so a later Collection tail failure must never treat it
+            # as a disposable orphan. Preserve it and fail only this run.
             finished = utcnow()
             run.status = "failed"
             run.active_key = None
