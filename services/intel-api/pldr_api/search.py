@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,23 +12,162 @@ from urllib.parse import urlparse, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .extraction import canonicalize_url, extract_page, normalize_text
 from .importers import fetch_public_text
 from .intake import generate_candidates, iso, submit_web_intake
-from .models import IntakeItem, SearchQueryRun, SearchResult, SearchSelection, SearchSelectionEvent
+from .models import (
+    IntakeItem,
+    Investigation,
+    InvestigationLink,
+    SearchQueryRun,
+    SearchResult,
+    SearchSelection,
+    SearchSelectionEvent,
+)
 from .schemas import ExternalSearchRequest, ExternalSearchSelectionRequest
+
+
+MAX_LOADED_RESULTS = 100
+
+
+ERROR_PRESENTATION: dict[str, dict[str, Any]] = {
+    "not_configured": {
+        "code": "search.not_configured",
+        "summary": "搜索服务尚未配置",
+        "why": "当前运行环境没有可用的搜索服务配置。",
+        "impact": "本次查询没有产生新资料，已有查询和档案不受影响。",
+        "retryable": False,
+        "recommended_action": "请管理员检查搜索服务地址和凭据后再试。",
+    },
+    "authentication_failed": {
+        "code": "search.authentication_failed",
+        "summary": "搜索服务拒绝了访问凭据",
+        "why": "搜索服务认为当前凭据无效或无权调用该接口。",
+        "impact": "本次查询没有产生新资料，已有查询和档案不受影响。",
+        "retryable": False,
+        "recommended_action": "请管理员更新搜索服务凭据。",
+    },
+    "rate_limited": {
+        "code": "search.rate_limited",
+        "summary": "搜索服务暂时限流",
+        "why": "短时间查询次数超过了上游服务当前允许的额度。",
+        "impact": "本次查询没有新增结果，已加载结果仍然保留。",
+        "retryable": True,
+        "recommended_action": "请稍后重试当前页，不需要重新建立专题。",
+    },
+    "timeout": {
+        "code": "search.timeout",
+        "summary": "搜索服务响应超时",
+        "why": "上游搜索服务没有在限定时间内返回结果。",
+        "impact": "本次查询没有新增结果，已加载结果仍然保留。",
+        "retryable": True,
+        "recommended_action": "请稍后重试当前页；连续失败时检查搜索服务健康状态。",
+    },
+    "network_error": {
+        "code": "search.unreachable",
+        "summary": "暂时无法连接搜索服务",
+        "why": "PLDR 与上游搜索服务之间的网络连接失败。",
+        "impact": "本次查询没有新增结果，已加载结果仍然保留。",
+        "retryable": True,
+        "recommended_action": "请重试；连续失败时检查网络或搜索服务状态。",
+    },
+    "format_disabled": {
+        "code": "search.format_disabled",
+        "summary": "搜索服务没有开放 JSON 结果",
+        "why": "当前 SearXNG 实例未启用 PLDR 所需的 JSON 输出格式。",
+        "impact": "PLDR 无法读取本次搜索结果。",
+        "retryable": False,
+        "recommended_action": "请管理员在 SearXNG 中启用 JSON search format。",
+    },
+    "invalid_response": {
+        "code": "search.invalid_response",
+        "summary": "搜索服务返回了无法读取的数据",
+        "why": "上游响应不是 PLDR 支持的搜索结果格式。",
+        "impact": "本次查询没有新增结果，已加载结果仍然保留。",
+        "retryable": True,
+        "recommended_action": "请重试；连续失败时检查上游版本和适配器配置。",
+    },
+    "invalid_query": {
+        "code": "search.invalid_query",
+        "summary": "无法继续这次查询",
+        "why": "查询条件、页码或已保存的查询上下文不一致。",
+        "impact": "没有发起新的外部请求，已加载结果不受影响。",
+        "retryable": False,
+        "recommended_action": "请重新打开原查询并从建议的下一页继续。",
+    },
+    "backend_error": {
+        "code": "search.upstream_error",
+        "summary": "搜索服务暂时出错",
+        "why": "上游搜索服务返回了错误状态。",
+        "impact": "本次查询没有新增结果，已加载结果仍然保留。",
+        "retryable": True,
+        "recommended_action": "请稍后重试当前页。",
+    },
+    "concurrent_update": {
+        "code": "search.concurrent_update",
+        "summary": "同一页正在被另一请求更新",
+        "why": "另一个请求同时提交了这次查询的同一页。",
+        "impact": "没有覆盖已保存结果；另一请求可能已经完成该页。",
+        "retryable": True,
+        "recommended_action": "重新打开查询；若该页尚未出现，再重试一次。",
+    },
+}
 
 
 class ExternalSearchError(RuntimeError):
     query_run_id: str | None = None
+    attempted_page: int | None = None
 
-    def __init__(self, message: str, *, status_code: int = 502, reason: str = "backend_error"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 502,
+        reason: str = "backend_error",
+        upstream_status: int | None = None,
+        retry_after: str | None = None,
+        stage: str = "search",
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.reason = reason
+        self.upstream_status = upstream_status
+        self.retry_after = retry_after
+        self.stage = stage
+        self.trace_id = "search_" + uuid.uuid4().hex[:16]
+
+    def as_dict(self) -> dict[str, Any]:
+        presentation = ERROR_PRESENTATION.get(
+            self.reason, ERROR_PRESENTATION["backend_error"]
+        )
+        summary = str(presentation["summary"])
+        action = str(presentation["recommended_action"])
+        technical = str(self)
+        return {
+            "code": presentation["code"],
+            "stage": self.stage,
+            "summary": summary,
+            "title": summary,
+            "message": summary,
+            "why": presentation["why"],
+            "impact": presentation["impact"],
+            "retryable": bool(presentation["retryable"]),
+            "recommended_action": action,
+            "next_action": action,
+            "technical_message": technical,
+            "technical_detail": technical,
+            "trace_id": self.trace_id,
+            "upstream_status": self.upstream_status,
+            "retry_after": self.retry_after,
+            # Compatibility fields for pre-workspace clients.
+            "reason": self.reason,
+            "query_run_id": self.query_run_id,
+            "attempted_page": self.attempted_page,
+        }
 
 
 @dataclass(frozen=True)
@@ -89,6 +229,8 @@ class BackendSearchResponse:
     provider: str
     channel: str
     hits: list[SearchHit]
+    has_more: bool | None = None
+    total_estimate: int | None = None
 
 
 def _safe_text(value: Any, limit: int) -> str:
@@ -156,6 +298,42 @@ def _nested_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
+def effective_search_language(keyword: str, language: str, provider: str) -> str:
+    """Resolve the UI's ``auto`` language before making an upstream request.
+
+    This is intentionally small and deterministic. It prevents the former UI
+    default from labelling an obviously Chinese query as English while avoiding
+    an opaque language-detection dependency in the evidence path.
+    """
+    cleaned = language.strip() or "auto"
+    normalized = cleaned.lower().replace("_", "-")
+    if normalized == "auto":
+        normalized = (
+            "zh" if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", keyword) else "en"
+        )
+    simplified = {"zh", "zh-cn", "zh-sg", "zh-hans"}
+    traditional = {"zh-tw", "zh-hk", "zh-mo", "zh-hant"}
+    if provider == "brave":
+        if normalized in simplified:
+            return "zh-hans"
+        if normalized in traditional:
+            return "zh-hant"
+    elif provider == "searxng":
+        if normalized in simplified:
+            return "zh-CN"
+        if normalized in traditional:
+            return "zh-TW"
+    return cleaned if cleaned.lower() != "auto" else "en"
+
+
+def _response_retry_after(response: Any) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    return str(value)[:120] if value else None
+
+
 async def request_brave_search(
     config: SearchProviderConfig, request: ExternalSearchRequest
 ) -> BackendSearchResponse:
@@ -172,10 +350,16 @@ async def request_brave_search(
     base_url = config.base_url.rstrip("/")
     resource_root = base_url if base_url.endswith("/res") else f"{base_url}/res"
     endpoint = f"{resource_root}/v1/{request.scope}/search"
+    page_size = request.effective_page_size
+    effective_language = effective_search_language(
+        request.keyword, request.language, "brave"
+    )
     payload: dict[str, Any] = {
         "q": request.keyword,
-        "count": request.limit,
-        "search_lang": request.language,
+        "count": page_size,
+        # Brave's offset is a zero-based *page count*, not a row offset.
+        "offset": request.page - 1,
+        "search_lang": effective_language,
         "country": "ALL",
         "safesearch": "strict",
         "spellcheck": False,
@@ -204,14 +388,22 @@ async def request_brave_search(
             "Brave Search API rejected the configured credential",
             status_code=response.status_code,
             reason="authentication_failed",
+            upstream_status=response.status_code,
         )
     if response.status_code == 429:
-        raise ExternalSearchError("Brave Search API rate limit reached", status_code=429, reason="rate_limited")
+        raise ExternalSearchError(
+            "Brave Search API rate limit reached",
+            status_code=429,
+            reason="rate_limited",
+            upstream_status=429,
+            retry_after=_response_retry_after(response),
+        )
     if response.status_code >= 400:
         raise ExternalSearchError(
             f"Brave Search API returned HTTP {response.status_code}",
             status_code=502,
             reason="backend_error",
+            upstream_status=response.status_code,
         )
     try:
         payload = response.json()
@@ -219,9 +411,11 @@ async def request_brave_search(
         raise ExternalSearchError("Brave Search API returned invalid JSON", reason="invalid_response") from exc
     if not isinstance(payload, dict):
         raise ExternalSearchError("Brave Search API response must be a JSON object", reason="invalid_response")
-    return BackendSearchResponse("brave", channel, [
-        _normalize_hit(item, provider="brave") for item in _nested_results(payload)
-    ])
+    hits = [_normalize_hit(item, provider="brave") for item in _nested_results(payload)]
+    query_metadata = payload.get("query") if isinstance(payload.get("query"), dict) else {}
+    explicit_more = query_metadata.get("more_results_available")
+    has_more = explicit_more if isinstance(explicit_more, bool) else len(hits) >= page_size
+    return BackendSearchResponse("brave", channel, hits[:page_size], has_more=has_more)
 
 
 async def request_searxng_search(
@@ -234,11 +428,16 @@ async def request_searxng_search(
             reason="not_configured",
         )
     channel = f"searxng:{request.scope}"
+    page_size = request.effective_page_size
+    effective_language = effective_search_language(
+        request.keyword, request.language, "searxng"
+    )
     params = {
         "q": request.keyword,
         "format": "json",
         "categories": "news" if request.scope == "news" else "general",
-        "language": request.language,
+        "language": effective_language,
+        "pageno": request.page,
         "safesearch": 1,
     }
     try:
@@ -255,12 +454,22 @@ async def request_searxng_search(
             "SearXNG rejected the JSON format; enable json in its search.formats setting",
             status_code=502,
             reason="format_disabled",
+            upstream_status=403,
         )
     if response.status_code == 429:
-        raise ExternalSearchError("SearXNG rate limit reached", status_code=429, reason="rate_limited")
+        raise ExternalSearchError(
+            "SearXNG rate limit reached",
+            status_code=429,
+            reason="rate_limited",
+            upstream_status=429,
+            retry_after=_response_retry_after(response),
+        )
     if response.status_code >= 400:
         raise ExternalSearchError(
-            f"SearXNG returned HTTP {response.status_code}", status_code=502, reason="backend_error"
+            f"SearXNG returned HTTP {response.status_code}",
+            status_code=502,
+            reason="backend_error",
+            upstream_status=response.status_code,
         )
     try:
         payload = response.json()
@@ -270,9 +479,32 @@ async def request_searxng_search(
         raise ExternalSearchError("SearXNG response must be a JSON object", reason="invalid_response")
     raw_results = payload.get("results")
     raw_results = raw_results if isinstance(raw_results, list) else []
-    return BackendSearchResponse("searxng", channel, [
-        _normalize_hit(item, provider="searxng") for item in raw_results if isinstance(item, dict)
-    ])
+    hits = [
+        _normalize_hit(item, provider="searxng")
+        for item in raw_results
+        if isinstance(item, dict)
+    ]
+    estimate = payload.get("number_of_results")
+    total_estimate = (
+        estimate
+        if isinstance(estimate, int) and not isinstance(estimate, bool) and estimate >= 0
+        else None
+    )
+    # SearXNG controls its own results-per-page setting. PLDR sends the real
+    # ``pageno`` and applies its display cap locally; its reported total is only
+    # an estimate, never an assertion that PLDR loaded the entire result set.
+    # SearXNG owns the actual results-per-page setting. Many operator-managed
+    # instances return ten rows even when the PLDR workspace asks to display
+    # twenty, so a non-empty page must remain continuable. The executor below
+    # also stops when a later page adds no unique rows.
+    has_more = bool(hits)
+    return BackendSearchResponse(
+        "searxng",
+        channel,
+        hits,
+        has_more=has_more,
+        total_estimate=total_estimate,
+    )
 
 
 async def request_search(
@@ -283,19 +515,28 @@ async def request_search(
     return await request_searxng_search(config, request)
 
 
-def provider_metadata() -> dict[str, Any]:
+def provider_metadata(historical_provider: str | None = None) -> dict[str, Any]:
     try:
         config = SearchProviderConfig.from_env()
-        configured = bool(config.base_url) and (config.provider != "brave" or bool(config.api_key))
+        provider = historical_provider or config.provider
+        configured = (
+            provider == config.provider
+            and bool(config.base_url)
+            and (config.provider != "brave" or bool(config.api_key))
+        )
+        metadata = PROVIDER_METADATA.get(provider, {})
         return {
-            **PROVIDER_METADATA[config.provider],
-            "provider": config.provider,
+            **metadata,
+            "provider": provider,
             "configured": configured,
+            "current_provider": config.provider,
             "external_request": True,
         }
     except ExternalSearchError as exc:
+        provider = historical_provider or os.getenv("PLDR_SEARCH_PROVIDER", "brave")
         return {
-            "provider": os.getenv("PLDR_SEARCH_PROVIDER", "brave"),
+            **PROVIDER_METADATA.get(provider, {}),
+            "provider": provider,
             "configured": False,
             "error": str(exc),
             "external_request": True,
@@ -310,22 +551,72 @@ def _result_id(query_run_id: str, fingerprint: str, rank: int) -> str:
     return "srchr_" + hashlib.sha256(f"{query_run_id}:{fingerprint}:{rank}".encode()).hexdigest()[:24]
 
 
-def serialize_selection(selection: SearchSelection | None) -> dict[str, Any] | None:
+def _selection_error_detail(selection: SearchSelection) -> dict[str, Any] | None:
+    if not selection.last_error:
+        return None
+    message = selection.last_error
+    normalized = message.lower()
+    error_class = "intake_failed"
+    item = selection.intake_item
+    if item is not None and item.candidate_mode == "fallback-after-error":
+        error_class = "model_fallback"
+    elif "non-public address" in normalized or "private address" in normalized:
+        error_class = "unsafe_url"
+    elif "response too large" in normalized or "size limit" in normalized:
+        error_class = "response_too_large"
+    elif "unsupported content type" in normalized:
+        error_class = "unsupported_content_type"
+    elif "unsupported content encoding" in normalized:
+        error_class = "unsupported_content_encoding"
+    elif "timeout" in normalized or "timed out" in normalized:
+        error_class = "timeout"
+    elif any(value in normalized for value in ("network", "connection", "dns")):
+        error_class = "network"
+    elif any(str(status) in normalized for status in (401, 403, 429)):
+        error_class = "http_status"
+    from .investigations import _structured_task_error
+
+    detail = _structured_task_error(
+        error_class,
+        message,
+        task_status="failed",
+    )
+    if detail is not None:
+        detail["trace_id"] = selection.id
+        detail["technical_detail"] = message
+    return detail
+
+
+def serialize_selection(
+    selection: SearchSelection | None,
+    *,
+    current_result: SearchResult | None = None,
+) -> dict[str, Any] | None:
     if selection is None:
         return None
     item = selection.intake_item
+    error_detail = _selection_error_detail(selection)
     return {
         "status": item.status if item is not None else selection.status,
         "outcome": selection.outcome,
         "attempt_count": selection.attempt_count,
         "last_attempt_at": iso(selection.last_attempt_at),
         "last_error": selection.last_error,
+        "error": error_detail,
         "intake_item_id": selection.intake_item_id,
         "intake_status": item.status if item is not None else None,
-        "retryable": selection.status == "failed",
+        "retryable": selection.status in {"failed", "generation_failed"}
+        and (
+            bool(error_detail["retryable"])
+            if error_detail is not None
+            else True
+        ),
         "selection_event_count": len(selection.events),
-        "latest_query_run_id": selection.result.query_run_id,
-        "latest_result_id": selection.result_id,
+        # Describe the result currently being rendered. A canonical URL can be
+        # discovered in more than one topic, while the persisted intake object
+        # is intentionally reused.
+        "latest_query_run_id": (current_result or selection.result).query_run_id,
+        "latest_result_id": (current_result or selection.result).id,
     }
 
 
@@ -345,8 +636,9 @@ def serialize_search_result(result: SearchResult, selection: SearchSelection | N
         "snippet": result.snippet,
         "published_at": iso(result.published_at),
         "rank": result.rank,
+        "source_page": result.source_page,
         "engine": result.engine,
-        "selection": serialize_selection(selection),
+        "selection": serialize_selection(selection, current_result=result),
     }
 
 
@@ -357,22 +649,213 @@ def serialize_query_run(
 ) -> dict[str, Any]:
     selections = selections_by_fingerprint or {}
     items = results if results is not None else list(run.results)
-    return {
+    serialized_results = [
+        serialize_search_result(result, selections.get(result.result_fingerprint))
+        for result in items
+    ]
+    loaded_count = int(run.result_count or 0)
+    page = int(run.current_page or 1)
+    page_size = int(run.page_size or 10)
+    has_more = bool(run.has_more) and loaded_count < MAX_LOADED_RESULTS
+    next_page = page + 1 if has_more else None
+    pagination = {
+        "page": page,
+        "page_size": page_size,
+        "returned_count": int(run.returned_count or 0),
+        "loaded_count": loaded_count,
+        # Search providers do not promise an exact, stable web-wide total.
+        "available_count": None,
+        "total_estimate": run.total_count,
+        "total_known": bool(run.total_known),
+        "has_more": has_more,
+        "next_page": next_page,
+        "next_cursor": str(next_page) if next_page is not None else None,
+        "max_loaded_results": MAX_LOADED_RESULTS,
+    }
+    payload = {
         "id": run.id,
+        "query_run_id": run.id,
         "keyword": run.keyword,
         "scope": run.scope,
         "channel": run.channel,
         "language": run.language,
+        "effective_language": run.language,
         "status": run.status,
         "error": run.error,
-        "result_count": run.result_count,
+        "error_detail": run.error_detail,
+        "structured_error": run.error_detail,
+        "result_count": loaded_count,
+        **pagination,
+        "pagination": pagination,
         "latency_ms": run.latency_ms,
         "created_at": iso(run.created_at),
-        "provider": provider_metadata(),
-        "results": [
-            serialize_search_result(result, selections.get(result.result_fingerprint)) for result in items
-        ],
+        "updated_at": iso(run.updated_at),
+        "provider": provider_metadata(run.provider),
+        "results": serialized_results,
+        "items": serialized_results,
     }
+    return payload
+
+
+def _run_investigation(
+    session: Session,
+    run_id: str,
+    *,
+    investigation_id: str | None = None,
+) -> Investigation | None:
+    query = (
+        select(Investigation)
+        .join(InvestigationLink, InvestigationLink.investigation_id == Investigation.id)
+        .where(
+            InvestigationLink.object_type == "search_query",
+            InvestigationLink.object_id == run_id,
+        )
+        .order_by(InvestigationLink.created_at.asc())
+    )
+    if investigation_id is not None:
+        query = query.where(Investigation.id == investigation_id)
+    return session.scalar(query.limit(1))
+
+
+def _selections_for_results(
+    session: Session,
+    results: list[SearchResult],
+    *,
+    investigation_id: str,
+) -> dict[str, SearchSelection]:
+    fingerprints = {result.result_fingerprint for result in results}
+    if not fingerprints:
+        return {}
+    return {
+        selection.result_fingerprint: selection
+        for selection in session.scalars(
+            select(SearchSelection)
+            .join(
+                InvestigationLink,
+                (InvestigationLink.object_type == "intake")
+                & (InvestigationLink.object_id == SearchSelection.intake_item_id),
+            )
+            .where(SearchSelection.result_fingerprint.in_(fingerprints))
+            .where(InvestigationLink.investigation_id == investigation_id)
+            .options(
+                selectinload(SearchSelection.result).selectinload(SearchResult.query_run),
+                selectinload(SearchSelection.intake_item),
+                selectinload(SearchSelection.events),
+            )
+        )
+    }
+
+
+def get_query_run_payload(
+    session: Session,
+    run_id: str,
+    *,
+    investigation_id: str | None = None,
+) -> dict[str, Any]:
+    run = session.get(SearchQueryRun, run_id)
+    if run is None:
+        raise ValueError("Search query run not found")
+    investigation = _run_investigation(
+        session, run.id, investigation_id=investigation_id
+    )
+    if investigation is None:
+        raise ValueError("Search query run is not linked to this investigation")
+    results = list(
+        session.scalars(
+            select(SearchResult)
+            .where(SearchResult.query_run_id == run.id)
+            .options(selectinload(SearchResult.query_run))
+            .order_by(SearchResult.rank.asc())
+        )
+    )
+    payload = serialize_query_run(
+        run,
+        results,
+        _selections_for_results(
+            session, results, investigation_id=investigation.id
+        ),
+    )
+    payload["investigation_id"] = investigation.id
+    payload["investigation"] = {
+        "id": investigation.id,
+        "title": investigation.title,
+        "status": investigation.status,
+    }
+    return payload
+
+
+def list_query_runs(
+    session: Session,
+    *,
+    investigation_id: str,
+    limit: int,
+) -> dict[str, Any]:
+    association = (
+        InvestigationLink.object_type == "search_query",
+        InvestigationLink.investigation_id == investigation_id,
+    )
+    base = (
+        select(SearchQueryRun)
+        .join(InvestigationLink, InvestigationLink.object_id == SearchQueryRun.id)
+        .where(*association)
+    )
+    total = int(
+        session.scalar(
+            select(func.count())
+            .select_from(SearchQueryRun)
+            .join(InvestigationLink, InvestigationLink.object_id == SearchQueryRun.id)
+            .where(*association)
+        )
+        or 0
+    )
+    runs = list(
+        session.scalars(
+            base.order_by(SearchQueryRun.updated_at.desc(), SearchQueryRun.created_at.desc())
+            .limit(limit)
+        )
+    )
+    summaries = [serialize_query_run(run, []) for run in runs]
+    return {
+        "investigation_id": investigation_id,
+        "count": total,
+        "returned_count": len(summaries),
+        "runs": summaries,
+        "items": summaries,
+    }
+
+
+def _validate_continuation(
+    run: SearchQueryRun,
+    request: ExternalSearchRequest,
+    *,
+    provider: str,
+    effective_language: str,
+    page_size: int,
+) -> None:
+    if run.normalized_keyword != normalize_text(request.keyword).casefold():
+        raise ExternalSearchError(
+            "The continuation keyword does not match the saved query",
+            status_code=409,
+            reason="invalid_query",
+        )
+    if run.scope != request.scope or run.provider != provider:
+        raise ExternalSearchError(
+            "The continuation scope or provider does not match the saved query",
+            status_code=409,
+            reason="invalid_query",
+        )
+    if run.language != effective_language:
+        raise ExternalSearchError(
+            "The continuation language does not match the saved query",
+            status_code=409,
+            reason="invalid_query",
+        )
+    if int(run.page_size or 10) != page_size:
+        raise ExternalSearchError(
+            "The page size cannot change while continuing a saved query",
+            status_code=409,
+            reason="invalid_query",
+        )
 
 
 async def execute_external_search(
@@ -382,29 +865,117 @@ async def execute_external_search(
     if not normalized_keyword:
         raise ExternalSearchError("Keyword is empty", status_code=422, reason="invalid_query")
     config = SearchProviderConfig.from_env()
-    run = SearchQueryRun(
-        id=_query_run_id(),
-        keyword=normalize_text(request.keyword),
-        normalized_keyword=normalized_keyword,
-        scope=request.scope,
-        provider=config.provider,
-        channel=f"{'brave-search-api' if config.provider == 'brave' else config.provider}:{request.scope}",
-        language=request.language,
-        status="running",
+    effective_language = effective_search_language(
+        request.keyword, request.language, config.provider
     )
-    session.add(run)
+    requested_page_size = request.effective_page_size
+    run: SearchQueryRun
+    investigation: Investigation
     from .investigations import attach_search_run, record_action
 
-    investigation = attach_search_run(session, request, run)
+    if request.query_run_id is not None:
+        run = session.get(SearchQueryRun, request.query_run_id)
+        if run is None:
+            raise ValueError("Search query run not found")
+        # If a continuation omits both size fields, inherit the frozen page size
+        # instead of treating the legacy default of ten as a requested change.
+        if not ({"limit", "page_size"} & request.model_fields_set):
+            requested_page_size = int(run.page_size or 10)
+        if "language" not in request.model_fields_set:
+            effective_language = run.language
+        try:
+            _validate_continuation(
+                run,
+                request,
+                provider=config.provider,
+                effective_language=effective_language,
+                page_size=requested_page_size,
+            )
+        except ExternalSearchError as exc:
+            exc.query_run_id = run.id
+            raise
+        investigation = _run_investigation(
+            session, run.id, investigation_id=request.investigation_id
+        )
+        if investigation is None:
+            raise ValueError("Search query run is not linked to this investigation")
+        retrying_failed_first_page = (
+            request.page == 1
+            and int(run.current_page or 1) == 1
+            and run.status == "failed"
+            and int(run.result_count or 0) == 0
+        )
+        if request.page <= int(run.current_page or 1) and not retrying_failed_first_page:
+            return get_query_run_payload(
+                session, run.id, investigation_id=investigation.id
+            )
+        if (
+            not retrying_failed_first_page
+            and request.page != int(run.current_page or 1) + 1
+        ):
+            error = ExternalSearchError(
+                "Search pages must be loaded in order",
+                status_code=409,
+                reason="invalid_query",
+            )
+            error.query_run_id = run.id
+            raise error
+        if int(run.result_count or 0) >= MAX_LOADED_RESULTS:
+            run.has_more = False
+            session.commit()
+            return get_query_run_payload(
+                session, run.id, investigation_id=investigation.id
+            )
+    else:
+        now = datetime.now(timezone.utc)
+        run = SearchQueryRun(
+            id=_query_run_id(),
+            keyword=normalize_text(request.keyword),
+            normalized_keyword=normalized_keyword,
+            scope=request.scope,
+            provider=config.provider,
+            channel=f"{'brave-search-api' if config.provider == 'brave' else config.provider}:{request.scope}",
+            language=effective_language,
+            status="running",
+            error_detail=None,
+            result_count=0,
+            current_page=1,
+            page_size=requested_page_size,
+            returned_count=0,
+            has_more=False,
+            total_known=False,
+            total_count=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(run)
+        investigation = attach_search_run(session, request, run)
+
+    # Freeze the effective values sent upstream. ``auto`` must never reach a
+    # provider, and a continuation must keep the original page size.
+    provider_request = request.model_copy(
+        update={
+            "language": effective_language,
+            "page_size": requested_page_size,
+            "limit": requested_page_size,
+        }
+    )
+    run.status = "running"
+    run.updated_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(run)
     started = time.monotonic()
     try:
-        backend_response = await request_search(config, request)
+        backend_response = await request_search(config, provider_request)
     except ExternalSearchError as exc:
-        run.status = "failed"
+        exc.query_run_id = run.id
+        exc.attempted_page = request.page
+        run.status = "partial_failure" if int(run.result_count or 0) else "failed"
         run.error = str(exc)
+        run.error_detail = exc.as_dict()
+        run.returned_count = 0
         run.latency_ms = int((time.monotonic() - started) * 1000)
+        run.updated_at = datetime.now(timezone.utc)
         record_action(
             session,
             investigation.id,
@@ -412,19 +983,54 @@ async def execute_external_search(
             actor="analyst",
             object_type="search_query",
             object_id=run.id,
-            detail={"reason": exc.reason, "error": str(exc)},
+            detail=exc.as_dict(),
         )
         session.commit()
-        exc.query_run_id = run.id
         raise
 
-    seen: set[str] = set()
-    rank = 0
+    existing_fingerprints = set(
+        session.scalars(
+            select(SearchResult.result_fingerprint).where(
+                SearchResult.query_run_id == run.id
+            )
+        )
+    )
+    page_seen: set[str] = set()
+    rank = int(
+        session.scalar(
+            select(func.max(SearchResult.rank)).where(SearchResult.query_run_id == run.id)
+        )
+        or 0
+    )
+    # ``limit`` is the original one-shot contract: callers that only send that
+    # field must still receive at most that many unique rows.  A workspace run
+    # opts into provider-page persistence with ``page_size`` (and every saved-run
+    # continuation is necessarily a workspace request).  SearXNG controls its
+    # own operator page size, which can be larger than PLDR's display page; keep
+    # that whole page so later UI paging/select-all cannot silently lose rows.
+    preserve_searxng_operator_page = (
+        backend_response.provider == "searxng"
+        and (request.page_size is not None or request.query_run_id is not None)
+    )
+    page_result_cap = (
+        MAX_LOADED_RESULTS
+        if preserve_searxng_operator_page
+        else requested_page_size
+    )
+    added_count = 0
     for hit in backend_response.hits:
-        if hit.fingerprint in seen:
+        if hit.fingerprint in page_seen:
             continue
-        seen.add(hit.fingerprint)
+        page_seen.add(hit.fingerprint)
+        if hit.fingerprint in existing_fingerprints:
+            continue
+        if added_count >= page_result_cap:
+            break
+        if rank >= MAX_LOADED_RESULTS:
+            break
         rank += 1
+        added_count += 1
+        existing_fingerprints.add(hit.fingerprint)
         session.add(
             SearchResult(
                 id=_result_id(run.id, hit.fingerprint, rank),
@@ -439,17 +1045,60 @@ async def execute_external_search(
                 snippet=hit.snippet,
                 published_at=hit.published_at,
                 rank=rank,
+                source_page=request.page,
                 engine=hit.engine,
                 raw_result=hit.raw_result,
             )
         )
-        if rank >= request.limit:
-            break
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        # Two workers can pass the preflight page check before either commits.
+        # Never leak the uniqueness race as an opaque 500: discard this
+        # transaction, then reuse the winner's page when it is already visible.
+        session.rollback()
+        concurrent_run = session.get(SearchQueryRun, run.id)
+        if concurrent_run is not None and int(concurrent_run.current_page or 1) >= request.page:
+            return get_query_run_payload(
+                session, concurrent_run.id, investigation_id=investigation.id
+            )
+        error = ExternalSearchError(
+            "Concurrent request is updating the same saved query page",
+            status_code=409,
+            reason="concurrent_update",
+        )
+        error.query_run_id = run.id
+        error.attempted_page = request.page
+        raise error from exc
+    loaded_count = int(
+        session.scalar(
+            select(func.count())
+            .select_from(SearchResult)
+            .where(SearchResult.query_run_id == run.id)
+        )
+        or 0
+    )
     run.provider = backend_response.provider
     run.channel = backend_response.channel
     run.status = "ok"
-    run.result_count = len(seen)
+    run.error = None
+    run.error_detail = None
+    run.result_count = loaded_count
+    run.current_page = request.page
+    run.page_size = requested_page_size
+    run.returned_count = added_count
+    provider_has_more = backend_response.has_more
+    if provider_has_more is None:
+        provider_has_more = len(backend_response.hits) >= requested_page_size
+    run.has_more = (
+        bool(provider_has_more)
+        and added_count > 0
+        and loaded_count < MAX_LOADED_RESULTS
+    )
+    run.total_known = False
+    run.total_count = backend_response.total_estimate
     run.latency_ms = int((time.monotonic() - started) * 1000)
+    run.updated_at = datetime.now(timezone.utc)
     record_action(
         session,
         investigation.id,
@@ -457,29 +1106,16 @@ async def execute_external_search(
         actor="analyst",
         object_type="search_query",
         object_id=run.id,
-        detail={"result_count": run.result_count, "latency_ms": run.latency_ms},
+        detail={
+            "page": run.current_page,
+            "returned_count": run.returned_count,
+            "loaded_count": run.result_count,
+            "has_more": run.has_more,
+            "latency_ms": run.latency_ms,
+        },
     )
     session.commit()
-    session.refresh(run)
-    selections = {
-        selection.result_fingerprint: selection
-        for selection in session.scalars(
-            select(SearchSelection)
-            .where(SearchSelection.result_fingerprint.in_(seen))
-            .options(
-                selectinload(SearchSelection.result).selectinload(SearchResult.query_run),
-                selectinload(SearchSelection.events),
-            )
-        )
-    }
-    payload = serialize_query_run(run, list(run.results), selections)
-    payload["investigation_id"] = investigation.id
-    payload["investigation"] = {
-        "id": investigation.id,
-        "title": investigation.title,
-        "status": investigation.status,
-    }
-    return payload
+    return get_query_run_payload(session, run.id, investigation_id=investigation.id)
 
 
 def _trace_for_selection(

@@ -314,9 +314,22 @@ class SearchQueryRun(Base):
     language: Mapped[str] = mapped_column(String(20), default="en")
     status: Mapped[str] = mapped_column(String(20), default="ok", index=True)
     error: Mapped[str | None] = mapped_column(Text)
+    # ``error`` stays as the legacy plain-text field. New clients use this
+    # serializable envelope to explain cause, impact, and recovery without
+    # scraping an exception string.
+    error_detail: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     result_count: Mapped[int] = mapped_column(Integer, default=0)
+    current_page: Mapped[int] = mapped_column(Integer, default=1)
+    page_size: Mapped[int] = mapped_column(Integer, default=10)
+    returned_count: Mapped[int] = mapped_column(Integer, default=0)
+    has_more: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    total_count: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
+    )
     results: Mapped[list["SearchResult"]] = relationship(
         back_populates="query_run", cascade="all, delete-orphan", order_by="SearchResult.rank"
     )
@@ -339,6 +352,7 @@ class SearchResult(Base):
     snippet: Mapped[str] = mapped_column(Text, default="")
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_page: Mapped[int] = mapped_column(Integer, default=1, index=True)
     engine: Mapped[str] = mapped_column(String(120), default="")
     raw_result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

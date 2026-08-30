@@ -629,7 +629,7 @@ class P0Test(unittest.TestCase):
                 "mode": "api",
                 "model": "test-model",
                 "result": {
-                    "event": {"title": "Warehouse inspection finding", "summary": "Machine-proposed inspection summary.", "event_time": None, "location_name": None},
+                    "event": {"title": "Warehouse inspection finding", "summary": "Machine-proposed inspection summary.", "start_at": "2099-01-01T00:00:00Z", "location_name": None},
                     "entities": [{"name": "warehouse inspection", "entity_type": "activity", "aliases": [], "role": "subject"}],
                     "claims": [
                         {
@@ -657,6 +657,7 @@ class P0Test(unittest.TestCase):
         self.assertEqual(item["candidate_generation"]["model"], "test-model")
         candidates = {candidate["candidate_key"]: candidate for candidate in item["candidates"]}
         self.assertIsNone(candidates["event"]["machine"]["fields"]["event_time"])
+        self.assertNotIn("start_at", candidates["event"]["machine"]["fields"])
         self.assertIsNone(candidates["event"]["machine"]["fields"]["location_name"])
         self.assertEqual(len([c for c in candidates.values() if c["object_type"] == "entity"]), 1)
         invalid = candidates["evidence:2"]
@@ -1540,11 +1541,14 @@ class P0Test(unittest.TestCase):
             '$("#import-file").disabled = !isFileMode;',
         ]:
             self.assertIn(control_state, script.text)
-        self.assertIn('href="/snapshots/${escapeHtml(final.snapshot)}"', script.text)
+        self.assertIn("const snapshotId = final.snapshot || item.final_snapshot_id", script.text)
+        self.assertIn('href="/snapshots/${escapeHtml(snapshotId)}"', script.text)
         self.assertIn("没有匹配结果。PLDR 不会用演示数据填充空结果。", script.text)
         self.assertIn("未生成演示结果。", script.text)
         self.assertIn("data-search-retry=", script.text)
         self.assertIn('data-intake-action="retry-search"', script.text)
+        self.assertIn('event.target.closest("button[data-intake-step]")', script.text)
+        self.assertIn("本次查询最多保留", script.text)
         self.assertIn("item.search_history", script.text)
         self.assertIn("处理追踪", script.text)
         self.assertIn('escapeHtml(result.title || "无标题")', script.text)

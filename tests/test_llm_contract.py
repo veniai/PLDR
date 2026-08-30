@@ -49,6 +49,7 @@ class ModelContractTest(unittest.TestCase):
         self.assertEqual(normalized["event"]["summary"], "A verification occurred.")
         self.assertEqual(normalized["event"]["event_time"], "2026-08-29")
         self.assertEqual(normalized["event"]["location_name"], "local host")
+        self.assertNotIn("occurred_at", normalized["event"])
         self.assertEqual(normalized["entities"][0]["entity_type"], "software")
         self.assertEqual(normalized["claims"][0]["text"], "The operator verified the report.")
         self.assertEqual(
@@ -57,6 +58,22 @@ class ModelContractTest(unittest.TestCase):
         )
         self.assertNotIn("summary", raw["event"])
         self.assertNotIn("text", raw["claims"][0])
+
+    def test_event_time_aliases_do_not_turn_document_publication_into_event_time(self):
+        normalized = normalize_model_result(
+            "extract_intake_candidates",
+            {"event": {"start_at": "2026-08-29", "published_at": "2026-08-30"}},
+        )
+        self.assertEqual(normalized["event"]["event_time"], "2026-08-29")
+        self.assertNotIn("start_at", normalized["event"])
+        self.assertNotIn("published_at", normalized["event"])
+
+        publication_only = normalize_model_result(
+            "extract_intake_candidates",
+            {"event": {"published_at": "2026-08-30"}},
+        )
+        self.assertNotIn("event_time", publication_only["event"])
+        self.assertNotIn("published_at", publication_only["event"])
 
     def test_title_alias_is_normalized_and_non_objects_fail_closed(self):
         self.assertEqual(

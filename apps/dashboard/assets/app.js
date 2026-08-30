@@ -4,18 +4,46 @@ const state = {
   filteredEvents: [],
   selectedId: null,
   selectedEvent: null,
+  selectedEventError: null,
+  selectedEventRequestSerial: 0,
   sources: [],
   config: null,
   drawerTab: "overview",
   importMode: "url",
   intakeItems: [],
+  globalIntakeItems: [],
   intakeOptions: { events: [], entities: [] },
   selectedIntakeId: null,
+  intakeScopeInvestigationId: null,
+  intakeMobileStep: 0,
+  intakeRequestSerial: 0,
+  intakePreviewRequestSerial: 0,
+  intakePreviewApproval: null,
+  intakeActionBusy: false,
+  intakeActionSerial: 0,
   intakeDrafts: {},
   searchRun: null,
   searchResults: [],
+  searchCurrentPageIds: [],
+  searchSelectedIds: new Set(),
+  searchSelectionsByRun: new Map(),
+  searchHistory: [],
+  searchHistoryInvestigationId: null,
+  searchHistoryBusy: false,
+  searchHistoryError: "",
+  searchHistoryRequestSerial: 0,
+  searchHistoryAvailable: true,
+  searchPage: 1,
+  searchPageSize: 20,
+  searchHasMore: false,
+  searchNextPage: null,
+  searchNextCursor: null,
+  searchLastRequest: null,
   searchError: "",
+  searchErrorInfo: null,
+  searchErrorSource: null,
   searchBusy: false,
+  searchRequestSerial: 0,
   collectionSummary: null,
   collectionTargets: [],
   selectedCollectionTargetId: null,
@@ -32,9 +60,13 @@ const state = {
   activeInvestigationTab: "today",
   investigationDetails: new Map(),
   investigationTasks: new Map(),
+  investigationTaskErrors: new Map(),
   investigationActivities: new Map(),
+  investigationActivityErrors: new Map(),
   investigationLinks: new Map(),
   investigationEventDetails: new Map(),
+  investigationEventErrors: new Map(),
+  investigationEventRequestTokens: new Map(),
   investigationPollTimer: null,
   investigationRequestSerial: 0,
   localInvestigationState: null,
@@ -54,6 +86,8 @@ const API_ROUTES = Object.freeze({
   investigationLinks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/links`,
   taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`,
   search: "/pldr-api/v1/search",
+  searchRuns: "/pldr-api/v1/search/runs",
+  searchRun: (id) => `/pldr-api/v1/search/runs/${encodeURIComponent(id)}`,
   searchSelect: "/pldr-api/v1/search/select",
   reports: "/pldr-api/v1/reports",
 });
@@ -62,6 +96,11 @@ const LOCAL_INVESTIGATION_KEY = "pldr.investigations.v1";
 const NEW_INVESTIGATION_VALUE = "__new_investigation__";
 const UNASSIGNED_VALUE = "__unassigned__";
 const INVESTIGATION_TABS = new Set(["today", "discovery", "monitoring", "review", "events", "claims", "reports", "activity"]);
+const INVESTIGATION_TASK_PAGE_SIZE = 500;
+const INVESTIGATION_DIRECTORY_PAGE_SIZE = 500;
+const INVESTIGATION_ACTIVITY_PAGE_SIZE = 500;
+const HOME_ASSIGNMENT_WINDOW = 100;
+const GLOBAL_INTAKE_LOAD_LIMIT = 500;
 
 const LABELS = {
   importance: { critical: "极高", high: "高", medium: "中", low: "低" },
@@ -219,6 +258,12 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function unitIntervalValue(value, fallback) {
+  if (value === null || value === undefined || String(value).trim() === "") return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? clamp(number, 0, 1) : fallback;
+}
+
 function formatDate(value, withTime = false) {
   if (!value) return "未知";
   const date = new Date(value);
@@ -253,9 +298,162 @@ async function api(path, options = {}) {
     const error = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
     error.status = response.status;
     error.payload = payload;
+    error.traceId = response.headers.get("x-request-id") || response.headers.get("trace-id") || null;
     throw error;
   }
   return payload;
+}
+
+const ERROR_STAGE_LABELS = Object.freeze({
+  query: "公开资料检索",
+  search: "公开资料检索",
+  fetch: "抓取原始页面",
+  parse: "提取正文",
+  extract: "提取正文",
+  generate: "生成 AI 候选",
+  model: "生成 AI 候选",
+  link: "关联专题",
+  confirm: "确认入档",
+  unknown: "处理资料",
+});
+
+function objectMessage(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  return value.message || value.summary || value.title || value.detail || value.reason || "";
+}
+
+function legacyErrorBlueprint(message, fallbackStage = "unknown") {
+  const text = String(message || "未知错误");
+  const lower = text.toLowerCase();
+  if (/model|glm|candidate/.test(lower) && /timeout|deadline|timed out|90 second/.test(lower)) {
+    return {
+      stage: "generate",
+      title: "AI 候选生成超时",
+      message: "原始材料已经保存，但模型没有在时限内返回可审核候选。",
+      impact: "材料不会丢失，也还没有进入正式事件档案。",
+      nextAction: "稍后只重试候选生成，不需要重新搜索或重新抓取原文。",
+      retryable: true,
+    };
+  }
+  if (/non-public address|private address|ssrf|blocked.*address/.test(lower)) {
+    return {
+      stage: "fetch",
+      title: "安全检查阻止了页面抓取",
+      message: "系统解析到非公网地址，因此没有请求这个页面。",
+      impact: "搜索线索仍保留，但没有原始页面快照，不能作为证据入档。",
+      nextAction: "请先让管理员检查 DNS 或代理解析，或换用公开正文页；当前配置不变时重复重试不会解决问题，也不要关闭安全防护。",
+      retryable: false,
+    };
+  }
+  if (/\b401\b|\b403\b|forbidden|unauthorized|login|paywall/.test(lower)) {
+    return {
+      stage: "fetch",
+      title: "来源网站拒绝访问",
+      message: "原站要求登录、授权或拒绝了当前抓取方式。",
+      impact: "没有获得可固定的原始页面快照，正式档案没有变化。",
+      nextAction: "先打开原网页核对；如材料允许公开使用，可改为粘贴正文或上传文件。",
+      retryable: false,
+    };
+  }
+  if (/\b429\b|rate.?limit|too many requests/.test(lower)) {
+    return {
+      stage: fallbackStage === "unknown" ? "query" : fallbackStage,
+      title: "外部服务暂时限流",
+      message: "请求频率超过了外部服务当前允许的范围。",
+      impact: "本次操作没有产生新的正式档案。",
+      nextAction: "等待一会儿再重试，不要连续重复提交。",
+      retryable: true,
+    };
+  }
+  if (/not configured|missing.*key|api key|credential/.test(lower)) {
+    return {
+      stage: fallbackStage === "unknown" ? "query" : fallbackStage,
+      title: "外部服务尚未配置",
+      message: "当前环境缺少可用的检索或模型配置。",
+      impact: "没有生成虚假结果，正式档案没有变化。",
+      nextAction: "请管理员检查服务配置后再试。",
+      retryable: false,
+    };
+  }
+  if (/timeout|deadline|timed out/.test(lower)) {
+    return {
+      stage: fallbackStage,
+      title: `${ERROR_STAGE_LABELS[fallbackStage] || ERROR_STAGE_LABELS.unknown}超时`,
+      message: "外部服务没有在时限内完成本次操作。",
+      impact: "尚未完成的步骤不会被显示为成功；已保存的材料仍然保留。",
+      nextAction: "稍后重试一次；若持续发生，请展开技术详情并提供诊断编号。",
+      retryable: true,
+    };
+  }
+  if (/network|connection|dns|resolve|fetch failed/.test(lower)) {
+    return {
+      stage: fallbackStage,
+      title: "暂时无法连接外部服务",
+      message: "网络、DNS 或上游服务连接失败。",
+      impact: "本次未完成的步骤没有写入正式档案。",
+      nextAction: "确认网络恢复后重试；持续失败时把诊断编号交给管理员。",
+      retryable: true,
+    };
+  }
+  return {
+    stage: fallbackStage,
+    title: `${ERROR_STAGE_LABELS[fallbackStage] || ERROR_STAGE_LABELS.unknown}没有完成`,
+    message: "系统保留了失败状态，没有把未完成的操作显示为成功。",
+    impact: "正式档案不会因本次失败而发生未经确认的改变。",
+    nextAction: "可重试一次；若仍失败，请展开技术详情并提供诊断编号。",
+    retryable: true,
+  };
+}
+
+function normalizeOperationalError(input, fallbackStage = "unknown") {
+  const payload = input?.payload || input || {};
+  const rawDetail = payload?.detail && typeof payload.detail === "object" ? payload.detail : payload;
+  const structured = rawDetail?.error && typeof rawDetail.error === "object" ? { ...rawDetail, ...rawDetail.error } : rawDetail;
+  const rawMessage = objectMessage(structured)
+    || objectMessage(payload?.detail)
+    || input?.error_message
+    || input?.last_error
+    || input?.candidate_generation?.error
+    || input?.message
+    || (typeof input === "string" ? input : "")
+    || "未知错误";
+  const blueprint = legacyErrorBlueprint(rawMessage, structured?.stage || input?.stage || fallbackStage);
+  const technical = structured?.technical_detail
+    || structured?.technical_message
+    || structured?.debug_detail
+    || rawMessage;
+  return {
+    code: structured?.code || input?.error_code || "PLDR_OPERATION_FAILED",
+    stage: structured?.stage || input?.error_stage || blueprint.stage || fallbackStage,
+    title: structured?.title || structured?.summary || blueprint.title,
+    message: structured?.display_message || structured?.why || structured?.message || blueprint.message,
+    impact: structured?.impact || blueprint.impact,
+    nextAction: structured?.next_action || structured?.recommended_action || blueprint.nextAction,
+    retryable: structured?.retryable ?? input?.retryable ?? blueprint.retryable,
+    traceId: structured?.trace_id || structured?.request_id || input?.trace_id || input?.traceId || null,
+    technical: typeof technical === "string" ? technical : JSON.stringify(technical, null, 2),
+  };
+}
+
+function renderOperationalError(input, { stage = "unknown", compact = false, actionHtml = "" } = {}) {
+  const error = normalizeOperationalError(input, stage);
+  const trace = error.traceId ? `
+    <span class="error-trace">诊断编号 <code>${escapeHtml(error.traceId)}</code><button class="text-btn" type="button" data-copy-trace="${escapeHtml(error.traceId)}">复制</button></span>` : "";
+  return `
+    <article class="operational-error ${compact ? "compact" : ""}" role="alert">
+      <div class="operational-error-heading">
+        <span class="error-stage">${escapeHtml(ERROR_STAGE_LABELS[error.stage] || ERROR_STAGE_LABELS.unknown)}</span>
+        <strong>${escapeHtml(error.title)}</strong>
+      </div>
+      <dl>
+        <div><dt>发生了什么</dt><dd>${escapeHtml(error.message)}</dd></div>
+        <div><dt>影响</dt><dd>${escapeHtml(error.impact)}</dd></div>
+        <div><dt>怎么办</dt><dd>${escapeHtml(error.nextAction)}</dd></div>
+      </dl>
+      ${actionHtml ? `<div class="operational-error-action">${actionHtml}</div>` : ""}
+      <details><summary>技术详情${error.code ? ` · ${escapeHtml(error.code)}` : ""}</summary><pre>${escapeHtml(error.technical)}</pre>${trace}</details>
+    </article>`;
 }
 
 function setBusy(isBusy, label = "处理中") {
@@ -320,6 +518,57 @@ function unwrapItems(payload, ...keys) {
     if (Array.isArray(payload?.[key])) return payload[key];
   }
   return [];
+}
+
+async function loadAllInvestigationTasks(investigationId) {
+  const tasksById = new Map();
+  let offset = 0;
+  let total = null;
+  do {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(INVESTIGATION_TASK_PAGE_SIZE) });
+    const payload = await api(`${API_ROUTES.investigationTasks(investigationId)}?${params}`);
+    const page = unwrapItems(payload, "items", "tasks", "review_tasks");
+    page.forEach((task) => tasksById.set(task.id, task));
+    const reportedTotal = Number(payload?.count);
+    if (Number.isFinite(reportedTotal) && reportedTotal >= 0) total = Math.max(total ?? 0, reportedTotal);
+    offset += page.length;
+    if (!page.length || (total === null && page.length < INVESTIGATION_TASK_PAGE_SIZE)) break;
+  } while (total === null || offset < total);
+  return [...tasksById.values()];
+}
+
+async function loadAllInvestigations() {
+  const byId = new Map();
+  let offset = 0;
+  let total = null;
+  do {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(INVESTIGATION_DIRECTORY_PAGE_SIZE) });
+    const payload = await api(`${API_ROUTES.investigations}?${params}`);
+    const page = unwrapItems(payload, "items", "investigations");
+    page.forEach((investigation) => byId.set(investigation.id, investigation));
+    const reportedTotal = Number(payload?.count);
+    if (Number.isFinite(reportedTotal) && reportedTotal >= 0) total = reportedTotal;
+    offset += page.length;
+    if (!page.length || (total === null && page.length < INVESTIGATION_DIRECTORY_PAGE_SIZE)) break;
+  } while (total === null || offset < total);
+  return [...byId.values()];
+}
+
+async function loadAllInvestigationActivity(investigationId) {
+  const byId = new Map();
+  let offset = 0;
+  let total = null;
+  do {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(INVESTIGATION_ACTIVITY_PAGE_SIZE) });
+    const payload = await api(`${API_ROUTES.investigationActivity(investigationId)}?${params}`);
+    const page = unwrapItems(payload, "items", "activity", "activities", "decisions");
+    page.forEach((entry) => byId.set(entry.id, entry));
+    const reportedTotal = Number(payload?.count);
+    if (Number.isFinite(reportedTotal) && reportedTotal >= 0) total = reportedTotal;
+    offset += page.length;
+    if (!page.length || (total === null && page.length < INVESTIGATION_ACTIVITY_PAGE_SIZE)) break;
+  } while (total === null || offset < total);
+  return [...byId.values()];
 }
 
 function normalizeInvestigation(raw, syncMode = "server") {
@@ -523,12 +772,12 @@ function canonicalTaskStage(task) {
 }
 
 function taskIntakeId(task) {
-  return task?.intake_item_id || task?.intake?.id || task?.result?.intake_item_id || null;
+  return task?.intake_item_id || task?.intake_item?.id || task?.intake?.id || task?.result?.intake_item_id || null;
 }
 
 function taskTitle(task) {
   const intakeId = taskIntakeId(task);
-  const intake = state.intakeItems.find((item) => item.id === intakeId);
+  const intake = task?.intake_item || state.intakeItems.find((item) => item.id === intakeId);
   const resultId = task?.subject?.id || task?.subject_id || task?.payload?.result_id || task?.payload_json?.result_id;
   const searchResult = state.searchResults.find((item) => item.id === resultId);
   return task?.title
@@ -545,7 +794,14 @@ function taskTitle(task) {
 
 function taskError(task) {
   const error = task?.error;
-  return task?.error_message || (typeof error === "object" ? error?.message || error?.class : error) || task?.last_error || "";
+  return task?.error_message || (typeof error === "object" ? error?.message || error?.summary || error?.title || error?.class : error) || task?.last_error || "";
+}
+
+function taskErrorPayload(task) {
+  if (!task) return null;
+  if (task.error && typeof task.error === "object") return { ...task.error, retryable: task.retryable ?? task.error.retryable };
+  const message = taskError(task);
+  return message ? { message, stage: task.error_stage || canonicalTaskStage(task), retryable: task.retryable } : null;
 }
 
 function taskStatusMarkup(stage) {
@@ -679,7 +935,9 @@ function allHomeAssignments() {
       investigation: null,
     });
   });
-  return assignments.slice(0, 30);
+  const rank = { failed: 0, ready: 1, fetching: 2, generating: 3, queued: 4 };
+  return assignments.sort((a, b) => (rank[canonicalTaskStage(a.task)] ?? 8) - (rank[canonicalTaskStage(b.task)] ?? 8)
+    || new Date(b.task.updated_at || b.task.created_at || 0) - new Date(a.task.updated_at || a.task.created_at || 0));
 }
 
 function renderDestinationPickers(preferredId = state.activeInvestigationId) {
@@ -782,8 +1040,9 @@ function renderInvestigationHome() {
     </div>`}${referenceInvestigations.length ? `<div class="investigation-list-divider"><span>参考入口</span><small>不计入“我的专题”，也不能作为资料归类目标</small></div>${renderCards(referenceInvestigations)}` : ""}`;
 
   const assignments = allHomeAssignments();
+  const visibleAssignments = assignments.slice(0, HOME_ASSIGNMENT_WINDOW);
   $("#assignment-count").textContent = String(assignments.length);
-  $("#assignment-list").innerHTML = assignments.length ? assignments.map(({ task, investigation }) => {
+  $("#assignment-list").innerHTML = assignments.length ? `${visibleAssignments.map(({ task, investigation }) => {
     const stage = canonicalTaskStage(task);
     return `
       <button class="assignment-card" type="button" data-investigation-assignment="${escapeHtml(task.id)}" data-investigation-id="${escapeHtml(investigation?.id || "")}" data-intake-id="${escapeHtml(taskIntakeId(task) || "")}">
@@ -791,12 +1050,12 @@ function renderInvestigationHome() {
         <span class="assignment-copy">
           <h3>${escapeHtml(taskTitle(task))}</h3>
           <span class="assignment-meta"><span>${escapeHtml(investigation?.sync_mode === "system" ? "系统待归类" : investigation?.title || "待归类材料")}</span><span>${formatDate(task.updated_at || task.created_at, true)}</span></span>
-          ${taskError(task) ? `<p>${escapeHtml(taskError(task))}</p>` : ""}
+          ${taskError(task) ? `<p>${escapeHtml(normalizeOperationalError(taskErrorPayload(task), canonicalTaskStage(task)).title)}</p>` : ""}
           <span class="assignment-meta">${taskStatusMarkup(stage)}</span>
         </span>
         <span class="assignment-go">›</span>
       </button>`;
-  }).join("") : '<div class="investigation-empty"><strong>当前没有待处理项</strong><p>这里不会用示例任务填充。新采集、网页变化或失败任务出现后会显示。</p></div>';
+  }).join("")}${assignments.length > visibleAssignments.length ? `<div class="investigation-empty"><strong>首页显示优先级最高的 ${visibleAssignments.length} / ${assignments.length} 条</strong><p>完整队列没有被计数截断；请进入对应专题查看其全部任务。</p></div>` : ""}` : '<div class="investigation-empty"><strong>当前没有待处理项</strong><p>这里不会用示例任务填充。新采集、网页变化或失败任务出现后会显示。</p></div>';
   renderDestinationPickers();
   renderMetrics();
 }
@@ -805,14 +1064,26 @@ async function refreshInvestigationDirectory() {
   const local = loadLocalInvestigationState();
   let serverInvestigations = [];
   try {
-    const payload = await api(API_ROUTES.investigations);
-    serverInvestigations = unwrapItems(payload, "items", "investigations").map((item) => normalizeInvestigation(item, "server"));
+    const payload = await loadAllInvestigations();
+    serverInvestigations = payload.map((item) => normalizeInvestigation(item, "server"));
     state.investigationMode = "server";
     state.investigationError = "";
-    const taskLists = await Promise.allSettled(serverInvestigations.slice(0, 50).map((investigation) => api(API_ROUTES.investigationTasks(investigation.id))));
+    const taskLists = await Promise.allSettled(serverInvestigations.map((investigation) => loadAllInvestigationTasks(investigation.id)));
     taskLists.forEach((result, index) => {
-      if (result.status === "fulfilled") state.investigationTasks.set(serverInvestigations[index].id, unwrapItems(result.value, "items", "tasks", "review_tasks"));
+      const investigationId = serverInvestigations[index].id;
+      if (result.status === "fulfilled") {
+        state.investigationTasks.set(investigationId, result.value);
+        state.investigationTaskErrors.delete(investigationId);
+      } else {
+        state.investigationTasks.delete(investigationId);
+        state.investigationTaskErrors.set(investigationId, result.reason);
+      }
     });
+    const taskFailures = taskLists.filter((result) => result.status === "rejected");
+    if (taskFailures.length) {
+      state.investigationMode = "error";
+      state.investigationError = `${taskFailures.length} 个专题的处理队列读取失败：${taskFailures[0].reason?.message || "未知错误"}`;
+    }
   } catch (error) {
     if (isUnsupportedEndpoint(error)) {
       state.investigationMode = "unavailable";
@@ -853,8 +1124,8 @@ async function loadInvestigationWorkspace(investigationId, { quiet = false } = {
   if (!quiet) $("#investigation-panel").innerHTML = '<div class="investigation-empty"><strong>正在读取专题任务与记录…</strong></div>';
   const calls = await Promise.allSettled([
     api(API_ROUTES.investigation(investigation.id)),
-    api(API_ROUTES.investigationTasks(investigation.id)),
-    api(API_ROUTES.investigationActivity(investigation.id)),
+    loadAllInvestigationTasks(investigation.id),
+    loadAllInvestigationActivity(investigation.id),
   ]);
   if (requestSerial !== state.investigationRequestSerial || state.activeInvestigationId !== investigation.id) return;
   if (calls[0].status === "fulfilled") {
@@ -866,8 +1137,20 @@ async function loadInvestigationWorkspace(investigationId, { quiet = false } = {
     $("#investigation-panel").innerHTML = `<div class="investigation-empty"><strong>专题详情读取失败</strong><p>${escapeHtml(calls[0].reason?.message || "未知错误")}</p><button class="btn btn-ghost" type="button" data-investigation-action="refresh">重试</button></div>`;
     return;
   }
-  if (calls[1].status === "fulfilled") state.investigationTasks.set(investigation.id, unwrapItems(calls[1].value, "items", "tasks", "review_tasks"));
-  if (calls[2].status === "fulfilled") state.investigationActivities.set(investigation.id, unwrapItems(calls[2].value, "items", "activity", "activities", "decisions"));
+  if (calls[1].status === "fulfilled") {
+    state.investigationTasks.set(investigation.id, calls[1].value);
+    state.investigationTaskErrors.delete(investigation.id);
+  } else {
+    state.investigationTasks.delete(investigation.id);
+    state.investigationTaskErrors.set(investigation.id, calls[1].reason);
+  }
+  if (calls[2].status === "fulfilled") {
+    state.investigationActivities.set(investigation.id, calls[2].value);
+    state.investigationActivityErrors.delete(investigation.id);
+  } else {
+    state.investigationActivities.delete(investigation.id);
+    state.investigationActivityErrors.set(investigation.id, calls[2].reason);
+  }
   const detailLinks = unwrapItems(state.investigationDetails.get(investigation.id), "links");
   if (detailLinks.length) state.investigationLinks.set(investigation.id, detailLinks);
   renderInvestigationHome();
@@ -942,7 +1225,7 @@ async function openInvestigation(investigationId, tab = "today", { syncUrl = tru
     history.pushState(null, "", url);
   }
   await loadInvestigationWorkspace(investigationId);
-  if (state.activeInvestigationTab === "claims") await loadInvestigationEvidence(investigation);
+  if (["today", "claims"].includes(state.activeInvestigationTab)) await loadInvestigationEvidence(investigation);
 }
 
 function setInvestigationTab(tab, { syncUrl = true } = {}) {
@@ -954,7 +1237,7 @@ function setInvestigationTab(tab, { syncUrl = true } = {}) {
     url.searchParams.set("tab", tab);
     history.pushState(null, "", url);
   }
-  if (tab === "claims") loadInvestigationEvidence(activeInvestigation());
+  if (["today", "claims"].includes(tab)) loadInvestigationEvidence(activeInvestigation());
 }
 
 function renderInvestigationPage() {
@@ -994,7 +1277,32 @@ function renderInvestigationPanel(investigation) {
     reports: renderInvestigationReports,
     activity: renderInvestigationActivity,
   };
-  $("#investigation-panel").innerHTML = (renderers[state.activeInvestigationTab] || renderers.today)(investigation);
+  const content = (renderers[state.activeInvestigationTab] || renderers.today)(investigation);
+  const taskError = state.investigationTaskErrors.get(investigation.id);
+  const queueError = taskError
+    ? renderOperationalError(taskError, {
+      stage: "fetch",
+      actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取完整处理队列</button>',
+    })
+    : "";
+  const eventErrorEntry = ["today", "claims"].includes(state.activeInvestigationTab)
+    ? eventsForInvestigation(investigation)
+      .map((event) => [event, state.investigationEventErrors.get(event.id)])
+      .find(([, error]) => error)
+    : null;
+  const eventError = eventErrorEntry
+    ? renderOperationalError(eventErrorEntry[1], {
+      stage: "fetch",
+      actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取正式事件与证据</button>',
+    })
+    : "";
+  const activityError = state.activeInvestigationTab === "activity" && state.investigationActivityErrors.get(investigation.id)
+    ? renderOperationalError(state.investigationActivityErrors.get(investigation.id), {
+      stage: "fetch",
+      actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取完整操作记录</button>',
+    })
+    : "";
+  $("#investigation-panel").innerHTML = `${queueError}${eventError}${activityError}${content}`;
 }
 
 function investigationPanelHeading(eyebrow, title, description, actions = "") {
@@ -1008,20 +1316,33 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
     const intakeId = taskIntakeId(task);
     const taskId = task.id || task.task_id;
     const canReview = stage === "ready" && intakeId;
-    const canRetryTask = (stage === "failed" || task.retryable === true) && taskId && !String(taskId).startsWith("intake:") && !String(taskId).startsWith("unassigned:");
-    const intake = state.intakeItems.find((item) => item.id === intakeId);
+    const retryAllowed = task.error?.retryable ?? task.retryable ?? true;
+    const canRetryTask = retryAllowed && (stage === "failed" || task.retryable === true) && taskId && !String(taskId).startsWith("intake:") && !String(taskId).startsWith("unassigned:");
+    const intake = task.intake_item || state.intakeItems.find((item) => item.id === intakeId);
+    let primaryAction = "";
+    if (canReview) {
+      primaryAction = `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">打开审核</button>`;
+      if (canRetryTask) {
+        primaryAction += `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">只重试 AI</button>`;
+      }
+    } else if (canRetryTask) {
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">重试这一步</button>`;
+    } else if (retryAllowed && stage === "failed" && intake?.status === "generation_failed") {
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">只重试候选生成</button>`;
+    } else if (retryAllowed && stage === "failed" && intake?.search?.result_id) {
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取原始页</button>`;
+    }
+    const errorPayload = stage === "failed" ? taskErrorPayload(task) : null;
+    const degradation = task.degradation || (task.degraded && task.error ? task.error : null);
     return `
       <article class="topic-task-row">
         <div>
           <h3>${escapeHtml(taskTitle(task))}</h3>
-          <p>${escapeHtml(taskError(task) || (stage === "ready" ? "AI 候选已就绪，尚未写入正式档案。" : stage === "generating" ? "原始材料已保存，候选仍在生成。" : stage === "fetching" ? "正在抓取原始页面；搜索摘要不会进入证据链。" : stage === "queued" ? "任务已持久排队，尚未开始抓取。" : "任务状态来自服务端。"))}</p>
+          ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true }) : degradation ? `<div class="task-degradation"><strong>${escapeHtml(degradation.title || "已生成降级候选")}</strong><span>${escapeHtml(degradation.message || degradation.display_message || "原文已保存；请在确认前人工核对候选字段。")}</span><small>${escapeHtml(degradation.next_action || "继续人工审核。")}</small></div>` : `<p>${escapeHtml(stage === "ready" ? "AI 候选已就绪，尚未写入正式档案。" : stage === "generating" ? "原始材料已保存，候选仍在生成。" : stage === "fetching" ? "正在抓取原始页面；搜索摘要不会进入证据链。" : stage === "queued" ? "任务已持久排队，尚未开始抓取。" : "任务状态来自服务端。")}</p>`}
           <div class="topic-task-meta">${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span>${intakeId ? `<span>intake ${escapeHtml(intakeId)}</span>` : ""}</div>
         </div>
         <div class="topic-task-actions">
-          ${canReview ? `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">打开审核</button><button class="btn btn-ghost" type="button" data-investigation-action="accept-entry" data-intake-id="${escapeHtml(intakeId)}">接受 / 编辑</button><button class="btn btn-ghost warning" type="button" data-investigation-action="reject-entry" data-intake-id="${escapeHtml(intakeId)}">驳回</button>` : ""}
-          ${canRetryTask ? `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">重试任务</button>` : ""}
-          ${stage === "failed" && intake?.status === "generation_failed" ? `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">重新生成候选</button>` : ""}
-          ${stage === "failed" && intake?.search?.result_id ? `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取</button>` : ""}
+          ${primaryAction}
         </div>
       </article>`;
   }).join("")}</div>`;
@@ -1033,6 +1354,89 @@ function renderMiniMap(investigation) {
     const position = mapPosition(event);
     return `<button class="investigation-map-marker ${escapeHtml(event.importance || "medium")}" type="button" style="left:${position.left}%;top:${position.top}%" data-investigation-event="${escapeHtml(event.id)}" aria-label="${escapeHtml(event.title)}"></button>`;
   }).join("")}</div><div class="investigation-map-note">${events.length ? `${events.length} 个事件有可用坐标；点击节点打开正式事件档案。` : "当前没有可靠坐标，不会根据材料文本猜测位置。"}</div></div>`;
+}
+
+function renderSituationAssessment(investigation) {
+  const events = eventsForInvestigation(investigation);
+  const tasks = tasksForInvestigation(investigation);
+  const details = events.map((event) => state.investigationEventDetails.get(event.id)).filter(Boolean);
+  const documents = details.flatMap((event) => event.documents || []);
+  const claims = details.flatMap((event) => event.claims || []);
+  const evidence = claims.flatMap((claim) => claim.evidence || []);
+  const claimsWithEvidence = claims.filter((claim) => Array.isArray(claim.evidence) && claim.evidence.length > 0).length;
+  const sourceTiers = documents.map((document) => Number(document.source?.reliability_tier)).filter(Number.isFinite);
+  const corroboratedEvents = events.filter((event) => Number(event.independent_source_count || 0) >= 2).length;
+  const unresolvedClaims = events.reduce((sum, event) => sum + Number(event.claim_counts?.contested || 0) + Number(event.claim_counts?.unverified || 0), 0);
+  const assessments = details.map((event) => event.assessment).filter(Boolean);
+  const humanAssessments = assessments.filter((assessment) => /human|analyst|人工|分析员/i.test(String(assessment.generated_by || "")));
+  const failedTasks = tasks.filter((task) => canonicalTaskStage(task) === "failed").length;
+  const sourceFailures = targetsForInvestigation(investigation).filter((target) => ["error", "degraded", "stale"].includes(collectionTargetStatus(target))).length;
+  const latestTime = [...tasks.map((task) => task.updated_at || task.created_at), ...events.map((event) => event.updated_at || event.start_at)]
+    .filter(Boolean)
+    .sort((a, b) => new Date(b) - new Date(a))[0];
+
+  let reliability = { label: "未知", tone: "unknown", basis: "尚未读取到本专题已确认资料的来源档案。" };
+  if (sourceTiers.length) {
+    const bestTier = Math.min(...sourceTiers);
+    reliability = {
+      label: bestTier <= 2 ? "含较高等级来源" : "仍需人工评估",
+      tone: bestTier <= 2 ? "supported" : "attention",
+      basis: `${documents.length} 篇已确认资料带有来源级别记录；T${bestTier} 是其中最高等级，不等于具体主张为真。`,
+    };
+  } else if (events.length) {
+    reliability.basis = "已有正式事件，但当前列表没有加载来源级别；保持未知，不从站点名称猜测。";
+  }
+
+  const corroboration = events.length ? {
+    label: corroboratedEvents ? `${corroboratedEvents} 个事件有独立印证` : "以单一来源为主",
+    tone: corroboratedEvents ? "supported" : "attention",
+    basis: `${events.length} 个正式事件中，${corroboratedEvents} 个连接了至少 2 个独立来源组。文档数量不会冒充独立来源数量。`,
+  } : { label: "未知", tone: "unknown", basis: "尚无正式事件，不能判断独立来源印证情况。" };
+
+  const everyClaimHasEvidence = claims.length > 0 && claimsWithEvidence === claims.length;
+  const evidenceCoverage = details.length === events.length && events.length ? {
+    label: everyClaimHasEvidence ? "已逐条回链" : "存在证据缺口",
+    tone: everyClaimHasEvidence ? "supported" : "attention",
+    basis: `${claims.length} 条已确认主张中 ${claimsWithEvidence} 条至少连接一条固定快照证据，共 ${evidence.length} 条证据；仍需逐条核对，不是可信度分数。`,
+  } : {
+    label: events.length ? "待核对" : "未知",
+    tone: "unknown",
+    basis: events.length ? "请打开“主张与证据”读取正式对象后核对；当前不根据事件数量推算完整度。" : "尚无正式事件与主张，无法判断证据完整性。",
+  };
+
+  const humanConfidence = humanAssessments.length ? {
+    label: "已有人工研判",
+    tone: "supported",
+    basis: `${humanAssessments.length} 个正式事件带有明确标记的人工研判；这里不把机器候选置信度混入。`,
+  } : {
+    label: "未知",
+    tone: "unknown",
+    basis: assessments.length ? "当前研判未明确标记为人工完成，因此不展示人工置信度。" : "尚未读取到明确的人工研判记录。",
+  };
+
+  const rows = [
+    ["来源可靠性", reliability],
+    ["独立来源印证", corroboration],
+    ["证据完整性", evidenceCoverage],
+    ["人工研判置信度", humanConfidence],
+  ];
+  return `
+    <section class="workbench-surface situation-assessment" aria-labelledby="situation-assessment-title">
+      <div class="workbench-surface-head">
+        <div><h3 id="situation-assessment-title">当前研判</h3><p>分项说明依据，不生成综合分</p></div>
+        <span class="situation-updated">${latestTime ? `更新 ${formatDate(latestTime, true)}` : "尚无更新时间"}</span>
+      </div>
+      <div class="situation-dimensions">
+        ${rows.map(([name, value]) => `<details class="situation-dimension ${escapeHtml(value.tone)}"><summary><span>${escapeHtml(name)}</span><strong>${escapeHtml(value.label)}</strong></summary><p>${escapeHtml(value.basis)}</p></details>`).join("")}
+      </div>
+      <div class="situation-gaps">
+        <strong>需要注意</strong>
+        <span>${unresolvedClaims ? `${unresolvedClaims} 条争议或待核实主张` : "未读取到争议主张"}</span>
+        <span>${failedTasks ? `${failedTasks} 个处理失败` : "处理队列无失败"}</span>
+        <span>${sourceFailures ? `${sourceFailures} 个监测来源异常` : "已关联监测来源无已知异常"}</span>
+      </div>
+      <div class="situation-actions"><button class="text-btn" type="button" data-investigation-action="claims">核对主张与证据</button><button class="text-btn" type="button" data-investigation-action="review">处理待审与失败</button></div>
+    </section>`;
 }
 
 function renderInvestigationToday(investigation) {
@@ -1051,6 +1455,7 @@ function renderInvestigationToday(investigation) {
     <div class="investigation-today-grid">
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>优先处理</h3><p>失败与待审核优先，随后显示实际处理进度</p></div><span class="count-badge warning">${active.length}</span></div>${renderTaskRows(active)}</section>
       <aside class="investigation-rail">
+        ${renderSituationAssessment(investigation)}
         <div class="workbench-surface"><div class="workbench-surface-head"><div><h3>采集覆盖</h3><p>当前专题的固定网页</p></div></div><div class="workbench-surface-body"><p class="muted">${targetsForInvestigation(investigation).length} 个已关联监测来源。${state.collectionSummary ? "全局监测服务已连接。" : "监测摘要暂不可用。"}</p><button class="btn btn-ghost" type="button" data-investigation-action="monitoring">查看来源状态</button></div></div>
         ${renderMiniMap(investigation)}
       </aside>
@@ -1094,23 +1499,51 @@ function renderInvestigationEvents(investigation) {
     </div>`;
 }
 
-async function loadInvestigationEvidence(investigation) {
+function invalidateInvestigationEvidence(eventIds) {
+  eventIds.forEach((eventId) => {
+    state.investigationEventRequestTokens.set(eventId, (state.investigationEventRequestTokens.get(eventId) || 0) + 1);
+    state.investigationEventDetails.delete(eventId);
+    state.investigationEventErrors.delete(eventId);
+  });
+}
+
+async function loadInvestigationEvidence(investigation, { force = false } = {}) {
   const events = eventsForInvestigation(investigation);
+  if (force) invalidateInvestigationEvidence(events.map((event) => event.id));
   const missing = events.filter((event) => !state.investigationEventDetails.has(event.id));
   if (!missing.length) {
     if (state.activeInvestigationTab === "claims") renderInvestigationPage();
     return;
   }
-  $("#investigation-panel").innerHTML = '<div class="investigation-empty"><strong>正在读取已确认主张与固定证据快照…</strong></div>';
-  const results = await Promise.allSettled(missing.slice(0, 20).map((event) => api(`/pldr-api/v1/events/${encodeURIComponent(event.id)}`)));
-  results.forEach((result) => { if (result.status === "fulfilled") state.investigationEventDetails.set(result.value.id, result.value); });
-  if (state.activeInvestigationId === investigation.id && state.activeInvestigationTab === "claims") renderInvestigationPage();
+  if (state.activeInvestigationTab === "claims") $("#investigation-panel").innerHTML = '<div class="investigation-empty"><strong>正在读取已确认主张与固定证据快照…</strong></div>';
+  for (let offset = 0; offset < missing.length; offset += 20) {
+    const batch = missing.slice(offset, offset + 20);
+    const requests = batch.map((event) => {
+      const token = (state.investigationEventRequestTokens.get(event.id) || 0) + 1;
+      state.investigationEventRequestTokens.set(event.id, token);
+      return { event, token };
+    });
+    const results = await Promise.allSettled(requests.map(({ event }) => api(`/pldr-api/v1/events/${encodeURIComponent(event.id)}`)));
+    results.forEach((result, index) => {
+      const { event, token } = requests[index];
+      const eventId = event.id;
+      if (state.investigationEventRequestTokens.get(eventId) !== token) return;
+      if (result.status === "fulfilled") {
+        state.investigationEventDetails.set(eventId, result.value);
+        state.investigationEventErrors.delete(eventId);
+      } else {
+        state.investigationEventErrors.set(eventId, result.reason);
+      }
+    });
+  }
+  if (state.activeInvestigationId === investigation.id && ["today", "claims"].includes(state.activeInvestigationTab)) renderInvestigationPage();
 }
 
 function renderInvestigationClaims(investigation) {
   const events = eventsForInvestigation(investigation);
   const details = events.map((event) => state.investigationEventDetails.get(event.id)).filter(Boolean);
-  if (events.length && details.length < events.length) {
+  const detailErrors = events.filter((event) => state.investigationEventErrors.has(event.id));
+  if (events.length && details.length < events.length && !detailErrors.length) {
     return '<div class="investigation-empty"><strong>正在读取已确认主张与证据…</strong><p>只读取正式事件接口，不会把候选补成证据。</p></div>';
   }
   const claims = details.flatMap((event) => (event.claims || []).map((claim) => ({ event, claim })));
@@ -1121,7 +1554,7 @@ function renderInvestigationClaims(investigation) {
         <h3>${escapeHtml(claim.text)}</h3>
         ${(claim.evidence || []).map((evidence) => `<blockquote>${escapeHtml(evidence.snippet)}<footer><span>${escapeHtml(evidence.document?.source?.name || "来源未知")} · ${formatDate(evidence.document?.published_at)}</span><a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document?.snapshot_url, event.id))}" target="_blank" rel="noopener">打开固定快照 ↗</a></footer></blockquote>`).join("") || '<p class="muted">该主张尚未连接原文证据。</p>'}
         <footer><span>事件：${escapeHtml(event.title)}</span><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">打开事件档案</button></footer>
-      </article>`).join("") : '<div class="investigation-empty"><strong>该专题还没有已确认主张</strong><p>候选不会提前出现在这里。</p></div>'}</div>`;
+      </article>`).join("") : detailErrors.length ? '<div class="investigation-empty"><strong>部分正式事件详情读取失败</strong><p>没有用候选补齐主张与证据；请按上方错误提示重试。</p></div>' : '<div class="investigation-empty"><strong>该专题还没有已确认主张</strong><p>候选不会提前出现在这里。</p></div>'}</div>`;
 }
 
 function reportsForInvestigation(investigation) {
@@ -1336,13 +1769,18 @@ async function handleInvestigationAction(action, node) {
   if (action === "search") return openExternalSearchModal(investigation?.id);
   if (action === "import") return openImportModal(investigation?.id);
   if (action === "review") return setInvestigationTab("review");
+  if (action === "claims") return setInvestigationTab("claims");
   if (action === "monitoring") return setInvestigationTab("monitoring");
   if (action === "classic") return showClassicWorkspace();
-  if (action === "open-intake") return openIntakeModal();
+  if (action === "open-intake") return openIntakeModal(null, false, isServerInvestigation(investigation) ? investigation.id : null);
   if (action === "refresh") {
     await refreshData({ keepSelection: true, quiet: true });
     await refreshInvestigationDirectory();
     if (investigation) await loadInvestigationWorkspace(investigation.id, { quiet: true });
+    const refreshedInvestigation = activeInvestigation();
+    if (refreshedInvestigation && ["today", "claims"].includes(state.activeInvestigationTab)) {
+      await loadInvestigationEvidence(refreshedInvestigation, { force: true });
+    }
     toast("专题数据已刷新。", "success");
     return;
   }
@@ -1358,16 +1796,25 @@ async function handleInvestigationAction(action, node) {
   }
   if (["open-review", "accept-entry", "reject-entry"].includes(action)) {
     const intakeId = node.dataset.intakeId;
-    await openIntakeModal(intakeId);
+    await openIntakeModal(intakeId, false, isServerInvestigation(investigation) ? investigation.id : null);
     if (action === "accept-entry") toast("请核对或编辑候选，预览影响后再确认入档。", "info", 6000);
     if (action === "reject-entry") toast("请在审核页填写驳回原因后执行驳回。", "info", 6000);
     return;
   }
   if (action === "retry-task") return retryInvestigationTask(node.dataset.taskId);
   if (action === "retry-intake") {
-    state.selectedIntakeId = node.dataset.intakeId;
-    await handleIntakeAction("regenerate");
-    if (investigation) await loadInvestigationWorkspace(investigation.id, { quiet: true });
+    const intakeId = node.dataset.intakeId;
+    if (!intakeId) {
+      toast("任务缺少材料编号，无法重新生成候选。", "error", 7000);
+      return;
+    }
+    try {
+      await api(`/pldr-api/v1/intake/${encodeURIComponent(intakeId)}/regenerate`, { method: "POST" });
+      toast("候选已重新生成。", "success");
+      if (investigation) await loadInvestigationWorkspace(investigation.id, { quiet: true });
+    } catch (error) {
+      toast(`候选重新生成失败：${error.message || "未知错误"}`, "error", 7000);
+    }
     return;
   }
   if (action === "retry-search") {
@@ -1671,7 +2118,15 @@ function renderDrawer() {
   const root = $("#drawer-content");
   const event = state.selectedEvent;
   if (!event) {
-    root.innerHTML = '<div class="drawer-loading">正在加载事件档案…</div>';
+    const card = state.events.find((item) => item.id === state.selectedId);
+    $("#drawer-title").textContent = card?.title || "事件档案";
+    $("#drawer-summary").innerHTML = `<p>${state.selectedEventError ? "事件详情读取失败，未显示上一个事件的数据。" : "正在读取这个事件的正式档案…"}</p>`;
+    root.innerHTML = state.selectedEventError
+      ? renderOperationalError(state.selectedEventError, {
+        stage: "fetch",
+        actionHtml: '<button class="btn btn-ghost" type="button" data-retry-selected-event>重新读取事件档案</button>',
+      })
+      : '<div class="drawer-loading">正在加载事件档案…</div>';
     return;
   }
   renderDrawerSummary(event);
@@ -1817,7 +2272,9 @@ function closeDrawer() {
 
 async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = true } = {}) {
   if (!eventId) return;
+  const requestSerial = ++state.selectedEventRequestSerial;
   state.selectedId = eventId;
+  state.selectedEventError = null;
   renderEvents();
   renderMap();
   renderTimeline();
@@ -1830,7 +2287,7 @@ async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = 
 
   try {
     const event = await api(`/pldr-api/v1/events/${encodeURIComponent(eventId)}`);
-    if (state.selectedId !== eventId) return;
+    if (requestSerial !== state.selectedEventRequestSerial || state.selectedId !== eventId) return;
     state.selectedEvent = event;
     renderAssessment();
     renderGaps();
@@ -1841,6 +2298,10 @@ async function selectEvent(eventId, { open = false, tab = "overview", syncUrl = 
       history.replaceState(null, "", url);
     }
   } catch (error) {
+    if (requestSerial !== state.selectedEventRequestSerial || state.selectedId !== eventId) return;
+    state.selectedEvent = null;
+    state.selectedEventError = error;
+    if (open || $("#event-drawer").classList.contains("open")) renderDrawer();
     toast(`事件加载失败：${error.message}`, "error");
   }
 }
@@ -1911,19 +2372,47 @@ function setImportMode(mode) {
   $("#import-source").required = isTextMode || isFileMode;
 }
 
-function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId) {
+async function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId) {
   const modal = $("#search-modal");
   renderDestinationPickers(preferredInvestigationId);
-  if (typeof modal.showModal === "function") modal.showModal();
-  else modal.setAttribute("open", "");
+  if (typeof modal.showModal === "function" && !modal.open) modal.showModal();
+  else if (!modal.open) modal.setAttribute("open", "");
   renderSearchProvider();
+  const destinationId = currentSearchDestinationId();
+  switchSearchWorkspaceContext(destinationId);
+  renderSearchHistory();
+  renderSearchResults();
+  updateSearchSelectionCount();
+  await loadSearchHistory(destinationId);
   $("#search-keyword").focus();
 }
 
 function closeExternalSearchModal() {
   const modal = $("#search-modal");
+  const runId = currentSearchRunId();
+  if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
   if (typeof modal.close === "function") modal.close();
   else modal.removeAttribute("open");
+}
+
+function detectSearchLanguage(keyword) {
+  if (/\p{Script=Han}/u.test(keyword)) return "zh";
+  if (/\p{Script=Arabic}/u.test(keyword)) return "ar";
+  return "en";
+}
+
+function searchLanguageLabel(language) {
+  return ({ zh: "中文", en: "英语", ar: "阿拉伯语", fr: "法语" })[language] || language || "未知";
+}
+
+function selectedSearchLanguage(keyword = $("#search-keyword")?.value.trim() || "") {
+  const selected = $("#search-language")?.value || "auto";
+  const language = selected === "auto" ? detectSearchLanguage(keyword) : selected;
+  const note = $("#search-language-note");
+  if (note) note.textContent = selected === "auto"
+    ? `已自动识别为${searchLanguageLabel(language)}；如不准确可手动修改。`
+    : `已手动指定为${searchLanguageLabel(language)}。`;
+  return language;
 }
 
 function renderSearchProvider() {
@@ -1932,11 +2421,261 @@ function renderSearchProvider() {
   if (!summary) return;
   summary.className = `search-provider-summary ${search.configured ? "ok" : "warning"}`;
   summary.innerHTML = `
-    <strong>${escapeHtml(search.component || search.provider || "外部检索后端")}</strong>
-    <span>${escapeHtml(search.version || "版本未知")} · ${escapeHtml(search.license || "许可证未知")}</span>
-    <small>${escapeHtml(search.deployment_boundary || "部署边界未知")}</small>
-    ${search.configured ? "" : `<em>${escapeHtml(search.error || "尚未配置；不会用演示数据伪装结果。")}</em>`}
-  `;
+    <details>
+      <summary><strong>${escapeHtml(search.component || search.provider || "外部检索后端")}</strong><span>${search.configured ? "已连接" : "未配置"}</span></summary>
+      <div class="search-provider-detail">
+        <span>${escapeHtml(search.version || "版本未知")} · ${escapeHtml(search.license || "许可证未知")}</span>
+        <small>${escapeHtml(search.deployment_boundary || "部署边界未知")}</small>
+        ${search.configured ? "" : `<em>${escapeHtml(search.error || "尚未配置；不会用演示数据伪装结果。")}</em>`}
+      </div>
+    </details>`;
+}
+
+function currentSearchRunId(payload = state.searchRun) {
+  return payload?.query_run_id || payload?.run?.query_run_id || payload?.id || payload?.run?.id || null;
+}
+
+function currentSearchDestinationId() {
+  const raw = $("#search-destination")?.value;
+  return raw === UNASSIGNED_VALUE ? unclassifiedInvestigation()?.id : raw || null;
+}
+
+function switchSearchWorkspaceContext(destinationId) {
+  if (destinationId === state.searchHistoryInvestigationId) return;
+  const previousContext = state.searchHistoryInvestigationId || state.searchRun?.investigation_id || null;
+  if (previousContext && previousContext !== destinationId) {
+    const runId = currentSearchRunId();
+    if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
+    state.searchRun = null;
+    state.searchResults = [];
+    state.searchCurrentPageIds = [];
+    state.searchSelectedIds = new Set();
+    state.searchPage = 1;
+    state.searchHasMore = false;
+    state.searchNextPage = null;
+    state.searchNextCursor = null;
+    state.searchLastRequest = null;
+    state.searchError = "";
+    state.searchErrorInfo = null;
+    state.searchErrorSource = null;
+    const status = $("#search-status");
+    if (status) {
+      status.className = "search-status";
+      status.textContent = "输入关键词后开始检索；每次默认加载 20 条。";
+    }
+  }
+  state.searchHistory = [];
+  state.searchHistoryError = "";
+  state.searchHistoryInvestigationId = destinationId || null;
+  state.searchHistoryRequestSerial += 1;
+  state.searchRequestSerial += 1;
+  state.searchHistoryBusy = false;
+  state.searchBusy = false;
+  if ($("#search-destination")) $("#search-destination").disabled = false;
+  const submit = $("#search-submit");
+  if (submit) {
+    submit.disabled = false;
+    submit.textContent = "开始搜索";
+  }
+  renderSearchResultSummary();
+  updateSearchSelectionCount();
+}
+
+function beginSearchRequest() {
+  return {
+    serial: ++state.searchRequestSerial,
+    destinationId: currentSearchDestinationId(),
+  };
+}
+
+function searchRequestIsCurrent(requestContext) {
+  return requestContext.serial === state.searchRequestSerial
+    && requestContext.destinationId === currentSearchDestinationId();
+}
+
+function normalizeSearchRun(raw) {
+  const run = raw?.run && typeof raw.run === "object" ? { ...raw, ...raw.run } : raw || {};
+  return {
+    ...run,
+    id: run.query_run_id || run.id,
+    query_run_id: run.query_run_id || run.id,
+    keyword: run.keyword || run.query || "未知关键词",
+    scope: run.scope || "web",
+    language: run.language || "",
+    created_at: run.created_at || run.started_at || run.executed_at || run.updated_at,
+    returned_count: run.returned_count ?? run.loaded_count ?? run.results?.length ?? run.items?.length ?? run.result_count ?? 0,
+  };
+}
+
+function upsertSearchHistory(raw) {
+  const run = normalizeSearchRun(raw);
+  if (!run.id) return;
+  state.searchHistory = [run, ...state.searchHistory.filter((item) => item.id !== run.id)]
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+    .slice(0, 20);
+  renderSearchHistory();
+}
+
+function renderSearchHistory() {
+  const root = $("#search-history");
+  if (!root) return;
+  if (state.searchHistoryBusy && !state.searchHistory.length) {
+    root.innerHTML = '<p class="search-history-empty">正在读取查询记录…</p>';
+    return;
+  }
+  const currentId = currentSearchRunId();
+  const errorMarkup = state.searchHistoryError
+    ? `<div class="search-history-error" role="alert"><span>查询记录读取失败：${escapeHtml(state.searchHistoryError)}</span><button class="text-btn" type="button" data-search-history-retry>重试</button></div>`
+    : "";
+  const historyMarkup = state.searchHistory.length ? state.searchHistory.map((raw) => {
+    const run = normalizeSearchRun(raw);
+    return `
+      <button class="search-history-item ${run.id === currentId ? "active" : ""}" type="button" data-search-history-run="${escapeHtml(run.id)}">
+        <span class="search-history-topline"><strong>${escapeHtml(run.keyword)}</strong><time>${formatDate(run.created_at, true)}</time></span>
+        <span>${escapeHtml(LABELS.searchScope[run.scope] || run.scope)} · ${run.language ? escapeHtml(searchLanguageLabel(run.language)) : "语言未知"}</span>
+        <small>已加载 ${Number(run.loaded_count ?? run.returned_count ?? 0)} 条${run.status === "failed" || run.error ? " · 查询失败" : ""}</small>
+      </button>`;
+  }).join("") : `<p class="search-history-empty">${state.searchHistoryAvailable ? "还没有查询记录。完成一次搜索后可从这里重新打开。" : "当前后端未提供历史接口；本次页面中的查询仍会保留。"}</p>`;
+  root.innerHTML = errorMarkup + historyMarkup;
+}
+
+async function loadSearchHistory(investigationId = state.activeInvestigationId) {
+  if (!state.searchHistoryAvailable) return;
+  const rawDestinationId = investigationId || $("#search-destination")?.value;
+  const destinationId = rawDestinationId === UNASSIGNED_VALUE ? unclassifiedInvestigation()?.id : rawDestinationId;
+  const destination = state.investigations.find((item) => item.id === destinationId);
+  if (!destinationId || destinationId === NEW_INVESTIGATION_VALUE || (destination && !isServerInvestigation(destination))) return;
+  switchSearchWorkspaceContext(destinationId);
+  const requestSerial = ++state.searchHistoryRequestSerial;
+  state.searchHistoryBusy = true;
+  state.searchHistoryError = "";
+  renderSearchHistory();
+  try {
+    const params = new URLSearchParams({ limit: "12" });
+    params.set("investigation_id", destinationId);
+    const payload = await api(`${API_ROUTES.searchRuns}?${params}`);
+    if (requestSerial !== state.searchHistoryRequestSerial || destinationId !== state.searchHistoryInvestigationId) return;
+    const runs = unwrapItems(payload, "runs", "items").map(normalizeSearchRun);
+    const current = currentSearchRunId()
+      && state.searchRun?.investigation_id === destinationId
+      ? [normalizeSearchRun(state.searchRun)]
+      : [];
+    const byId = new Map([...current, ...runs, ...state.searchHistory].filter((run) => run.id).map((run) => [run.id, run]));
+    state.searchHistory = [...byId.values()].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)).slice(0, 20);
+    state.searchHistoryError = "";
+  } catch (error) {
+    if (requestSerial !== state.searchHistoryRequestSerial) return;
+    if (isUnsupportedEndpoint(error)) state.searchHistoryAvailable = false;
+    else state.searchHistoryError = error.message || "未知错误";
+  } finally {
+    if (requestSerial === state.searchHistoryRequestSerial) {
+      state.searchHistoryBusy = false;
+      renderSearchHistory();
+    }
+  }
+}
+
+function searchPayloadResults(payload) {
+  if (Array.isArray(payload?.results)) return payload.results;
+  if (Array.isArray(payload?.items)) return payload.items;
+  if (Array.isArray(payload?.run?.results)) return payload.run.results;
+  if (Array.isArray(payload?.run?.items)) return payload.run.items;
+  return [];
+}
+
+function applySearchPayload(payload, { append = false } = {}) {
+  const runIdBefore = currentSearchRunId();
+  if (runIdBefore) state.searchSelectionsByRun.set(runIdBefore, new Set(state.searchSelectedIds));
+  const combinedPayload = payload?.run && typeof payload.run === "object" ? { ...payload, ...payload.run } : payload || {};
+  const pagination = combinedPayload.pagination || {};
+  const page = Number(combinedPayload.page ?? pagination.page ?? (append ? state.searchPage + 1 : 1)) || 1;
+  const incoming = searchPayloadResults(payload).map((result) => ({ ...result, _loadedPage: page }));
+  const byId = new Map((append ? state.searchResults : []).map((result) => [result.id, result]));
+  incoming.forEach((result) => byId.set(result.id, { ...byId.get(result.id), ...result }));
+  state.searchResults = [...byId.values()];
+  state.searchPage = page;
+  state.searchPageSize = Number(combinedPayload.page_size ?? pagination.page_size ?? $("#search-page-size")?.value ?? 20) || 20;
+  if ($("#search-page-size") && [...$("#search-page-size").options].some((option) => Number(option.value) === state.searchPageSize)) {
+    $("#search-page-size").value = String(state.searchPageSize);
+  }
+  const fullRunPayload = incoming.length > state.searchPageSize
+    && Number(combinedPayload.loaded_count || incoming.length) === incoming.length;
+  const providerPageResults = incoming.filter((result) => Number(result.source_page) === page);
+  const currentPageResults = providerPageResults.length
+    ? providerPageResults
+    : fullRunPayload
+      ? incoming.slice(Math.max(0, (page - 1) * state.searchPageSize), page * state.searchPageSize)
+      : incoming;
+  state.searchCurrentPageIds = currentPageResults.map((result) => result.id);
+  state.searchHasMore = Boolean(combinedPayload.has_more ?? pagination.has_more ?? false);
+  state.searchNextPage = combinedPayload.next_page ?? pagination.next_page ?? (state.searchHasMore ? page + 1 : null);
+  state.searchNextCursor = combinedPayload.next_cursor ?? pagination.next_cursor ?? null;
+  state.searchRun = { ...(append ? state.searchRun : {}), ...combinedPayload, results: state.searchResults };
+  state.searchLastRequest = {
+    keyword: combinedPayload.keyword || state.searchLastRequest?.keyword || $("#search-keyword")?.value.trim(),
+    scope: combinedPayload.scope || state.searchLastRequest?.scope || $("#search-scope")?.value || "web",
+    language: combinedPayload.language || state.searchLastRequest?.language || selectedSearchLanguage(),
+    limit: state.searchPageSize,
+    page_size: state.searchPageSize,
+    ...(combinedPayload.investigation_id ? { investigation_id: combinedPayload.investigation_id } : {}),
+  };
+  const runId = currentSearchRunId();
+  state.searchSelectedIds = new Set(runId ? state.searchSelectionsByRun.get(runId) || [] : []);
+  state.searchError = "";
+  state.searchErrorInfo = null;
+  state.searchErrorSource = null;
+  if (combinedPayload.keyword) $("#search-keyword").value = combinedPayload.keyword;
+  if (combinedPayload.scope && $("#search-scope")) $("#search-scope").value = combinedPayload.scope;
+  if (combinedPayload.language && $("#search-language-note")) {
+    const mode = $("#search-language")?.value || "auto";
+    $("#search-language-note").textContent = `本次运行使用${searchLanguageLabel(combinedPayload.language)}；${mode === "auto" ? "下一次查询仍会按新关键词自动识别" : "下一次查询仍使用当前手动语言设置"}。`;
+  }
+  if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
+  upsertSearchHistory({ ...combinedPayload, id: runId, loaded_count: state.searchResults.length });
+  renderSearchResults();
+}
+
+async function openSearchHistoryRun(runId) {
+  if (!runId || state.searchBusy) return;
+  const requestContext = beginSearchRequest();
+  const currentId = currentSearchRunId();
+  if (currentId) state.searchSelectionsByRun.set(currentId, new Set(state.searchSelectedIds));
+  state.searchBusy = true;
+  renderSearchBusyState("正在重新打开查询运行…");
+  try {
+    let payload;
+    if (runId === currentId && state.searchResults.length) payload = state.searchRun;
+    else {
+      const rawDestinationId = $("#search-destination")?.value;
+      const destinationId = rawDestinationId === UNASSIGNED_VALUE ? unclassifiedInvestigation()?.id : rawDestinationId;
+      const query = destinationId && destinationId !== NEW_INVESTIGATION_VALUE
+        ? `?investigation_id=${encodeURIComponent(destinationId)}`
+        : "";
+      payload = await api(`${API_ROUTES.searchRun(runId)}${query}`);
+    }
+    if (!searchRequestIsCurrent(requestContext)) return;
+    applySearchPayload(payload, { append: false });
+    const run = normalizeSearchRun(payload);
+    state.searchSelectedIds = new Set(state.searchSelectionsByRun.get(run.id) || []);
+    renderSearchResults();
+    if (["failed", "partial_failure"].includes(run.status) || run.error_detail || run.structured_error) {
+      showSearchError(run.error_detail || run.structured_error || run.error, "query");
+    } else {
+      setSearchCompletionStatus(payload, "已重新打开查询");
+    }
+  } catch (error) {
+    if (!searchRequestIsCurrent(requestContext)) return;
+    showSearchError(error, "query");
+  } finally {
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      $("#search-submit").disabled = false;
+      $("#search-submit").textContent = "开始搜索";
+      renderSearchResultSummary();
+      updateSearchSelectionCount();
+    }
+  }
 }
 
 function searchResultLinkedToDestination(result) {
@@ -1958,52 +2697,242 @@ function searchResultLinkedToDestination(result) {
 function searchSelectionLabel(result, linked = searchResultLinkedToDestination(result)) {
   const selection = result.selection;
   if (linked) return "已在当前专题";
-  if (!selection) return "选择";
+  if (!selection) return "选择这条线索";
   const status = LABELS.intakeStatus[selection.intake_status || selection.status] || selection.status;
-  if (selection.intake_status === "failed") return `${status} · 可关联后重试`;
+  if (selection.intake_status === "failed") {
+    return selection.retryable === false ? `${status} · 需更换来源或检查配置` : `${status} · 可重试`;
+  }
   return `采集箱已有 · ${status || "可复用"}`;
+}
+
+function visibleSearchResults() {
+  const query = $("#search-result-filter")?.value.trim().toLocaleLowerCase() || "";
+  const status = $("#search-result-state")?.value || "all";
+  return state.searchResults.filter((result) => {
+    const linked = searchResultLinkedToDestination(result);
+    const selected = state.searchSelectedIds.has(result.id);
+    const failed = Boolean(result.selection?.last_error || result.selection?.error || result.selection?.intake_status === "failed");
+    if (status === "available" && (linked || result.selection && !failed)) return false;
+    if (status === "selected" && !selected) return false;
+    if (status === "failed" && !failed) return false;
+    if (!query) return true;
+    return [result.title, result.snippet, result.site, result.channel, result.provider, result.original_url]
+      .filter(Boolean).join(" ").toLocaleLowerCase().includes(query);
+  });
+}
+
+function searchClueCompleteness(result) {
+  const fields = [result.title, result.snippet, result.published_at].filter(Boolean).length;
+  return `${fields}/3 个线索字段`;
 }
 
 function renderSearchResults() {
   const root = $("#search-results");
   if (!root) return;
-  const checkedIds = new Set($$("input[type='checkbox']:checked", root).map((input) => input.value));
-  root.innerHTML = state.searchResults.length ? state.searchResults.map((result) => {
+  const visible = visibleSearchResults();
+  $("#search-result-tools").hidden = state.searchResults.length === 0;
+  root.innerHTML = visible.length ? visible.map((result) => {
     const linked = searchResultLinkedToDestination(result);
+    const checked = state.searchSelectedIds.has(result.id);
+    const selectionError = result.selection?.error || result.selection?.last_error;
+    const selectionStage = selectionError ? normalizeOperationalError(selectionError, "fetch").stage : "fetch";
+    const retryAction = result.selection?.retryable
+      ? `<button class="btn btn-ghost warning" type="button" data-search-retry="${escapeHtml(result.id)}">${selectionStage === "generate" ? "只重试 AI 候选" : "重试抓取原始页"}</button>`
+      : "";
     return `
     <article class="search-result ${linked ? "selected" : result.selection ? "existing" : ""}" role="listitem">
       <label class="search-select">
-        <input type="checkbox" value="${escapeHtml(result.id)}" ${linked ? "disabled" : checkedIds.has(result.id) ? "checked" : ""}>
+        <input type="checkbox" value="${escapeHtml(result.id)}" ${linked ? "disabled" : checked ? "checked" : ""}>
         <span>${escapeHtml(searchSelectionLabel(result, linked))}</span>
       </label>
       <div class="search-result-body">
         <div class="search-result-meta">
-          <span>#${result.rank || "-"}</span>
+          <span>检索排名 #${result.rank || "-"}</span>
           <span>${escapeHtml(result.site || "未知站点")}</span>
           <span>${escapeHtml(result.channel || result.provider || "未知渠道")}</span>
           <span>${formatDate(result.published_at, true)}</span>
+          <span class="clue-completeness">${searchClueCompleteness(result)} · 不是可信度</span>
         </div>
         <h3>${escapeHtml(result.title || "无标题")}</h3>
         ${result.snippet ? `<p>${escapeHtml(result.snippet)}</p>` : '<p class="muted">检索后端未返回摘要。</p>'}
         <a href="${escapeHtml(result.original_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(result.original_url)}</a>
-        <div class="search-result-footer">
-          <small>查询运行：${escapeHtml(result.query_run_id || "未知")} · 结果：${escapeHtml(result.id || "未知")}</small>
-          ${result.selection?.retryable ? `<button class="btn btn-ghost warning" type="button" data-search-retry="${escapeHtml(result.id)}">重试抓取</button>` : ""}
-        </div>
-        ${result.selection?.last_error ? `<p class="validation-error">${escapeHtml(result.selection.last_error)}</p>` : ""}
+        ${selectionError ? renderOperationalError({ ...(typeof selectionError === "object" ? selectionError : { message: selectionError }), retryable: result.selection?.retryable }, { stage: result.selection?.error_stage || "fetch", compact: true, actionHtml: retryAction }) : ""}
+        <details class="search-result-technical">
+          <summary>查询追踪</summary>
+          <div class="search-result-footer">
+            <small>查询运行：${escapeHtml(result.query_run_id || currentSearchRunId() || "未知")} · 结果：${escapeHtml(result.id || "未知")}</small>
+          </div>
+        </details>
       </div>
-    </article>
-  `; }).join("") : '<div class="search-empty">没有匹配结果。PLDR 不会用演示数据填充空结果。</div>';
-  $$("input[type='checkbox']", root).forEach((input) => input.addEventListener("change", updateSearchSelectionCount));
+    </article>`;
+  }).join("") : state.searchResults.length
+    ? '<div class="search-empty">已加载结果中没有符合当前筛选条件的条目。</div>'
+    : '<div class="search-empty">没有匹配结果。PLDR 不会用演示数据填充空结果。</div>';
+  $$("input[type='checkbox']", root).forEach((input) => input.addEventListener("change", () => {
+    if (input.checked) state.searchSelectedIds.add(input.value);
+    else state.searchSelectedIds.delete(input.value);
+    const runId = currentSearchRunId();
+    if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
+    if (!input.checked && $("#search-result-state")?.value === "selected") {
+      renderSearchResults();
+      return;
+    }
+    updateSearchSelectionCount();
+  }));
+  renderSearchResultSummary();
   updateSearchSelectionCount();
 }
 
+function renderSearchResultSummary() {
+  const loaded = state.searchResults.length;
+  const run = state.searchRun || {};
+  const totalKnown = Boolean(run.total_known ?? run.pagination?.total_known);
+  const total = run.available_count ?? run.total_estimate ?? run.pagination?.available_count ?? null;
+  const maxLoaded = Number(run.max_loaded_results ?? run.pagination?.max_loaded_results ?? 0);
+  const reachedCap = maxLoaded > 0 && loaded >= maxLoaded;
+  $("#search-loaded-count").textContent = `已加载 ${loaded} 条`;
+  $("#search-run-summary").textContent = totalKnown && total != null
+    ? `服务端确认共有 ${Number(total)} 条可用结果`
+    : "全网总数未知；这里只统计已经加载的结果";
+  const row = $("#search-load-more-row");
+  row.hidden = (!state.searchHasMore && !reachedCap) || !loaded;
+  $("#search-load-more").disabled = state.searchBusy || !state.searchHasMore;
+  $("#search-load-more").textContent = state.searchHasMore ? "继续加载下一页" : `已达 ${maxLoaded} 条上限`;
+  $("#search-load-more-note").textContent = reachedCap
+    ? `本次查询最多保留 ${maxLoaded} 条；如需更多结果，请细化关键词后重新查询。`
+    : state.searchHasMore
+    ? `当前查询按每页 ${state.searchPageSize} 条继续；下一页会加入现有 ${loaded} 条，已有选择不会丢失。`
+    : "当前查询没有更多可加载页面。";
+}
+
+function selectableSearchIds(ids) {
+  const idSet = new Set(ids);
+  return state.searchResults.filter((result) => idSet.has(result.id) && !searchResultLinkedToDestination(result)).map((result) => result.id);
+}
+
+function selectSearchResults(ids) {
+  const next = new Set(state.searchSelectedIds);
+  const available = selectableSearchIds(ids);
+  const remaining = Math.max(0, 100 - next.size);
+  available.slice(0, remaining).forEach((id) => next.add(id));
+  state.searchSelectedIds = next;
+  const runId = currentSearchRunId();
+  if (runId) state.searchSelectionsByRun.set(runId, new Set(next));
+  renderSearchResults();
+  if (available.length > remaining) toast("单批最多处理 100 条；已选择前 100 条，其余保留在结果中。", "info", 6500);
+}
+
+function selectVisibleSearchPage() {
+  const currentPageIds = new Set(state.searchCurrentPageIds);
+  const visibleIds = visibleSearchResults()
+    .filter((result) => currentPageIds.has(result.id))
+    .map((result) => result.id);
+  selectSearchResults(visibleIds);
+}
+
+function clearSearchSelection() {
+  state.searchSelectedIds.clear();
+  const runId = currentSearchRunId();
+  if (runId) state.searchSelectionsByRun.set(runId, new Set());
+  renderSearchResults();
+}
+
 function updateSearchSelectionCount() {
-  const selected = $$("#search-results input[type='checkbox']:checked");
-  $("#search-select").disabled = state.searchBusy || selected.length === 0;
+  const loadedIds = new Set(state.searchResults.map((result) => result.id));
+  const selected = [...state.searchSelectedIds].filter((id) => loadedIds.has(id));
+  const button = $("#search-select");
+  button.disabled = state.searchBusy || selected.length === 0;
+  button.textContent = selected.length ? `处理已选 ${selected.length} 条` : "加入专题并开始处理";
   $("#search-selection-count").textContent = selected.length
-    ? `已选择 ${selected.length} / ${state.searchResults.length} 个结果`
-    : `共 ${state.searchResults.length} 个结果，未选择`;
+    ? `已选择 ${selected.length} 条 · 已加载 ${state.searchResults.length} 条`
+    : `已加载 ${state.searchResults.length} 条，未选择`;
+}
+
+function renderSearchBusyState(message) {
+  $("#search-status").className = "search-status busy";
+  $("#search-status").innerHTML = `<span class="status-spinner" aria-hidden="true"></span><strong>${escapeHtml(message)}</strong><span>已有结果与选择会保留。</span>`;
+  const submit = $("#search-submit");
+  submit.disabled = true;
+  submit.textContent = "搜索中…";
+  $("#search-destination").disabled = true;
+  $("#search-load-more").disabled = true;
+  updateSearchSelectionCount();
+}
+
+function setSearchCompletionStatus(payload, prefix = "检索完成") {
+  const run = payload?.run && typeof payload.run === "object" ? { ...payload, ...payload.run } : payload || {};
+  const loaded = state.searchResults.length;
+  const returned = Number(run.returned_count ?? searchPayloadResults(payload).length ?? 0);
+  const channel = run.channel || run.provider || "外部检索后端";
+  const latency = Number(run.latency_ms || 0);
+  $("#search-status").className = "search-status ok";
+  $("#search-status").innerHTML = `<strong>${escapeHtml(prefix)}</strong><span>本页返回 ${returned} 条，当前已加载 ${loaded} 条 · ${escapeHtml(channel)}${latency ? ` · ${latency} ms` : ""}</span><small>排名只表示检索顺序，不表示来源可靠性或内容真实性。</small>`;
+  renderSearchResultSummary();
+}
+
+function showSearchError(error, stage = "query") {
+  state.searchError = error?.message || objectMessage(error) || "未知错误";
+  state.searchErrorInfo = normalizeOperationalError(error, stage);
+  state.searchErrorSource = error;
+  const retryAction = stage === "query" && state.searchErrorInfo.retryable
+    ? '<button class="btn btn-ghost warning" type="button" data-search-retry-query>重试这次查询</button>'
+    : "";
+  $("#search-status").className = "search-status error";
+  $("#search-status").innerHTML = `${renderOperationalError(error, { stage, actionHtml: retryAction })}<small>本次没有用假数据补齐，未生成演示结果。</small>`;
+  renderSearchResultSummary();
+}
+
+function revealSearchError(message) {
+  toast(message, "error", 7500);
+  const status = $("#search-status");
+  if (!status) return;
+  status.setAttribute("tabindex", "-1");
+  status.scrollIntoView({ behavior: "smooth", block: "center" });
+  status.focus({ preventScroll: true });
+}
+
+async function retryCurrentSearchQuery() {
+  if (state.searchBusy) return;
+  const requestContext = beginSearchRequest();
+  const source = state.searchErrorSource?.payload?.detail || state.searchErrorSource || state.searchRun?.error_detail || {};
+  const runId = source.query_run_id || currentSearchRunId();
+  if (!state.searchLastRequest) {
+    toast("缺少可恢复的查询上下文，请重新输入关键词发起查询。", "error", 6200);
+    return;
+  }
+  const attemptedPage = runId
+    ? Number(source.attempted_page || (state.searchRun?.status === "partial_failure" ? state.searchPage + 1 : state.searchPage || 1))
+    : 1;
+  const request = {
+    ...state.searchLastRequest,
+    page: attemptedPage,
+    ...(runId ? { query_run_id: runId } : {}),
+    ...(attemptedPage > 1 ? { pageno: attemptedPage, cursor: String(attemptedPage) } : {}),
+  };
+  state.searchBusy = true;
+  renderSearchBusyState("正在重试原查询…");
+  try {
+    const payload = await api(API_ROUTES.search, { method: "POST", body: JSON.stringify(request) });
+    if (!searchRequestIsCurrent(requestContext)) return;
+    state.searchLastRequest = request;
+    applySearchPayload(payload, { append: attemptedPage > 1 });
+    setSearchCompletionStatus(payload, "查询重试成功");
+    await loadSearchHistory(currentSearchDestinationId()).catch(() => null);
+  } catch (error) {
+    if (!searchRequestIsCurrent(requestContext)) return;
+    showSearchError(error, "query");
+    revealSearchError(`查询重试失败：${error.message || "请查看诊断详情"}`);
+    await loadSearchHistory(currentSearchDestinationId()).catch(() => null);
+  } finally {
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      $("#search-submit").disabled = false;
+      $("#search-submit").textContent = "开始搜索";
+      renderSearchResultSummary();
+      updateSearchSelectionCount();
+    }
+  }
 }
 
 async function submitExternalSearch(event) {
@@ -2011,70 +2940,126 @@ async function submitExternalSearch(event) {
   if (state.searchBusy) return;
   const keyword = $("#search-keyword").value.trim();
   if (keyword.length < 2) {
-    $("#search-status").className = "search-status error";
-    $("#search-status").textContent = "请输入至少 2 个字符的关键词。";
+    showSearchError({ title: "关键词太短", message: "至少输入 2 个字符，系统才能发起检索。", impact: "尚未向外部服务提交请求。", next_action: "补充更具体的人、机构、地点或事件关键词。", retryable: false }, "query");
     return;
   }
+  const requestContext = beginSearchRequest();
   state.searchBusy = true;
   state.searchError = "";
-  const submit = $("#search-submit");
-  submit.disabled = true;
-  submit.textContent = "检索中";
-  $("#search-select").disabled = true;
-  $("#search-status").className = "search-status";
-  $("#search-status").textContent = "正在调用外部检索后端…";
+  state.searchErrorInfo = null;
+  renderSearchBusyState("正在搜索公开资料…");
   try {
     const destinationId = $("#search-destination").value;
     const destination = destinationId === UNASSIGNED_VALUE
       ? unclassifiedInvestigation()
       : state.investigations.find((item) => item.id === destinationId);
     const context = ["server", "system"].includes(destination?.sync_mode) ? { investigation_id: destination.id } : {};
-    const payload = await api(API_ROUTES.search, {
-      method: "POST",
-      body: JSON.stringify({
-        keyword,
-        scope: $("#search-scope").value,
-        language: $("#search-language").value,
-        limit: 10,
-        ...context,
-      }),
-    });
-    state.searchRun = payload;
-    state.searchResults = payload.results || [];
-    $("#search-status").className = "search-status ok";
-    $("#search-status").textContent = `检索完成：${state.searchResults.length} 条结果 · ${payload.channel} · ${payload.latency_ms || 0} ms`;
-    renderSearchResults();
-  } catch (error) {
-    state.searchError = error.message;
+    const language = selectedSearchLanguage(keyword);
+    const pageSize = Number($("#search-page-size").value || 20);
+    const request = {
+      keyword,
+      scope: $("#search-scope").value,
+      language,
+      limit: pageSize,
+      page_size: pageSize,
+      page: 1,
+      ...context,
+    };
+    const previousRunId = currentSearchRunId();
+    if (previousRunId) state.searchSelectionsByRun.set(previousRunId, new Set(state.searchSelectedIds));
+    state.searchRun = null;
     state.searchResults = [];
-    $("#search-status").className = "search-status error";
-    $("#search-status").textContent = `检索失败：${error.message}。未生成演示结果。`;
+    state.searchCurrentPageIds = [];
+    state.searchSelectedIds = new Set();
+    state.searchPage = 1;
+    state.searchHasMore = false;
+    state.searchNextPage = null;
+    state.searchNextCursor = null;
+    state.searchLastRequest = request;
     renderSearchResults();
+    const payload = await api(API_ROUTES.search, { method: "POST", body: JSON.stringify(request) });
+    if (!searchRequestIsCurrent(requestContext)) return;
+    applySearchPayload(payload, { append: false });
+    setSearchCompletionStatus(payload);
+    loadSearchHistory(destination?.id).catch(() => null);
+  } catch (error) {
+    if (!searchRequestIsCurrent(requestContext)) return;
+    showSearchError(error, "query");
+    revealSearchError(`搜索失败：${error.message || "请查看诊断详情"}`);
+    if (!state.searchResults.length) renderSearchResults();
+    await loadSearchHistory(currentSearchDestinationId()).catch(() => null);
   } finally {
-    state.searchBusy = false;
-    submit.disabled = false;
-    submit.textContent = "检索";
-    updateSearchSelectionCount();
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      const submit = $("#search-submit");
+      submit.disabled = false;
+      submit.textContent = "开始搜索";
+      renderSearchResultSummary();
+      updateSearchSelectionCount();
+    }
+  }
+}
+
+async function loadMoreExternalSearch() {
+  if (state.searchBusy || !state.searchHasMore || !state.searchLastRequest) return;
+  const requestContext = beginSearchRequest();
+  state.searchBusy = true;
+  renderSearchBusyState("正在加载下一页…");
+  try {
+    const request = {
+      ...state.searchLastRequest,
+      page: Number(state.searchNextPage || state.searchPage + 1),
+      pageno: Number(state.searchNextPage || state.searchPage + 1),
+      query_run_id: currentSearchRunId(),
+      ...(state.searchNextCursor ? { cursor: state.searchNextCursor } : {}),
+    };
+    const payload = await api(API_ROUTES.search, { method: "POST", body: JSON.stringify(request) });
+    if (!searchRequestIsCurrent(requestContext)) return;
+    state.searchLastRequest = request;
+    applySearchPayload(payload, { append: true });
+    setSearchCompletionStatus(payload, "下一页已加载");
+  } catch (error) {
+    if (!searchRequestIsCurrent(requestContext)) return;
+    showSearchError(error, "query");
+    revealSearchError(`下一页加载失败：${error.message || "请查看诊断详情"}`);
+  } finally {
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      $("#search-submit").disabled = false;
+      $("#search-submit").textContent = "开始搜索";
+      renderSearchResultSummary();
+      updateSearchSelectionCount();
+    }
   }
 }
 
 async function submitSelectedSearchResults() {
-  const selectedIds = $$("#search-results input[type='checkbox']:checked").map((input) => input.value);
+  const loadedIds = new Set(state.searchResults.map((result) => result.id));
+  const selectedIds = [...state.searchSelectedIds].filter((id) => loadedIds.has(id));
   if (!selectedIds.length || state.searchBusy) return;
+  if (selectedIds.length > 100) {
+    showSearchError({ title: "单批选择过多", message: `当前选择了 ${selectedIds.length} 条，单批最多处理 100 条。`, impact: "尚未提交处理任务，已有选择仍然保留。", next_action: "取消一部分选择后分批处理。", retryable: false }, "link");
+    revealSearchError("单批最多处理 100 条；请减少选择后重试。");
+    return;
+  }
   let intent;
   try {
     intent = destinationIntent("search");
   } catch (error) {
-    $("#search-status").className = "search-status error";
-    $("#search-status").textContent = error.message;
+    showSearchError(error, "link");
+    revealSearchError(`目标专题不可用：${error.message || "请重新选择"}`);
     return;
   }
+  const requestContext = beginSearchRequest();
   state.searchBusy = true;
+  $("#search-destination").disabled = true;
   const button = $("#search-select");
   button.disabled = true;
-  button.textContent = "提交处理中";
-  $("#search-status").className = "search-status";
-  $("#search-status").textContent = "正在提交逐条处理任务；搜索摘要不会进入证据链。";
+  button.textContent = "正在提交…";
+  $("#search-status").className = "search-status busy";
+  $("#search-status").innerHTML = '<strong>正在提交逐条处理任务</strong><span>搜索摘要不会进入证据链；每条资料会独立显示抓取与候选生成进度。</span>';
   let requestAccepted = false;
   try {
     const useServerContext = state.investigationMode === "server" || state.investigationMode === "error";
@@ -2088,6 +3073,7 @@ async function submitSelectedSearchResults() {
       body: JSON.stringify({ result_ids: selectedIds, request_id: makeClientId("search-request"), actor: "analyst", ...context }),
     });
     requestAccepted = true;
+    if (!searchRequestIsCurrent(requestContext)) return;
     let investigation = intent.investigation || null;
     if (intent.type === "new") {
       if (payload.investigation) {
@@ -2110,9 +3096,7 @@ async function submitSelectedSearchResults() {
       task_type: entry.task_type || "search_result_intake",
       created_at: entry.created_at || new Date().toISOString(),
     }));
-    if (investigation && taskRows.length) {
-      state.investigationTasks.set(investigation.id, [...taskRows, ...(state.investigationTasks.get(investigation.id) || [])]);
-    }
+    if (investigation && taskRows.length) state.investigationTasks.set(investigation.id, [...taskRows, ...(state.investigationTasks.get(investigation.id) || [])]);
 
     const intakeIds = responseEntries.map((entry) => entry.intake_item_id).filter(Boolean);
     let association = { linked: 0, failed: 0, mode: "server" };
@@ -2122,62 +3106,76 @@ async function submitSelectedSearchResults() {
       association = await associateInvestigationObjects(investigation, "intake", intakeIds, { origin: "external_search_legacy" });
     }
 
+    state.searchSelectedIds.clear();
+    const runId = currentSearchRunId();
+    if (runId) state.searchSelectionsByRun.set(runId, new Set());
     closeExternalSearchModal();
     renderInvestigationHome();
-    if (investigation) {
-      await openInvestigation(investigation.id, "review");
-    } else {
-      showInvestigationHome();
-    }
-    if (asynchronous) {
-      toast(`已提交 ${responseEntries.length || selectedIds.length} 条任务；正在专题中逐条显示真实进度。`, "success", 6500);
-    } else {
+    if (investigation) await openInvestigation(investigation.id, "review");
+    else showInvestigationHome();
+    if (asynchronous) toast(`已提交 ${responseEntries.length || selectedIds.length} 条任务；专题会逐条显示抓取、生成和审核进度。`, "success", 6500);
+    else {
       const updates = new Map((payload.results || []).map((entry) => [entry.result_id, entry.result]));
       state.searchResults = state.searchResults.map((result) => updates.get(result.id) || result);
       const failures = (payload.results || []).filter((entry) => entry.intake_status === "failed").length;
-      toast(failures ? `已处理 ${responseEntries.length} 项，其中 ${failures} 项抓取失败。` : `已处理 ${responseEntries.length} 项并进入人工候选流程。`, failures ? "error" : "success", 6500);
+      toast(failures ? `已处理 ${responseEntries.length} 项，其中 ${failures} 项抓取失败；可在专题中查看原因。` : `已处理 ${responseEntries.length} 项并进入人工候选流程。`, failures ? "error" : "success", 6500);
     }
     if (association.failed) toast(`材料已进入采集箱，但 ${association.failed} 条专题关联失败；没有声称关联成功。`, "error", 7500);
     await refreshIntakeData().catch(() => null);
     renderInvestigationHome();
-    if (!investigation && intakeIds[0]) await openIntakeModal(intakeIds[0]);
+    if (!investigation && intakeIds[0]) await openIntakeModal(intakeIds[0], false, null);
     if (isServerInvestigation(investigation)) await loadInvestigationWorkspace(investigation.id, { quiet: true });
   } catch (error) {
+    if (!searchRequestIsCurrent(requestContext)) return;
     if (requestAccepted) {
       closeExternalSearchModal();
       showInvestigationHome();
-      toast(`处理请求已被服务端接受，但专题关联或页面刷新失败：${error.message}。请在待处理队列核对。`, "error", 9000);
+      toast("处理请求已被服务端接受，但专题关联或页面刷新没有完成；请在待处理队列核对。", "error", 9000);
     } else {
-      $("#search-status").className = "search-status error";
-      $("#search-status").textContent = `提交处理任务失败：${error.message}。未显示排队或成功状态。`;
+      showSearchError(error, "link");
+      revealSearchError(`提交处理任务失败：${error.message || "请查看诊断详情"}`);
     }
   } finally {
-    state.searchBusy = false;
-    button.textContent = "加入专题并开始处理";
-    updateSearchSelectionCount();
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      button.textContent = "加入专题并开始处理";
+      updateSearchSelectionCount();
+    }
   }
 }
 
 async function retryExternalSearchResult(resultId) {
   if (state.searchBusy) return;
+  const requestContext = beginSearchRequest();
   state.searchBusy = true;
-  $("#search-status").className = "search-status";
-  $("#search-status").textContent = "正在重试抓取原始页面…";
+  renderSearchBusyState("正在重试抓取原始页面…");
   try {
     const payload = await api(`/pldr-api/v1/search/results/${encodeURIComponent(resultId)}/retry`, { method: "POST" });
+    if (!searchRequestIsCurrent(requestContext)) return;
     state.searchResults = state.searchResults.map((result) => (result.id === resultId ? payload.result : result));
-    $("#search-status").className = `search-status ${payload.intake_status === "failed" ? "warning" : "ok"}`;
-    $("#search-status").textContent = payload.intake_status === "failed"
-      ? `重试仍失败：${payload.error || payload.result?.selection?.last_error || "未知错误"}`
-      : "重试完成，条目仍需候选审核和人工确认。";
+    if (payload.intake_status === "failed") {
+      showSearchError(payload.error || payload.result?.selection?.last_error || "未知错误", "fetch");
+      revealSearchError("原始页面重试仍然失败；该结果已保留失败原因。 ");
+    }
+    else {
+      $("#search-status").className = "search-status ok";
+      $("#search-status").innerHTML = "<strong>原始页面重试完成</strong><span>条目仍需候选审核和人工确认，尚未自动进入正式档案。</span>";
+    }
     renderSearchResults();
     await refreshIntakeData();
   } catch (error) {
-    $("#search-status").className = "search-status error";
-    $("#search-status").textContent = `重试失败：${error.message}`;
+    if (!searchRequestIsCurrent(requestContext)) return;
+    showSearchError(error, "fetch");
+    revealSearchError(`原始页面重试失败：${error.message || "请查看诊断详情"}`);
   } finally {
-    state.searchBusy = false;
-    updateSearchSelectionCount();
+    if (searchRequestIsCurrent(requestContext)) {
+      state.searchBusy = false;
+      $("#search-destination").disabled = false;
+      $("#search-submit").disabled = false;
+      $("#search-submit").textContent = "开始搜索";
+      updateSearchSelectionCount();
+    }
   }
 }
 
@@ -2293,15 +3291,36 @@ function renderIntakeList() {
   const activeCount = state.intakeItems.filter((item) => ["queued", "parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status)).length;
   const badge = $("#intake-count");
   if (badge) badge.textContent = String(activeCount);
-  $("#intake-summary").textContent = `${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`;
+  $("#intake-summary").textContent = state.intakeScopeInvestigationId
+    ? `本专题 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录`
+    : `全局 · ${activeCount} 条待处理 / ${state.intakeItems.length} 条记录 · 列表加载最近最多 ${GLOBAL_INTAKE_LOAD_LIMIT} 条，指定旧记录会单独读取`;
   root.innerHTML = state.intakeItems.length ? state.intakeItems.map((item) => `
     <button class="intake-item ${item.id === state.selectedIntakeId ? "active" : ""}" type="button" role="listitem" data-intake-id="${escapeHtml(item.id)}">
       <span class="intake-type">${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</span>
       <strong>${escapeHtml(intakeTitle(item))}</strong>
       <small>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)} · ${formatDate(item.created_at, true)}</small>
-      ${item.error ? `<em>${escapeHtml(item.error)}</em>` : ""}
+      ${item.error ? `<em>${escapeHtml(normalizeOperationalError(item.error, item.status === "generation_failed" ? "generate" : "fetch").title)}</em>` : ""}
     </button>
   `).join("") : '<p class="muted intake-empty">采集箱暂无条目。</p>';
+}
+
+function renderReadonlyCandidate(candidate) {
+  const fields = candidate.machine?.fields || candidate.machine || {};
+  const type = candidate.object_type;
+  const title = ({ event: "候选事件", entity: "候选实体", claim: "候选主张", evidence: "候选证据" })[type] || `机器候选 · ${type}`;
+  let body = "";
+  if (type === "event") body = `<strong>${escapeHtml(fields.title || "事件标题未知")}</strong><p>${escapeHtml(fields.summary || "没有候选摘要")}</p>`;
+  else if (type === "entity") body = `<strong>${escapeHtml(fields.name || "实体名称未知")}</strong><p>${escapeHtml(fields.entity_type || "类型未知")} · ${escapeHtml(fields.role || "角色未知")}</p>`;
+  else if (type === "claim") body = `<blockquote>${escapeHtml(fields.text || "主张文本未知")}</blockquote><p>${escapeHtml(LABELS.claim[fields.status] || fields.status || "状态未知")}</p>`;
+  else if (type === "evidence") body = `<blockquote>${escapeHtml(fields.snippet || "证据原句未知")}</blockquote><p>${escapeHtml(LABELS.stance[fields.stance] || fields.stance || "立场未知")}</p>`;
+  else body = `<p>当前版本无法用语义卡展示这个候选，请在技术详情中核对。</p>`;
+  return `
+    <article class="candidate-card readonly semantic-candidate">
+      <header><b>${escapeHtml(title)}</b><span>${escapeHtml(candidate.source_mode || "机器生成")}</span></header>
+      <div class="semantic-candidate-body">${body}</div>
+      ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}</p>` : ""}
+      <details><summary>机器原值</summary><pre>${escapeHtml(JSON.stringify(candidate.machine, null, 2))}</pre></details>
+    </article>`;
 }
 
 function renderIntakeDetail(item = null) {
@@ -2315,23 +3334,23 @@ function renderIntakeDetail(item = null) {
     root.innerHTML = renderIntakeReview(item);
     return;
   }
-  const machineCandidates = (item.candidates || []).map((candidate) => `
-    <article class="candidate-card readonly">
-      <header><b>${escapeHtml(candidate.object_type)}</b><span>${escapeHtml(candidate.source_mode)}</span></header>
-      <pre>${escapeHtml(JSON.stringify(candidate.machine, null, 2))}</pre>
-      ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}</p>` : ""}
-    </article>
-  `).join("");
+  const machineCandidates = (item.candidates || []).map(renderReadonlyCandidate).join("");
   const final = item.final_object_ids || {};
+  const errorValue = item.error || item.candidate_generation?.error;
+  const errorStage = item.status === "generation_failed" ? "generate" : "fetch";
+  const normalizedItemError = errorValue ? normalizeOperationalError(errorValue, errorStage) : null;
+  const errorAction = normalizedItemError?.retryable !== false && item.status === "generation_failed"
+    ? '<button class="btn btn-ghost" type="button" data-intake-action="regenerate">只重试候选生成</button>'
+    : normalizedItemError?.retryable !== false && item.status === "failed" && item.search?.result_id
+      ? `<button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取原始页</button>`
+      : "";
   root.innerHTML = `
     <article class="intake-status-card ${intakeStatusClass(item.status)}">
       <div>
         <span>${escapeHtml(LABELS.intakeStatus[item.status] || item.status)}</span>
         <strong>${escapeHtml(intakeTitle(item))}</strong>
       </div>
-      ${item.error || item.candidate_generation?.error ? `<p>${escapeHtml(item.error || item.candidate_generation.error)}</p>` : ""}
-      ${item.status === "generation_failed" ? '<div class="trace-links"><button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新生成候选</button></div>' : ""}
-      ${item.status === "failed" && item.search?.result_id ? `<div class="trace-links"><button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取原始页</button></div>` : ""}
+      ${errorValue ? renderOperationalError(errorValue, { stage: errorStage, actionHtml: errorAction }) : ""}
     </article>
     ${renderIntakeFacts(item)}
     ${renderIntakeSnapshots(item)}
@@ -2353,7 +3372,9 @@ function renderIntakeFacts(item) {
     failed: "本材料处理失败，未进入正式档案。",
   }[item.status] || "机器候选，尚未人工确认；修改表示修改候选后新建，不会直接改写既有正式事件。";
   return `
-    <dl class="intake-facts">
+    <details class="intake-facts-disclosure">
+      <summary>来源、采集与追踪信息</summary>
+      <dl class="intake-facts">
       <div><dt>输入类型</dt><dd>${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</dd></div>
       <div><dt>来源说明</dt><dd>${escapeHtml(item.source?.description || "未知来源")}</dd></div>
       <div><dt>原始地址</dt><dd>${escapeHtml(item.source?.canonical_url || item.source?.url || "未知地址")}</dd></div>
@@ -2374,7 +3395,8 @@ function renderIntakeFacts(item) {
         <div><dt>搜索摘要</dt><dd>${escapeHtml(item.search.search_snippet || "未返回；不作为证据")}</dd></div>
         ${item.search_history?.length ? `<div><dt>处理追踪</dt><dd><ul class="search-trace-list">${item.search_history.map((trace) => `<li><strong>${escapeHtml(SEARCH_TRACE_OUTCOME_LABELS[trace.outcome] || trace.outcome || "状态未知")}</strong> · ${escapeHtml(trace.keyword || "未知关键词")} · ${escapeHtml(trace.channel || trace.provider || "未知渠道")} · ${formatDate(trace.selected_at, true)} · ${escapeHtml(trace.result_id || "未知结果")}</li>`).join("")}</ul></dd></div>` : ""}
       ` : ""}
-    </dl>`;
+      </dl>
+    </details>`;
 }
 
 function renderIntakeSnapshots(item) {
@@ -2391,29 +3413,104 @@ function renderIntakeSnapshots(item) {
     </details>`;
 }
 
+function renderReviewMaterialSummary(item) {
+  const sourceName = item.source?.description || item.search?.site || item.search?.channel || "来源未知";
+  return `
+    <div class="review-material-summary">
+      <div><span>来源</span><strong>${escapeHtml(sourceName)}</strong></div>
+      <div><span>采集时间</span><strong>${formatDate(item.created_at, true)}</strong></div>
+      <div><span>快照</span><strong>${item.material?.extracted_hash ? "已固定" : "尚未固定"}</strong></div>
+      <div><span>正式档案</span><strong>尚未改变</strong></div>
+    </div>`;
+}
+
+function validationErrorLabel(error) {
+  const text = String(error || "");
+  if (/At least one claim/i.test(text)) return "至少保留一条主张候选。";
+  if (/At least one evidence/i.test(text)) return "至少纳入一条能够在快照中定位的证据原句。";
+  if (/cannot be precisely located/i.test(text)) return "所选证据无法在完整快照中精确定位，请恢复原句或排除它。";
+  if (/event title.*required/i.test(text)) return "事件标题不能为空。";
+  if (/merge target/i.test(text)) return "所选合并目标无效或不属于当前事件，请重新选择。";
+  if (/explicit human change/i.test(text)) return "选择“修改”时，至少需要明确修改一个候选字段。";
+  return text;
+}
+
+function previewActionLabel(action) {
+  return ({ create: "新建", "create-modified": "修改后新建", merge: "合并", exclude: "排除", include: "纳入" })[action] || action || "保持";
+}
+
+function renderConfirmationPreview(preview) {
+  const formal = preview.semantic_preview || preview.formal || {};
+  const event = formal.event || {};
+  const source = formal.source || {};
+  const document = formal.document || {};
+  const snapshot = formal.snapshot || {};
+  return `
+    <div class="preview-heading">
+      <span class="task-stage ${preview.confirmable ? "ready" : "failed"}">${preview.confirmable ? "可以确认" : "需要修正"}</span>
+      <div><strong>${preview.confirmable ? "确认后将发生这些变化" : "当前还不能入档"}</strong><p>这是正式区的语义预览，不会在此步骤写入数据。</p></div>
+    </div>
+    ${preview.errors?.length ? `<ul class="preview-errors">${preview.errors.map((error) => `<li>${escapeHtml(validationErrorLabel(error))}</li>`).join("")}</ul>` : ""}
+    <div class="preview-object-grid">
+      <section><span>来源与文档</span><strong>${escapeHtml(source.name || "来源未知")}</strong><p>${escapeHtml(document.title || "文档标题未知")} · ${document.published_at ? formatDate(document.published_at, true) : "发布时间未知"}</p></section>
+      <section><span>固定快照</span><strong>${Number(snapshot.length || 0).toLocaleString("zh-CN")} 字符</strong><p>哈希 ${escapeHtml(snapshot.content_hash || "尚未生成")}</p></section>
+      <section class="preview-event"><span>事件 · ${escapeHtml(previewActionLabel(event.action))}</span><strong>${escapeHtml(event.title || "事件标题未知")}</strong><p>${escapeHtml(event.summary || "没有事件摘要")}</p><small>${escapeHtml(event.event_type || "类型未知")} · ${event.start_at ? formatDate(event.start_at, true) : "时间未知"} · ${escapeHtml(event.location_name || "地点未知")} · ${escapeHtml(LABELS.importance[event.importance] || event.importance || "重要性未知")}</small></section>
+    </div>
+    <div class="preview-change-lists">
+      <section><h4>实体 ${formal.entities?.length || 0}</h4>${formal.entities?.length ? `<ul>${formal.entities.map((entity) => `<li><span>${escapeHtml(previewActionLabel(entity.action))}</span>${escapeHtml(entity.name || entity.merge_entity_id || "实体未知")}<small>${escapeHtml(entity.entity_type || "类型未知")} · ${escapeHtml(entity.role || "角色未知")}${entity.aliases?.length ? ` · 别名 ${escapeHtml(entity.aliases.join("、"))}` : ""}</small></li>`).join("")}</ul>` : "<p>不创建或合并实体。</p>"}</section>
+      <section><h4>主张 ${formal.claims?.length || 0}</h4>${formal.claims?.length ? `<ul>${formal.claims.map((claim) => `<li><span>${escapeHtml(previewActionLabel(claim.action))}</span>${escapeHtml(claim.text || claim.merge_claim_id || "主张未知")}<small>${escapeHtml(LABELS.claim[claim.status] || claim.status || "状态未知")} · 置信度 ${percent(claim.confidence)}${claim.temporal_scope ? ` · ${escapeHtml(claim.temporal_scope)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要写入的主张。</p>"}</section>
+      <section><h4>证据 ${formal.evidence?.length || 0}</h4>${formal.evidence?.length ? `<ul>${formal.evidence.map((evidence) => `<li><span>${escapeHtml(LABELS.stance[evidence.stance] || evidence.stance || "背景")}</span><q>${escapeHtml(evidence.snippet || "证据原句未知")}</q><small>强度 ${percent(evidence.strength)}${evidence.note ? ` · ${escapeHtml(evidence.note)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要固定的证据原句。</p>"}</section>
+    </div>
+    ${formal.actions?.length ? `<section class="preview-action-summary"><h4>确认后按顺序执行</h4><ol>${formal.actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ol>${formal.candidate_generation?.degraded ? `<p>${escapeHtml(formal.candidate_generation.warning || "当前为降级候选，必须人工核对。")}</p>` : ""}</section>` : ""}
+    ${formal.scope?.mode ? `<div class="preview-scope-note">对象范围：${formal.scope.mode === "investigation-only" ? "仅限当前专题" : "已显式允许跨专题复用"}</div>` : ""}
+    <details class="preview-technical"><summary>审计追踪</summary><pre>${escapeHtml(JSON.stringify(preview.trace || {}, null, 2))}</pre></details>`;
+}
+
 function renderConfirmedRecord(item, final) {
+  const eventId = final.event || item.final_event_id || item.confirmation_result?.final_event_id || "";
+  const snapshotId = final.snapshot || item.final_snapshot_id || item.confirmation_result?.formal_object_ids?.snapshot || "";
   return `
     <section class="confirmed-trace">
-      <h3>人工确认与回链</h3>
-      <p>处置：${escapeHtml(item.disposition)} · 分析员：${escapeHtml(item.reviewed_by)} · 时间：${formatDate(item.reviewed_at, true)}</p>
+      <span class="task-stage ready">已确认入档</span>
+      <h3>${escapeHtml(intakeTitle(item))}</h3>
+      <p>人工处置已经完成。正式事件与固定快照已建立回链；机器候选和人工决定仍可审计。</p>
       <div class="trace-links">
-        <button class="text-btn" type="button" data-intake-action="open-event" data-event-target="${escapeHtml(final.event)}">打开正式事件</button>
-        <a href="/snapshots/${escapeHtml(final.snapshot)}" target="_blank" rel="noopener">打开正式快照</a>
+        <button class="btn btn-primary" type="button" data-intake-action="open-event" data-event-target="${escapeHtml(eventId)}" ${eventId ? "" : "disabled"}>查看正式事件</button>
+        <button class="btn btn-ghost" type="button" data-intake-action="continue-review">继续下一条</button>
       </div>
-      <pre>${escapeHtml(JSON.stringify(item.confirmation_result, null, 2))}</pre>
+      <details><summary>固定快照与审计信息</summary><div class="confirmed-audit">${snapshotId ? `<a href="/snapshots/${escapeHtml(snapshotId)}" target="_blank" rel="noopener">打开正式快照 ↗</a>` : '<span>快照编号未返回</span>'}<span>处置 ${escapeHtml(item.disposition || "未知")}</span><span>分析员 ${escapeHtml(item.reviewed_by || "未知")}</span><span>${formatDate(item.reviewed_at, true)}</span></div></details>
     </section>`;
 }
 
 function renderIntakeReview(item) {
+  state.intakePreviewApproval = null;
+  state.intakePreviewRequestSerial += 1;
   const event = candidateList(item, "event")[0]?.machine?.fields || {};
   const entities = candidateList(item, "entity");
   const claims = candidateList(item, "claim");
   const evidence = candidateList(item, "evidence");
   const eventOptions = state.intakeOptions.events || [];
   const entityOptions = state.intakeOptions.entities || [];
+  const claimOptions = state.intakeOptions.claims || [];
+  const generation = item.candidate_generation || {};
+  const degraded = ["fallback", "fallback-after-error"].includes(generation.mode);
+  const degradedWarning = degraded ? `
+    <div class="task-degradation review-degradation" role="status">
+      <strong>当前是规则降级候选，不是模型研判结果</strong>
+      <span>系统只做了确定性摘录，字段可能不完整或语义不准确。请逐项对照固定快照，必要时修改或驳回后再确认。</span>
+      ${generation.error ? `<small>模型失败原因：${escapeHtml(generation.error)}</small>` : ""}
+    </div>` : "";
   return `
-    ${renderIntakeFacts(item)}
-    ${renderIntakeSnapshots(item)}
+    <section class="intake-review-material">
+      <div class="intake-step-heading"><span>步骤 2</span><div><h3>核对原始材料</h3><p>证据必须能在固定快照中找到原句。</p></div></div>
+      ${renderReviewMaterialSummary(item)}
+      ${renderIntakeSnapshots(item)}
+      ${renderIntakeFacts(item)}
+      <div class="intake-mobile-next"><button class="btn btn-primary" type="button" data-intake-step="2">原文已核对，查看候选 →</button></div>
+    </section>
+    <section class="intake-review-decision">
+    <div class="intake-step-heading"><span>步骤 3</span><div><h3>决定如何入档</h3><p>编辑机器候选，先预览正式区变化，再由人工确认。</p></div></div>
+    ${degradedWarning}
     <form class="review-form" data-review-form="${escapeHtml(item.id)}">
       <section class="review-section">
         <h3>人工处置</h3>
@@ -2435,66 +3532,145 @@ function renderIntakeReview(item) {
         <h3>候选事件修改</h3>
         <div class="review-grid">
           <label><span>标题（未知必须由人工补实）</span><input id="intake-event-title" value="${escapeHtml(event.title || "")}" maxlength="500"></label>
-          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(event.event_time || item.published_at || "")}" placeholder="YYYY-MM-DDTHH:MM:SSZ"></label>
+          <label><span>事件类型</span><input id="intake-event-type" value="${escapeHtml(event.event_type || "incident")}" maxlength="80"></label>
+          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(event.start_at || event.event_time || "")}" placeholder="YYYY-MM-DDTHH:MM:SSZ"></label>
           <label><span>地点（未知留空）</span><input id="intake-event-location" value="${escapeHtml(event.location_name || "")}" maxlength="200"></label>
-          <label><span>重要性</span><select id="intake-event-importance"><option value="medium">中</option><option value="high">高</option><option value="critical">极高</option><option value="low">低</option></select></label>
+          <label><span>重要性</span><select id="intake-event-importance"><option value="medium" ${event.importance === "medium" || !event.importance ? "selected" : ""}>中</option><option value="high" ${event.importance === "high" ? "selected" : ""}>高</option><option value="critical" ${event.importance === "critical" ? "selected" : ""}>极高</option><option value="low" ${event.importance === "low" ? "selected" : ""}>低</option></select></label>
         </div>
         <label><span>摘要</span><textarea id="intake-event-summary" rows="4">${escapeHtml(event.summary || "")}</textarea></label>
       </section>
-      ${entities.length ? `<section class="review-section"><h3>候选实体</h3>${entities.map((candidate) => `
+      ${entities.length ? `<section class="review-section"><h3>候选实体</h3>${entities.map((candidate) => {
+        const fields = candidate.machine?.fields || {};
+        const aliases = Array.isArray(fields.aliases) ? fields.aliases.join(", ") : (fields.aliases || "");
+        return `
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
           <div class="review-grid">
-            <label><span>名称</span><input data-entity-field="name" value="${escapeHtml(candidate.machine?.fields?.name || "")}"></label>
-            <label><span>类型</span><input data-entity-field="entity_type" value="${escapeHtml(candidate.machine?.fields?.entity_type || "organization")}"></label>
-            <label><span>角色</span><input data-entity-field="role" value="${escapeHtml(candidate.machine?.fields?.role || "related")}"></label>
+            <label><span>名称</span><input data-entity-field="name" value="${escapeHtml(fields.name || "")}"></label>
+            <label><span>类型</span><input data-entity-field="entity_type" value="${escapeHtml(fields.entity_type || "organization")}"></label>
+            <label><span>别名（逗号分隔）</span><input data-entity-field="aliases" value="${escapeHtml(aliases)}"></label>
+            <label><span>角色</span><input data-entity-field="role" value="${escapeHtml(fields.role || "related")}"></label>
             <label><span>处置</span><select data-entity-field="action"><option value="create">新建</option><option value="merge">合并</option><option value="exclude">排除</option></select></label>
             <label><span>合并目标实体</span><select data-entity-field="merge_entity_id"><option value="">请选择实体</option>${entityOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.name)}</option>`).join("")}</select></label>
           </div>
-        </div>`).join("")}</section>` : ""}
-      <section class="review-section"><h3>候选主张</h3>${claims.map((candidate) => `
+        </div>`;
+      }).join("")}</section>` : ""}
+      <section class="review-section"><h3>候选主张</h3>${claims.map((candidate) => {
+        const fields = candidate.machine?.fields || {};
+        const confidence = unitIntervalValue(fields.confidence, 0.5);
+        const status = fields.status || "unverified";
+        return `
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
-          <label><span>主张文本</span><textarea data-claim-field="text" rows="3">${escapeHtml(candidate.machine?.fields?.text || "")}</textarea></label>
+          <label><span>主张文本</span><textarea data-claim-field="text" rows="3">${escapeHtml(fields.text || "")}</textarea></label>
           <div class="review-grid">
-            <label><span>状态</span><select data-claim-field="status"><option value="unverified">待核实</option><option value="supported">有支持</option><option value="contested">存在冲突</option></select></label>
-            <label><span>处置</span><select data-claim-field="action"><option value="create">新建</option><option value="exclude">排除</option></select></label>
+            <label><span>状态</span><select data-claim-field="status"><option value="unverified" ${status === "unverified" ? "selected" : ""}>待核实</option><option value="supported" ${status === "supported" ? "selected" : ""}>有支持</option><option value="contested" ${status === "contested" ? "selected" : ""}>存在冲突</option><option value="confirmed" ${status === "confirmed" ? "selected" : ""}>已确认</option><option value="refuted" ${status === "refuted" ? "selected" : ""}>已反驳</option></select></label>
+            <label><span>置信度（0–1）</span><input type="number" min="0" max="1" step="0.05" data-claim-field="confidence" value="${escapeHtml(confidence)}"></label>
+            <label><span>时间范围</span><input data-claim-field="temporal_scope" value="${escapeHtml(fields.temporal_scope || "")}" maxlength="120"></label>
+            <label><span>处置</span><select data-claim-field="action"><option value="create">新建</option><option value="merge">合并</option><option value="exclude">排除</option></select></label>
+            <label><span>合并目标主张</span><select data-claim-field="merge_claim_id"><option value="">请选择主张</option>${claimOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.text || option.title || option.id)}</option>`).join("")}</select></label>
           </div>
-        </div>`).join("") || '<p class="muted">机器未提出主张候选；未知保持未知。</p>'}</section>
-      <section class="review-section"><h3>候选证据（必须精确命中原句）</h3>${evidence.map((candidate) => `
+        </div>`;
+      }).join("") || '<p class="muted">机器未提出主张候选；未知保持未知。</p>'}</section>
+      <section class="review-section"><h3>候选证据（必须精确命中原句）</h3>${evidence.map((candidate) => {
+        const fields = candidate.machine?.fields || {};
+        const strength = unitIntervalValue(fields.strength, 0.7);
+        const stance = fields.stance || "context";
+        return `
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
-          <label><span>原文片段</span><textarea data-evidence-field="snippet" rows="3">${escapeHtml(candidate.machine?.fields?.snippet || "")}</textarea></label>
+          <label><span>原文片段</span><textarea data-evidence-field="snippet" rows="3">${escapeHtml(fields.snippet || "")}</textarea></label>
           <div class="review-grid">
-            <label><span>立场</span><select data-evidence-field="stance"><option value="context">背景</option><option value="supports">支持</option><option value="contradicts">冲突</option></select></label>
+            <label><span>立场</span><select data-evidence-field="stance"><option value="context" ${stance === "context" ? "selected" : ""}>背景</option><option value="supports" ${stance === "supports" ? "selected" : ""}>支持</option><option value="contradicts" ${stance === "contradicts" ? "selected" : ""}>冲突</option></select></label>
+            <label><span>证据强度（0–1）</span><input type="number" min="0" max="1" step="0.05" data-evidence-field="strength" value="${escapeHtml(strength)}"></label>
+            <label><span>人工备注</span><input data-evidence-field="note" value="${escapeHtml(fields.note || "")}" maxlength="1000"></label>
             <label><span>处置</span><select data-evidence-field="action"><option value="include">纳入</option><option value="exclude">排除</option></select></label>
           </div>
-          ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${candidate.machine?.fields?.start_offset}-${candidate.machine?.fields?.end_offset}</p>`}
-        </div>`).join("")}</section>
+          ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${fields.start_offset}-${fields.end_offset}</p>`}
+        </div>`;
+      }).join("")}</section>
       <section class="review-section">
         <h3>驳回</h3>
         <label><span>驳回原因</span><textarea id="intake-reject-reason" rows="2" placeholder="填写原因后执行驳回"></textarea></label>
       </section>
-      <div id="intake-preview" class="intake-preview" aria-live="polite"></div>
+      <div id="intake-preview" class="intake-preview" aria-live="polite"><p class="muted">先预览正式区变化；只有预览通过且字段未再修改，才能确认入档。</p></div>
       <div class="review-actions">
         <button class="btn btn-ghost" type="button" data-intake-action="preview">预览入档</button>
         <button class="btn btn-ghost warning" type="button" data-intake-action="cancel">撤销处理</button>
         <button class="btn btn-danger" type="button" data-intake-action="reject">驳回</button>
-        <button class="btn btn-primary" type="button" data-intake-action="confirm">确认入档</button>
+        <button class="btn btn-primary" type="button" data-intake-action="confirm" disabled title="请先预览并通过校验">先预览再确认</button>
       </div>
-    </form>`;
+    </form>
+    </section>`;
+}
+function intakeReviewRoute(itemId, action) {
+  if (state.intakeScopeInvestigationId) {
+    return `/pldr-api/v1/investigations/${encodeURIComponent(state.intakeScopeInvestigationId)}/intake/${encodeURIComponent(itemId)}/${action}`;
+  }
+  return `/pldr-api/v1/intake/${encodeURIComponent(itemId)}/${action}`;
+}
+
+async function loadIntakeDetail(
+  itemId,
+  requestContext = {
+    serial: state.intakeRequestSerial,
+    scopeInvestigationId: state.intakeScopeInvestigationId,
+  },
+) {
+  if (!itemId) return null;
+  const existing = state.intakeItems.find((item) => item.id === itemId);
+  if (existing?.material && Array.isArray(existing.candidates)) return existing;
+  const route = requestContext.scopeInvestigationId
+    ? `/pldr-api/v1/investigations/${encodeURIComponent(requestContext.scopeInvestigationId)}/intake/${encodeURIComponent(itemId)}`
+    : `/pldr-api/v1/intake/${encodeURIComponent(itemId)}`;
+  const detail = await api(route);
+  if (
+    requestContext.serial !== state.intakeRequestSerial
+    || requestContext.scopeInvestigationId !== state.intakeScopeInvestigationId
+  ) return null;
+  state.intakeItems = state.intakeItems.map((item) => item.id === itemId ? detail : item);
+  if (!requestContext.scopeInvestigationId) {
+    state.globalIntakeItems = state.globalIntakeItems.map((item) => item.id === itemId ? detail : item);
+  }
+  return detail;
 }
 
 async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
-  const [list, options] = await Promise.all([
-    api("/pldr-api/v1/intake?limit=200"),
-    api("/pldr-api/v1/intake/options"),
-  ]);
-  state.intakeItems = list.items || [];
-  state.intakeOptions = options || { events: [], entities: [] };
+  const requestContext = {
+    serial: ++state.intakeRequestSerial,
+    scopeInvestigationId: state.intakeScopeInvestigationId,
+  };
+  const requestIsStale = () => requestContext.serial !== state.intakeRequestSerial
+    || requestContext.scopeInvestigationId !== state.intakeScopeInvestigationId;
   let preferredError = null;
-  if (preferredItemId && !state.intakeItems.some((item) => item.id === preferredItemId)) {
+  if (requestContext.scopeInvestigationId) {
+    const investigationId = requestContext.scopeInvestigationId;
+    const [tasks, options] = await Promise.all([
+      loadAllInvestigationTasks(investigationId),
+      api(`/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/review-options`),
+    ]);
+    if (requestContext.serial !== state.intakeRequestSerial || investigationId !== state.intakeScopeInvestigationId) return { found: false, stale: true };
+    state.investigationTasks.set(investigationId, tasks);
+    const byId = new Map();
+    tasks.forEach((task) => {
+      if (task.intake_item?.id) byId.set(task.intake_item.id, task.intake_item);
+    });
+    state.intakeItems = [...byId.values()];
+    state.intakeOptions = options || { events: [], entities: [], claims: [] };
+  } else {
+    const [list, options] = await Promise.all([
+      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false`),
+      api("/pldr-api/v1/intake/options"),
+    ]);
+    if (requestContext.serial !== state.intakeRequestSerial || state.intakeScopeInvestigationId) return { found: false, stale: true };
+    state.intakeItems = list.items || [];
+    state.globalIntakeItems = [...state.intakeItems];
+    state.intakeOptions = options || { events: [], entities: [], claims: [] };
+  }
+  if (!state.intakeScopeInvestigationId && preferredItemId && !state.intakeItems.some((item) => item.id === preferredItemId)) {
     try {
       const olderItem = await api(`/pldr-api/v1/intake/${encodeURIComponent(preferredItemId)}`);
+      if (requestContext.serial !== state.intakeRequestSerial || state.intakeScopeInvestigationId) return { found: false, stale: true };
       state.intakeItems = [olderItem, ...state.intakeItems];
     } catch (error) {
+      if (requestIsStale()) return { found: false, stale: true };
       preferredError = error;
     }
   }
@@ -2504,19 +3680,67 @@ async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
     || state.intakeItems.find((item) => item.status === "candidate_ready")?.id
     || state.intakeItems[0]?.id
     || null;
+  if (target) {
+    try {
+      await loadIntakeDetail(target, requestContext);
+      if (
+        requestContext.serial !== state.intakeRequestSerial
+        || requestContext.scopeInvestigationId !== state.intakeScopeInvestigationId
+      ) return { found: false, stale: true };
+    } catch (error) {
+      if (requestIsStale()) return { found: false, stale: true };
+      preferredError = error;
+    }
+  }
   state.selectedIntakeId = target;
   renderIntakeList();
-  renderIntakeDetail(state.intakeItems.find((item) => item.id === target) || null);
+  if (preferredError) {
+    $("#intake-detail").innerHTML = `${renderOperationalError(preferredError, { stage: "fetch" })}<button class="btn btn-ghost" type="button" data-intake-action="retry-detail">重新读取这条材料</button>`;
+  } else {
+    renderIntakeDetail(state.intakeItems.find((item) => item.id === target) || null);
+  }
   return { found: !preferredItemId || target === preferredItemId, error: preferredError };
 }
 
-async function openIntakeModal(itemId = null, quiet = false) {
+function setIntakeMobileStep(step) {
+  state.intakeMobileStep = clamp(Number(step) || 0, 0, 2);
   const modal = $("#intake-modal");
+  if (modal) modal.dataset.intakeStep = String(state.intakeMobileStep);
+  $$('[data-intake-step]', $("#intake-mobile-steps")).forEach((button) => {
+    const active = Number(button.dataset.intakeStep) === state.intakeMobileStep;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "step" : "false");
+  });
+}
+
+async function openIntakeModal(itemId = null, quiet = false, scopeInvestigationId = null) {
+  const modal = $("#intake-modal");
+  state.intakeRequestSerial += 1;
+  state.intakeActionSerial += 1;
+  setIntakeActionBusy(false);
+  invalidateIntakePreview();
+  state.intakeScopeInvestigationId = scopeInvestigationId;
+  setIntakeMobileStep(itemId ? 1 : 0);
   if (!quiet && typeof modal.showModal === "function") modal.showModal();
   else if (!quiet) modal.setAttribute("open", "");
   const preferred = itemId || state.selectedIntakeId;
-  const result = await refreshIntakeData(preferred);
-  if (itemId && !result.found) {
+  let result;
+  const refreshPromise = refreshIntakeData(preferred);
+  const requestSerial = state.intakeRequestSerial;
+  try {
+    result = await refreshPromise;
+  } catch (error) {
+    if (state.intakeScopeInvestigationId !== scopeInvestigationId || state.intakeRequestSerial !== requestSerial) return;
+    $("#intake-detail").innerHTML = `${renderOperationalError(error, {
+      stage: "fetch",
+      actionHtml: '<button class="btn btn-ghost" type="button" data-intake-action="retry-intake">重新读取采集箱</button>',
+    })}`;
+    toast(`采集箱读取失败：${error.message || "未知错误"}`, "error", 7000);
+    return;
+  }
+  if (!result.stale && result.error) {
+    toast(`材料读取失败：${result.error.message || "未知错误"}`, "error", 7000);
+  } else if (itemId && !result.found && !result.stale) {
     toast(`指定版本无法打开：${result.error?.message || "材料不存在"}`, "error", 7000);
   }
 }
@@ -2525,10 +3749,50 @@ function closeIntakeModal() {
   const modal = $("#intake-modal");
   if (typeof modal.close === "function") modal.close();
   else modal.removeAttribute("open");
+  state.intakeRequestSerial += 1;
+  state.intakeActionSerial += 1;
+  setIntakeActionBusy(false);
+  invalidateIntakePreview();
+  state.intakeScopeInvestigationId = null;
+  if (state.globalIntakeItems.length) {
+    state.intakeItems = [...state.globalIntakeItems];
+    state.selectedIntakeId = state.intakeItems.find((item) => item.id === state.selectedIntakeId)?.id || state.intakeItems[0]?.id || null;
+    renderIntakeList();
+  }
 }
 
 function selectedIntakeItem() {
   return state.intakeItems.find((item) => item.id === state.selectedIntakeId) || null;
+}
+
+function confirmationFingerprint(payload) {
+  return JSON.stringify(payload);
+}
+
+function setIntakeConfirmEnabled(enabled) {
+  const button = $('[data-intake-action="confirm"]', $("#intake-modal") || document);
+  if (!button) return;
+  button.disabled = state.intakeActionBusy || !enabled;
+  button.textContent = enabled ? "确认入档" : "先预览再确认";
+  button.title = enabled ? "预览已通过；确认将写入正式区" : "请先预览并通过校验";
+}
+
+function setIntakeActionBusy(busy) {
+  state.intakeActionBusy = busy;
+  $$('[data-intake-action="preview"], [data-intake-action="reject"], [data-intake-action="cancel"]', $("#intake-modal") || document)
+    .forEach((button) => { button.disabled = busy; });
+  setIntakeConfirmEnabled(Boolean(state.intakePreviewApproval));
+}
+
+function invalidateIntakePreview(message = "") {
+  state.intakePreviewRequestSerial += 1;
+  state.intakePreviewApproval = null;
+  setIntakeConfirmEnabled(false);
+  const root = $("#intake-preview");
+  if (root && message) {
+    root.className = "intake-preview";
+    root.innerHTML = `<p class="muted">${escapeHtml(message)}</p>`;
+  }
 }
 
 function buildConfirmation(item) {
@@ -2546,7 +3810,7 @@ function buildConfirmation(item) {
       action: fields.action || "create",
       name: fields.name || "",
       entity_type: fields.entity_type || "organization",
-      aliases: [],
+      aliases: (fields.aliases || "").split(",").map((alias) => alias.trim()).filter(Boolean).slice(0, 20),
       role: fields.role || "related",
       merge_entity_id: fields.merge_entity_id || null,
   }));
@@ -2567,9 +3831,9 @@ function buildConfirmation(item) {
     event: {
       title: value("#intake-event-title"),
       summary: value("#intake-event-summary"),
-      event_type: "incident",
+      event_type: value("#intake-event-type") || "incident",
       start_at: value("#intake-event-start") || null,
-      location_name: value("#intake-event-location") || "Unknown",
+      location_name: value("#intake-event-location"),
       importance: value("#intake-event-importance") || "medium",
     },
     entities,
@@ -2578,17 +3842,17 @@ function buildConfirmation(item) {
       action: fields.action || "create",
       text: fields.text || "",
       status: fields.status || "unverified",
-      confidence: 0.5,
-      temporal_scope: "",
-      merge_claim_id: null,
+      confidence: unitIntervalValue(fields.confidence, 0.5),
+      temporal_scope: fields.temporal_scope || "",
+      merge_claim_id: fields.merge_claim_id || null,
     })),
     evidence: [...evidenceGroups.entries()].map(([candidate_key, fields]) => ({
       candidate_key,
       action: fields.action || "include",
       snippet: fields.snippet || "",
       stance: fields.stance || "context",
-      strength: 0.7,
-      note: "",
+      strength: unitIntervalValue(fields.strength, 0.7),
+      note: fields.note || "",
     })),
   };
 }
@@ -2601,6 +3865,7 @@ async function continueInvestigationReview(completedIntakeId) {
   const next = tasksForInvestigation(investigation).find((task) => canonicalTaskStage(task) === "ready" && taskIntakeId(task) && taskIntakeId(task) !== completedIntakeId);
   if (next) {
     await refreshIntakeData(taskIntakeId(next));
+    setIntakeMobileStep(1);
     toast("已打开专题中的下一条 ready 材料。", "success", 4200);
     return;
   }
@@ -2610,12 +3875,44 @@ async function continueInvestigationReview(completedIntakeId) {
 }
 
 async function handleIntakeAction(action, domEvent = null) {
+  if (action === "retry-intake") {
+    try {
+      await refreshIntakeData(state.selectedIntakeId);
+    } catch (error) {
+      $("#intake-detail").innerHTML = renderOperationalError(error, {
+        stage: "fetch",
+        actionHtml: '<button class="btn btn-ghost" type="button" data-intake-action="retry-intake">重新读取采集箱</button>',
+      });
+      toast(`采集箱读取失败：${error.message || "未知错误"}`, "error", 7000);
+    }
+    return;
+  }
   const item = selectedIntakeItem();
   if (!item) return;
+  if (action === "retry-detail") {
+    const requestContext = {
+      serial: ++state.intakeRequestSerial,
+      scopeInvestigationId: state.intakeScopeInvestigationId,
+    };
+    $("#intake-detail").innerHTML = '<div class="panel-empty">正在重新读取原始材料、固定快照与候选…</div>';
+    try {
+      await loadIntakeDetail(item.id, requestContext);
+      if (requestContext.serial !== state.intakeRequestSerial) return;
+      renderIntakeDetail(selectedIntakeItem());
+    } catch (error) {
+      if (requestContext.serial !== state.intakeRequestSerial) return;
+      $("#intake-detail").innerHTML = `${renderOperationalError(error, { stage: "fetch" })}<button class="btn btn-ghost" type="button" data-intake-action="retry-detail">重新读取这条材料</button>`;
+    }
+    return;
+  }
   if (action === "open-event") {
-    const eventId = domEvent?.target?.dataset?.eventTarget;
+    const eventId = domEvent?.target?.closest?.("[data-event-target]")?.dataset?.eventTarget || domEvent?.target?.dataset?.eventTarget;
     closeIntakeModal();
     await selectEvent(eventId, { open: true });
+    return;
+  }
+  if (action === "continue-review") {
+    await continueInvestigationReview(item.id);
     return;
   }
   if (action === "regenerate") {
@@ -2649,32 +3946,77 @@ async function handleIntakeAction(action, domEvent = null) {
     return;
   }
   if (item.status !== "candidate_ready") return;
+  if (state.intakeActionBusy) return;
+  const actionSerial = ++state.intakeActionSerial;
+  const actionScope = state.intakeScopeInvestigationId;
+  const actionIsCurrent = () => actionSerial === state.intakeActionSerial
+    && state.selectedIntakeId === item.id
+    && state.intakeScopeInvestigationId === actionScope;
+  setIntakeActionBusy(true);
   let dispositionCommitted = false;
   try {
     if (action === "preview") {
-      const preview = await api(`/pldr-api/v1/intake/${item.id}/preview`, {
+      const payload = buildConfirmation(item);
+      const fingerprint = confirmationFingerprint(payload);
+      const previewSerial = ++state.intakePreviewRequestSerial;
+      state.intakePreviewApproval = null;
+      setIntakeConfirmEnabled(false);
+      const pendingRoot = $("#intake-preview");
+      pendingRoot.className = "intake-preview";
+      pendingRoot.innerHTML = '<p class="muted">正在校验正式区变化…</p>';
+      const preview = await api(intakeReviewRoute(item.id, "preview"), {
         method: "POST",
-        body: JSON.stringify(buildConfirmation(item)),
+        body: JSON.stringify(payload),
       });
+      if (previewSerial !== state.intakePreviewRequestSerial || state.selectedIntakeId !== item.id) return;
       const root = $("#intake-preview");
       root.className = `intake-preview ${preview.confirmable ? "ok" : "error"}`;
-      root.innerHTML = `
-        <strong>${preview.confirmable ? "可以确认入档" : "当前不可确认"}</strong>
-        ${preview.errors?.length ? `<ul>${preview.errors.map((error) => `<li>${escapeHtml(error)}</li>`).join("")}</ul>` : ""}
-        <pre>${escapeHtml(JSON.stringify(preview.formal, null, 2))}</pre>`;
+      root.innerHTML = renderConfirmationPreview(preview);
+      const unchanged = confirmationFingerprint(buildConfirmation(item)) === fingerprint;
+      if (preview.confirmable && unchanged) {
+        state.intakePreviewApproval = { itemId: item.id, fingerprint };
+        setIntakeConfirmEnabled(true);
+      } else {
+        state.intakePreviewApproval = null;
+        setIntakeConfirmEnabled(false);
+        if (preview.confirmable && !unchanged) {
+          root.insertAdjacentHTML("afterbegin", '<p class="validation-error">预览期间字段发生了变化，请重新预览。</p>');
+        }
+      }
+      root.scrollIntoView({ behavior: "smooth", block: "nearest" });
       return;
     }
     if (action === "confirm") {
-      const result = await api(`/pldr-api/v1/intake/${item.id}/confirm`, {
+      const workspaceId = state.intakeScopeInvestigationId
+        || (isServerInvestigation(activeInvestigation()) ? state.activeInvestigationId : null);
+      const payload = buildConfirmation(item);
+      const fingerprint = confirmationFingerprint(payload);
+      if (state.intakePreviewApproval?.itemId !== item.id || state.intakePreviewApproval?.fingerprint !== fingerprint) {
+        invalidateIntakePreview("确认内容尚未预览，或预览后字段已变化。请重新预览再确认。");
+        throw new Error("请先预览当前内容并通过校验，再确认入档。");
+      }
+      const result = await api(intakeReviewRoute(item.id, "confirm"), {
         method: "POST",
-        body: JSON.stringify(buildConfirmation(item)),
+        body: JSON.stringify(payload),
       });
       dispositionCommitted = true;
-      toast(`已原子入档：${result.result.formal_object_ids.event}`, "success");
-      await refreshData({ keepSelection: false, quiet: true, preferredEventId: result.result.formal_object_ids.event });
+      if (actionIsCurrent()) invalidateIntakePreview();
+      const finalEventId = result.final_event_id || result.result?.final_event_id || result.result?.formal_object_ids?.event;
+      if (finalEventId) {
+        invalidateInvestigationEvidence([finalEventId]);
+      }
+      toast("人工确认已完成，正式事件与固定快照已经建立回链。", "success", 6200);
+      await refreshData({ keepSelection: false, quiet: true, preferredEventId: finalEventId });
+      await refreshInvestigationDirectory();
+      if (workspaceId && state.activeInvestigationId === workspaceId) {
+        await loadInvestigationWorkspace(workspaceId, { quiet: true });
+        if (["today", "claims"].includes(state.activeInvestigationTab)) await loadInvestigationEvidence(activeInvestigation());
+      }
+      if (!actionIsCurrent()) return;
       await refreshIntakeData(item.id);
+      if (!actionIsCurrent()) return;
       renderIntakeDetail(selectedIntakeItem());
-      await continueInvestigationReview(item.id);
+      setIntakeMobileStep(2);
       return;
     }
     if (action === "reject") {
@@ -2695,10 +4037,23 @@ async function handleIntakeAction(action, domEvent = null) {
       toast("处理已撤销，未写入正式区。", "success");
     }
     await refreshData({ keepSelection: true, quiet: true });
+    if (!actionIsCurrent()) return;
     await refreshIntakeData(item.id);
+    if (!actionIsCurrent()) return;
     await continueInvestigationReview(item.id);
   } catch (error) {
+    if (action === "preview" && actionIsCurrent()) {
+      const root = $("#intake-preview");
+      if (root) {
+        root.className = "intake-preview error";
+        root.innerHTML = renderOperationalError(error, { stage: "validate" });
+      }
+    } else if (action === "confirm" && !dispositionCommitted && actionIsCurrent()) {
+      invalidateIntakePreview("确认没有完成；正式区可能已变化，请重新预览后再确认。");
+    }
     toast(dispositionCommitted ? `人工处置已由服务端完成，但页面刷新失败：${error.message}` : `采集箱操作失败：${error.message}`, "error", 7000);
+  } finally {
+    if (actionSerial === state.intakeActionSerial) setIntakeActionBusy(false);
   }
 }
 
@@ -3162,7 +4517,7 @@ async function refreshData({
       api("/pldr-api/v1/overview"),
       api("/pldr-api/v1/sources/health"),
       api("/pldr-api/v1/config").catch(() => null),
-      api("/pldr-api/v1/intake?limit=200").catch(() => ({ items: [] })),
+      api(`/pldr-api/v1/intake?limit=${GLOBAL_INTAKE_LOAD_LIMIT}&include_detail=false`).catch(() => ({ items: [] })),
       api("/pldr-api/v1/collection/summary").catch(() => null),
     ]);
     state.overview = overview;
@@ -3171,11 +4526,14 @@ async function refreshData({
     state.config = config;
     state.collectionSummary = collectionSummary;
     renderSearchProvider();
-    state.intakeItems = intakeList.items || [];
-    if (!state.selectedIntakeId) {
-      state.selectedIntakeId = state.intakeItems.find((item) => item.status === "candidate_ready")?.id || null;
+    state.globalIntakeItems = intakeList.items || [];
+    if (!state.intakeScopeInvestigationId) {
+      state.intakeItems = [...state.globalIntakeItems];
+      if (!state.selectedIntakeId) {
+        state.selectedIntakeId = state.intakeItems.find((item) => item.status === "candidate_ready")?.id || null;
+      }
+      renderIntakeList();
     }
-    renderIntakeList();
     renderTopic();
     renderMetrics();
     renderSources();
@@ -3225,7 +4583,14 @@ function bindEvents() {
   $("#investigation-create-close").addEventListener("click", closeInvestigationCreateModal);
   $("#investigation-create-cancel").addEventListener("click", closeInvestigationCreateModal);
   $("#investigation-create-form").addEventListener("submit", submitInvestigationCreate);
-  $("#search-destination").addEventListener("change", () => updateDestinationFields("search"));
+  $("#search-destination").addEventListener("change", async () => {
+    updateDestinationFields("search");
+    const destinationId = currentSearchDestinationId();
+    switchSearchWorkspaceContext(destinationId);
+    renderSearchHistory();
+    renderSearchResults();
+    await loadSearchHistory(destinationId);
+  });
   $("#import-destination").addEventListener("change", () => updateDestinationFields("import"));
   $("#search").addEventListener("input", applyFilters);
   $("#importance-filter").addEventListener("change", applyFilters);
@@ -3243,7 +4608,7 @@ function bindEvents() {
   });
   $("#btn-search").addEventListener("click", openExternalSearchModal);
   $("#btn-import").addEventListener("click", openImportModal);
-  $("#btn-intake").addEventListener("click", () => openIntakeModal());
+  $("#btn-intake").addEventListener("click", () => openIntakeModal(null, false, null));
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#drawer-backdrop").addEventListener("click", closeDrawer);
   $("#drawer-report").addEventListener("click", () => generateReport());
@@ -3254,12 +4619,64 @@ function bindEvents() {
   $("#search-close").addEventListener("click", closeExternalSearchModal);
   $("#search-form").addEventListener("submit", submitExternalSearch);
   $("#search-select").addEventListener("click", submitSelectedSearchResults);
+  $("#search-load-more").addEventListener("click", loadMoreExternalSearch);
+  $("#search-select-page").addEventListener("click", selectVisibleSearchPage);
+  $("#search-select-loaded").addEventListener("click", () => selectSearchResults(state.searchResults.map((result) => result.id)));
+  $("#search-clear-selection").addEventListener("click", clearSearchSelection);
+  $("#search-result-filter").addEventListener("input", renderSearchResults);
+  $("#search-result-filter").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") event.preventDefault();
+  });
+  $("#search-result-state").addEventListener("change", renderSearchResults);
+  $("#search-language").addEventListener("change", () => selectedSearchLanguage());
+  $("#search-keyword").addEventListener("input", () => {
+    if ($("#search-language").value === "auto") selectedSearchLanguage();
+  });
+  $("#search-history-toggle").addEventListener("click", () => {
+    const panel = $("#search-history-panel");
+    const collapsed = panel.classList.toggle("collapsed");
+    $("#search-history-toggle").textContent = collapsed ? "展开" : "收起";
+    $("#search-history-toggle").setAttribute("aria-expanded", String(!collapsed));
+  });
   $("#collection-close").addEventListener("click", closeCollectionModal);
   $("#collection-refresh").addEventListener("click", () => refreshCollectionData());
   $("#collection-source-form").addEventListener("submit", submitCollectionTarget);
   $("#intake-close").addEventListener("click", closeIntakeModal);
+  const invalidateReviewForm = (event) => {
+    if (event.target.closest(".review-form")) {
+      invalidateIntakePreview("字段已变化；请重新预览正式区变化后再确认。");
+    }
+  };
+  $("#intake-modal").addEventListener("input", invalidateReviewForm);
+  $("#intake-modal").addEventListener("change", invalidateReviewForm);
 
-  document.addEventListener("click", (event) => {
+  document.addEventListener("click", async (event) => {
+    if (event.target.closest("[data-retry-selected-event]")) {
+      await selectEvent(state.selectedId, { open: true, tab: state.drawerTab, syncUrl: false });
+      return;
+    }
+    const traceCopy = event.target.closest("[data-copy-trace]");
+    if (traceCopy) {
+      navigator.clipboard?.writeText(traceCopy.dataset.copyTrace).then(
+        () => toast("诊断编号已复制。", "success", 2600),
+        () => toast("浏览器未授予剪贴板权限。", "error", 4200),
+      );
+      return;
+    }
+    const historyRun = event.target.closest("[data-search-history-run]");
+    if (historyRun) {
+      openSearchHistoryRun(historyRun.dataset.searchHistoryRun);
+      return;
+    }
+    if (event.target.closest("[data-search-history-retry]")) {
+      await loadSearchHistory(state.searchHistoryInvestigationId || currentSearchDestinationId());
+      return;
+    }
+    const intakeStep = event.target.closest("button[data-intake-step]");
+    if (intakeStep && intakeStep.closest("#intake-modal")) {
+      setIntakeMobileStep(intakeStep.dataset.intakeStep);
+      return;
+    }
     const investigationTab = event.target.closest("[data-investigation-tab]");
     if (investigationTab) {
       setInvestigationTab(investigationTab.dataset.investigationTab);
@@ -3302,11 +4719,33 @@ function bindEvents() {
       retryExternalSearchResult(searchRetry.dataset.searchRetry);
       return;
     }
+    if (event.target.closest("[data-search-retry-query]")) {
+      retryCurrentSearchQuery();
+      return;
+    }
     const intakeNode = event.target.closest("[data-intake-id]");
     if (intakeNode) {
+      const requestContext = {
+        serial: ++state.intakeRequestSerial,
+        scopeInvestigationId: state.intakeScopeInvestigationId,
+      };
+      invalidateIntakePreview();
       state.selectedIntakeId = intakeNode.dataset.intakeId;
       renderIntakeList();
+      const current = selectedIntakeItem();
+      if (!current?.material || !Array.isArray(current?.candidates)) {
+        $("#intake-detail").innerHTML = '<div class="panel-empty">正在读取原始材料、固定快照与候选…</div>';
+        try {
+          await loadIntakeDetail(state.selectedIntakeId, requestContext);
+          if (requestContext.serial !== state.intakeRequestSerial) return;
+        } catch (error) {
+          if (requestContext.serial !== state.intakeRequestSerial) return;
+          $("#intake-detail").innerHTML = renderOperationalError(error, { stage: "fetch" });
+          return;
+        }
+      }
       renderIntakeDetail(selectedIntakeItem());
+      setIntakeMobileStep(1);
       return;
     }
     const intakeAction = event.target.closest("[data-intake-action]");
