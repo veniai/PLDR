@@ -85,6 +85,94 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(response.json()["intake_item"]["status"], "candidate_ready")
         return response.json()["intake_item"]
 
+    def test_topic_starter_material_is_saved_before_background_candidate_generation(self):
+        topic = self.create_topic("Background starter material")
+        model = AsyncMock(side_effect=TimeoutError("model timeout"))
+        with patch("pldr_api.intake.run_model_task", new=model):
+            response = self.client.post(
+                "/pldr-api/v1/intake/text?defer_candidates=true",
+                json={
+                    "text": (
+                        "A public bulletin states that the monitored sea lane remained open "
+                        "while authorities reviewed the reported incident."
+                    ),
+                    "source_description": "Public bulletin",
+                    "title": "Sea lane bulletin",
+                    "published_at": None,
+                    "language": "auto",
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            item = response.json()["intake_item"]
+            self.assertEqual(item["status"], "parsed")
+            self.assertEqual(item["candidates"], [])
+            model.assert_not_awaited()
+
+            web = self.client.post(
+                "/pldr-api/v1/import/url?defer_candidates=true",
+                json={
+                    "url": "https://example.org/deferred-web",
+                    "source_name": "Deferred public page",
+                    "title": "Deferred web material",
+                    "html": (
+                        "<html><body><article><p>A public page records enough source text "
+                        "to preserve the material before any candidate model runs.</p></article></body></html>"
+                    ),
+                    "language": "auto",
+                },
+            )
+            self.assertEqual(web.status_code, 200, web.text)
+            self.assertEqual(web.json()["intake_item"]["status"], "parsed")
+
+            rss = self.client.post(
+                "/pldr-api/v1/import/rss?defer_candidates=true",
+                json={
+                    "xml": (
+                        "<rss><channel><item><title>Deferred RSS item</title>"
+                        "<link>https://example.org/deferred-rss</link>"
+                        "<description>A public RSS entry contains enough preserved source text "
+                        "to be processed later by the durable topic queue.</description>"
+                        "</item></channel></rss>"
+                    ),
+                    "source_name": "Deferred public feed",
+                    "language": "auto",
+                },
+            )
+            self.assertEqual(rss.status_code, 200, rss.text)
+            self.assertEqual(rss.json()["intake_items"][0]["status"], "parsed")
+
+            uploaded = self.client.post(
+                "/pldr-api/v1/intake/files?defer_candidates=true",
+                data={"source_description": "Deferred public file", "language": "auto"},
+                files={
+                    "file": (
+                        "starter.txt",
+                        b"A persisted local file remains available before background candidate generation.",
+                        "text/plain",
+                    )
+                },
+            )
+            self.assertEqual(uploaded.status_code, 200, uploaded.text)
+            self.assertEqual(uploaded.json()["intake_item"]["status"], "parsed")
+            model.assert_not_awaited()
+
+            linked = self.client.post(
+                f"/pldr-api/v1/investigations/{topic}/links",
+                json={"object_type": "intake", "object_id": item["id"]},
+            )
+            self.assertEqual(linked.status_code, 201, linked.text)
+            task = linked.json()["review_task"]["task"]
+            self.assertEqual(task["status"], "queued")
+            model.assert_not_awaited()
+
+            asyncio.run(run_review_task_once(worker_id="topic-onboarding-worker"))
+            model.assert_awaited_once()
+
+        ready = self.client.get(f"/pldr-api/v1/tasks/{task['id']}")
+        self.assertEqual(ready.status_code, 200, ready.text)
+        self.assertEqual(ready.json()["status"], "ready")
+        self.assertTrue(ready.json()["fallback_used"])
+
     def link(self, topic_id: str, object_type: str, object_id: str) -> None:
         response = self.client.post(
             f"/pldr-api/v1/investigations/{topic_id}/links",
@@ -278,6 +366,63 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(payload["result"]["final_event_id"], payload["final_event_id"])
         self.assertEqual(payload["event_url"], f"/pldr-api/v1/events/{payload['final_event_id']}")
         self.assertEqual(payload["next_task"]["intake_item"]["id"], second["id"])
+
+    def test_topic_outcome_contains_only_confirmed_results_and_tracks_report_changes(self):
+        topic = self.create_topic("User-facing outcome")
+        first = self.create_intake("outcome-one")
+        self.link(topic, "intake", first["id"])
+
+        empty = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome")
+        self.assertEqual(empty.status_code, 200, empty.text)
+        self.assertEqual(empty.json()["current_answer"]["status"], "empty")
+        self.assertEqual(empty.json()["events"], [])
+        self.assertEqual(empty.json()["claims"], [])
+        self.assertEqual(empty.json()["counts"]["waiting_for_review"], 1)
+
+        confirmed = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/intake/{first['id']}/confirm",
+            json=self.confirmation(first),
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        first_event_id = confirmed.json()["final_event_id"]
+
+        outcome = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome")
+        self.assertEqual(outcome.status_code, 200, outcome.text)
+        payload = outcome.json()
+        self.assertEqual(payload["current_answer"]["status"], "available")
+        self.assertEqual([event["id"] for event in payload["events"]], [first_event_id])
+        self.assertEqual(payload["counts"]["events"], 1)
+        self.assertEqual(payload["counts"]["claims"], 1)
+        self.assertEqual(payload["counts"]["evidence"], 1)
+        self.assertEqual(payload["claims"][0]["event_id"], first_event_id)
+        self.assertTrue(payload["claims"][0]["evidence"][0]["snapshot_url"])
+
+        report = self.client.post(
+            "/pldr-api/v1/reports",
+            json={"investigation_id": topic, "title": "Outcome baseline"},
+        )
+        self.assertEqual(report.status_code, 200, report.text)
+        report_page = self.client.get(report.json()["url"])
+        self.assertEqual(report_page.status_code, 200, report_page.text)
+        self.assertIn("这是生成时的冻结版本", report_page.text)
+        self.assertIn("1 条主张仍处于待核实或证据冲突状态", report_page.text)
+        baseline = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
+        self.assertEqual(baseline["changes"]["basis"], "latest_report")
+        self.assertEqual(baseline["changes"]["new_event_count"], 0)
+
+        second = self.create_intake("outcome-two")
+        self.link(topic, "intake", second["id"])
+        second_confirmation = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/intake/{second['id']}/confirm",
+            json=self.confirmation(second),
+        )
+        self.assertEqual(second_confirmation.status_code, 200, second_confirmation.text)
+        changed = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
+        self.assertEqual(changed["changes"]["new_event_count"], 1)
+        self.assertEqual(
+            changed["changes"]["new_event_ids"],
+            [second_confirmation.json()["final_event_id"]],
+        )
 
     def test_preview_uses_the_same_defaults_as_confirmed_formal_objects(self):
         topic = self.create_topic("Preview defaults")
@@ -476,6 +621,66 @@ class TopicUxContractTest(unittest.TestCase):
             'taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`',
             source,
         )
+
+    def test_topic_onboarding_presents_one_clear_human_confirmation_flow(self):
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200, page.text)
+        html = page.text
+        for label in ("专题成果", "待我处理", "资料与来源"):
+            self.assertIn(label, html)
+        self.assertLess(
+            html.index('data-investigation-tab="outcomes"'),
+            html.index('data-investigation-tab="overview"'),
+        )
+        self.assertLess(
+            html.index('data-investigation-tab="overview"'),
+            html.index('data-investigation-tab="materials"'),
+        )
+        self.assertNotIn('data-investigation-tab="review"', html)
+        self.assertNotIn('id="investigation-more-menu"', html)
+        self.assertIn("创建专题并开始收集", html)
+        self.assertIn("1 · 调查目标", html)
+        self.assertIn("2 · 首批资料", html)
+        self.assertIn("3 · 更新方式", html)
+        self.assertLess(html.index("1 · 调查目标"), html.index("2 · 首批资料"))
+        self.assertLess(html.index("2 · 首批资料"), html.index("3 · 更新方式"))
+        self.assertIn("指事件发生时间，不是新闻发布时间", html)
+        self.assertIn("四种方式可以同时使用", html)
+        self.assertIn('id="investigation-create-source-urls"', html)
+        self.assertIn('id="investigation-create-text"', html)
+        self.assertIn('id="investigation-create-files"', html)
+        self.assertIn("创建专题并开始", html)
+        for hidden_language_control in (
+            'id="investigation-create-source-language"',
+            'id="investigation-create-report-language"',
+            'id="search-language"',
+            'id="import-language"',
+            'id="collection-language"',
+        ):
+            self.assertNotIn(hidden_language_control, html)
+
+        script = self.client.get("/assets/app.js")
+        self.assertEqual(script.status_code, 200, script.text)
+        source = script.text
+        self.assertIn("function suggestedInvestigationQuestion", source)
+        self.assertIn("async function startInitialTopicCollection", source)
+        self.assertIn("function renderOutcomeHero", source)
+        self.assertIn("function renderOutcomeFindings", source)
+        self.assertIn('.filter((event) => event.status === "confirmed")', source)
+        self.assertIn("investigationOutcome: (id)", source)
+        self.assertIn('data-intake-action="accept">采用', source)
+        self.assertIn('data-intake-action="modify">修改后采用', source)
+        self.assertIn('data-intake-action="reject-toggle"', source)
+        self.assertNotIn("预览入档", source)
+        self.assertIn("searchPayloadResults(searchPayload)", source)
+        self.assertIn("await api(API_ROUTES.searchSelect", source)
+        self.assertIn('`${feed ? "/pldr-api/v1/import/rss" : "/pldr-api/v1/import/url"}?defer_candidates=true`', source)
+        self.assertIn('await api("/pldr-api/v1/intake/text?defer_candidates=true"', source)
+        self.assertIn('await api("/pldr-api/v1/intake/files?defer_candidates=true"', source)
+        self.assertIn('report_language: "zh-CN"', source)
+        self.assertIn('source_language: "auto"', source)
+        self.assertIn('if (action === "review") return openIntakeModal', source)
+        self.assertIn("不会把搜索摘要或 AI 草稿直接写成正式结论", html)
 
 
 if __name__ == "__main__":

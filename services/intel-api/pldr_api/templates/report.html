@@ -10,6 +10,10 @@
     header{padding:28px 30px;background:#0b2633;color:#e8f7fc;border-radius:14px;box-shadow:0 18px 45px rgba(18,48,63,.16)}
     header h1{margin:0 0 8px;font-size:28px;line-height:1.25}header p{margin:0;color:#91b4c4;font-size:13px}
     .notice{margin:18px 0;padding:13px 15px;background:#fff4d7;border-left:4px solid #cf941d;border-radius:0 8px 8px 0;color:#765b22;font-size:13px;line-height:1.6}
+    .result{margin:20px 0;padding:24px 27px;background:#fff;border:1px solid #d9e4e9;border-radius:12px;box-shadow:0 10px 30px rgba(25,61,78,.07)}
+    .result h2{font-size:22px}.result-answer{margin:8px 0 0;color:#2f4b59;font-size:15px;line-height:1.8}.result-note{color:#718894;font-size:11px}
+    .result-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px}.result-metrics div{padding:11px;border-radius:8px;background:#f2f7f9;text-align:center}.result-metrics strong{display:block;color:#164f68;font-size:22px}.result-metrics span{color:#708894;font-size:11px}
+    .gaps{margin-top:15px;padding:13px 15px;background:#fff9eb;border-left:4px solid #cf941d;color:#6b5b37}.gaps h3{margin:0 0 7px;color:#7b6127}.gaps ul{margin:0;padding-left:20px;font-size:12px;line-height:1.65}
     .event{margin-top:20px;padding:25px 27px;background:#fff;border:1px solid #d9e4e9;border-radius:12px;box-shadow:0 10px 30px rgba(25,61,78,.07)}
     h2{margin:0 0 10px;color:#0d4b66;font-size:21px}h3{margin:22px 0 9px;color:#24596f;font-size:15px}
     .summary{font-size:14px;line-height:1.75;color:#3a5260}.meta{color:#6c8795;font-size:12px;line-height:1.65}
@@ -19,7 +23,7 @@
     .analysis-grid h4{margin:0 0 6px;color:#446b7d;font-size:12px}.analysis-grid ul{margin:0;padding-left:18px}.analysis-grid li{margin:4px 0;color:#526c78;font-size:12px;line-height:1.55}
     .claim{margin:12px 0;padding:15px 16px;background:#f5f9fb;border:1px solid #dce8ed;border-left:4px solid #4eaccb;border-radius:0 8px 8px 0}
     .claim.contested{border-left-color:#d29a35}.claim.unverified{border-left-color:#9568c4}.claim.refuted{border-left-color:#d4565b}
-    .claim-title{display:flex;gap:9px;align-items:flex-start}.claim-title b{font-size:14px;line-height:1.55}.status{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#dcecf2;color:#396477;font-size:10px}
+    .claim-title{display:flex;gap:9px;align-items:flex-start}.claim-title b{font-size:14px;line-height:1.55}.status,.claim-origin{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#dcecf2;color:#396477;font-size:10px}.claim-origin{background:#e7f4ea;color:#357149}
     .evidence{margin:10px 0 0;padding:12px 14px;background:#fff;border:1px solid #dae5e9;border-left:3px solid #4da86f;border-radius:0 7px 7px 0}
     .evidence.contradicts{border-left-color:#d45c60}.evidence.context{border-left-color:#c89a36}.evidence blockquote{margin:7px 0;color:#334e5b;font-size:13px;line-height:1.65}
     .evidence-top{display:flex;gap:8px;color:#678392;font-size:11px}.evidence-top strong{color:#315f72}
@@ -27,7 +31,7 @@
     .evidence a{flex:0 0 auto;color:#087a9f;font-weight:650;text-decoration:none}.evidence a:hover{text-decoration:underline}
     .sources{margin-top:13px;padding-top:12px;border-top:1px solid #e2eaee}.source-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;color:#597481;font-size:11px}
     .hash{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#7d929c}
-    @media(max-width:680px){.page{padding:16px 10px 40px}header,.event{padding:20px 17px}.analysis-grid{grid-template-columns:1fr}.evidence footer,.source-row{align-items:flex-start;flex-direction:column}}
+    @media(max-width:680px){.page{padding:16px 10px 40px}header,.event,.result{padding:20px 17px}.analysis-grid,.result-metrics{grid-template-columns:1fr 1fr}.evidence footer,.source-row{align-items:flex-start;flex-direction:column}}
     @media print{body{background:#fff}.page{max-width:none;padding:0}header,.event{box-shadow:none}.event{break-inside:avoid}.claim{break-inside:avoid}}
   </style>
 </head>
@@ -42,11 +46,26 @@
     <div class="notice">当前为 P0 演示简报。关键判断必须打开证据快照，并在正式使用前回到原始来源再次核验。</div>
     {% endif %}
 
+    <section class="result">
+      <p class="result-note">这是生成时的冻结版本，只使用当时已经人工确认的正式对象。</p>
+      <h2>当前结论</h2>
+      <p class="result-answer">{{ current_answer }}</p>
+      <div class="result-metrics">
+        <div><strong>{{ event_count }}</strong><span>已确认事件</span></div>
+        <div><strong>{{ claim_count }}</strong><span>关键主张</span></div>
+        <div><strong>{{ evidence_count }}</strong><span>固定证据</span></div>
+        <div><strong>{{ source_count }}</strong><span>来源</span></div>
+      </div>
+      {% if information_gaps %}
+      <div class="gaps"><h3>未知与下一步</h3><ul>{% for item in information_gaps %}<li>{{ item }}</li>{% endfor %}</ul></div>
+      {% endif %}
+    </section>
+
     {% for event in events %}
     <section class="event">
       <h2>{{ event.title }}</h2>
       <p class="summary">{{ event.summary }}</p>
-      <p class="meta">时间 {{ event.start_at or "未知" }} · 地点 {{ event.location.name or "未知" }} · 文档 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }} · 事件置信度 {{ (event.confidence * 100)|round|int }}%</p>
+      <p class="meta">发生时间 {{ event.start_at or "待核实" }} · 地点 {{ event.location.name or "待核实" }} · 资料 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }}</p>
 
       {% if event.assessment %}
       <h3>结构化研判</h3>
@@ -62,11 +81,10 @@
       <h3>主张与证据</h3>
       {% for claim in event.claims %}
       <article class="claim {{ claim.status }}">
-        <div class="claim-title"><span class="status">{{ claim.status }}</span><b>{{ claim.text }}</b></div>
-        <p class="meta">主张置信度 {{ (claim.confidence * 100)|round|int }}% · 来源 {{ claim.origin }}</p>
+        <div class="claim-title"><span class="status">{{ claim_status_labels.get(claim.status, claim.status) }}</span><span class="claim-origin" data-origin="{{ claim.origin }}">{{ "人工确认" if claim.origin == "human-confirmed" else claim.origin }}</span><b>{{ claim.text }}</b></div>
         {% for evidence in claim.evidence %}
         <div class="evidence {{ evidence.stance }}">
-          <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ evidence.stance }}</strong><span>证据强度 {{ (evidence.strength * 100)|round|int }}%</span></div>
+          <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ stance_labels.get(evidence.stance, evidence.stance) }}</strong><span>固定原文证据</span></div>
           <blockquote>{{ evidence.snippet }}</blockquote>
           <footer>
             <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>

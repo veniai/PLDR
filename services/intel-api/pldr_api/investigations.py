@@ -46,7 +46,7 @@ from .models import (
     SearchSelection,
     SearchSelectionEvent,
 )
-from .repository import serialize_event_card
+from .repository import event_query, serialize_event_card, serialize_event_detail
 from .schemas import (
     ArchiveRequest,
     IntakeConfirmationRequest,
@@ -185,6 +185,10 @@ def create_investigation_record(
         title=request.title.strip(),
         question=_question_from_request(request) or "",
         description=request.description.strip(),
+        tracking_mode=request.tracking_mode,
+        event_start_at=request.event_start_at,
+        event_end_at=request.event_end_at,
+        settings_json=request.settings.model_dump(),
         status=request.status,
         created_at=now,
         updated_at=now,
@@ -201,6 +205,9 @@ def create_investigation_record(
         detail={
             "title": investigation.title,
             "question": investigation.question,
+            "tracking_mode": investigation.tracking_mode,
+            "event_start_at": iso(investigation.event_start_at),
+            "event_end_at": iso(investigation.event_end_at),
             "status": investigation.status,
         },
     )
@@ -646,6 +653,10 @@ def serialize_investigation(
         "question": investigation.question,
         "objective": investigation.question,
         "description": investigation.description,
+        "tracking_mode": investigation.tracking_mode or "one_time",
+        "event_start_at": iso(investigation.event_start_at),
+        "event_end_at": iso(investigation.event_end_at),
+        "settings": dict(investigation.settings_json or {}),
         "status": investigation.status,
         "created_at": iso(investigation.created_at),
         "updated_at": iso(investigation.updated_at),
@@ -737,6 +748,169 @@ def serialize_investigation(
         for entry in report_entries
     ]
     return payload
+
+
+def serialize_investigation_outcome(
+    session: Session,
+    investigation: Investigation,
+) -> dict[str, Any]:
+    """Build the user-facing result from confirmed formal objects only.
+
+    Review tasks are exposed only as counts so that candidates and failures can
+    guide the analyst back to the work queue without leaking draft content into
+    the topic result.
+    """
+    detail = serialize_investigation(session, investigation, include_detail=True)
+    linked_event_ids = [
+        event["id"] for event in detail.get("events", []) if event.get("id")
+    ]
+    event_models = []
+    if linked_event_ids:
+        event_models = list(
+            session.scalars(
+                event_query().where(
+                    Event.id.in_(linked_event_ids),
+                    Event.status == "confirmed",
+                )
+            ).unique()
+        )
+    by_id = {event.id: event for event in event_models}
+    ordered_models = [
+        by_id[event_id] for event_id in linked_event_ids if event_id in by_id
+    ]
+    ordered_models.sort(
+        key=lambda event: (
+            (event.metadata_json or {}).get("start_at_known") is not False,
+            event.start_at,
+            event.updated_at,
+            event.id,
+        ),
+        reverse=True,
+    )
+    events = [serialize_event_detail(event) for event in ordered_models]
+
+    claims: list[dict[str, Any]] = []
+    entity_index: dict[str, dict[str, Any]] = {}
+    source_index: dict[str, dict[str, Any]] = {}
+    information_gaps: list[str] = []
+    missing_evidence_claim_ids: list[str] = []
+    for event in events:
+        for entity in event.get("entities", []):
+            entity_index.setdefault(entity["id"], entity)
+        for document in event.get("documents", []):
+            source = document.get("source") or {}
+            source_id = source.get("id")
+            if source_id:
+                source_index.setdefault(source_id, source)
+        assessment = event.get("assessment") or {}
+        for gap in assessment.get("information_gaps") or []:
+            cleaned = str(gap).strip()
+            if cleaned and cleaned not in information_gaps:
+                information_gaps.append(cleaned)
+        for claim in event.get("claims", []):
+            evidence_items = claim.get("evidence") or []
+            claims.append(
+                {
+                    **claim,
+                    "event_id": event["id"],
+                    "event_title": event["title"],
+                    "evidence_count": len(evidence_items),
+                }
+            )
+            if not evidence_items:
+                missing_evidence_claim_ids.append(claim["id"])
+
+    reports = detail.get("reports", [])
+    latest_report = reports[0] if reports else None
+    latest_report_event_ids = set((latest_report or {}).get("event_ids") or [])
+    baseline_at = (latest_report or {}).get("generated_at") or detail.get("created_at")
+    baseline_time: datetime | None = None
+    if baseline_at:
+        try:
+            baseline_time = datetime.fromisoformat(str(baseline_at).replace("Z", "+00:00"))
+            if baseline_time.tzinfo is None:
+                baseline_time = baseline_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            baseline_time = None
+    new_event_ids = [
+        event.id for event in ordered_models if event.id not in latest_report_event_ids
+    ] if latest_report else [event.id for event in ordered_models]
+    updated_event_ids = [
+        event.id
+        for event in ordered_models
+        if latest_report
+        and event.id in latest_report_event_ids
+        and baseline_time is not None
+        and (event.updated_at.replace(tzinfo=timezone.utc) if event.updated_at.tzinfo is None else event.updated_at)
+        > baseline_time
+    ]
+
+    latest_event = events[0] if events else None
+    latest_assessment = (latest_event or {}).get("assessment") or {}
+    if latest_event:
+        answer_text = str(latest_assessment.get("judgement") or latest_event.get("summary") or "").strip()
+        current_answer = {
+            "status": "available",
+            "headline": f"已确认 {len(events)} 个事件，当前最新进展：{latest_event['title']}",
+            "text": answer_text or "该事件已进入正式档案，但尚未填写可展示的摘要。",
+            "basis": "formal_assessment" if latest_assessment.get("judgement") else "confirmed_event_summary",
+            "event_id": latest_event["id"],
+            "notice": "仅汇总本专题已人工确认的正式对象；未确认候选不会进入成果。",
+        }
+    else:
+        current_answer = {
+            "status": "empty",
+            "headline": "尚未形成正式成果",
+            "text": "资料可以继续在后台处理；只有经过人工采用的内容才会出现在这里。",
+            "basis": "no_confirmed_event",
+            "event_id": None,
+            "notice": "没有使用搜索摘要或 AI 草稿填充结论。",
+        }
+
+    unresolved_claims = [
+        claim for claim in claims if claim.get("status") in {"contested", "unverified"}
+    ]
+    task_status = detail.get("task_status") or {}
+    return {
+        "investigation": {
+            "id": investigation.id,
+            "title": investigation.title,
+            "question": investigation.question,
+            "tracking_mode": investigation.tracking_mode or "one_time",
+            "status": investigation.status,
+        },
+        "generated_at": iso(utcnow()),
+        "current_answer": current_answer,
+        "changes": {
+            "basis": "latest_report" if latest_report else "topic_created",
+            "label": "自上次报告以来" if latest_report else "当前累计",
+            "since": baseline_at,
+            "new_event_ids": new_event_ids,
+            "new_event_count": len(new_event_ids),
+            "updated_event_ids": updated_event_ids,
+            "updated_event_count": len(updated_event_ids),
+            "latest_report": latest_report,
+        },
+        "counts": {
+            "events": len(events),
+            "claims": len(claims),
+            "evidence": sum(claim["evidence_count"] for claim in claims),
+            "sources": len(source_index),
+            "entities": len(entity_index),
+            "unresolved_claims": len(unresolved_claims),
+            "claims_without_evidence": len(missing_evidence_claim_ids),
+            "waiting_for_review": int(task_status.get("ready") or 0),
+            "processing": sum(int(task_status.get(status_value) or 0) for status_value in ("queued", "fetching", "generating")),
+            "failed": int(task_status.get("failed") or 0),
+        },
+        "events": events,
+        "claims": claims,
+        "entities": list(entity_index.values()),
+        "sources": list(source_index.values()),
+        "information_gaps": information_gaps,
+        "missing_evidence_claim_ids": missing_evidence_claim_ids,
+        "reports": reports,
+    }
 
 
 def serialize_link(link: InvestigationLink) -> dict[str, Any]:
@@ -3074,6 +3248,17 @@ def get_investigation(
     return serialize_investigation(session, investigation, include_detail=True)
 
 
+@router.get("/{investigation_id}/outcome")
+def get_investigation_outcome(
+    investigation_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return serialize_investigation_outcome(session, investigation)
+
+
 @router.get("/{investigation_id}/intake/{item_id}")
 def get_investigation_intake(
     investigation_id: str,
@@ -3366,6 +3551,10 @@ def update_investigation(
         "title": investigation.title,
         "question": investigation.question,
         "description": investigation.description,
+        "tracking_mode": investigation.tracking_mode or "one_time",
+        "event_start_at": iso(investigation.event_start_at),
+        "event_end_at": iso(investigation.event_end_at),
+        "settings": dict(investigation.settings_json or {}),
         "status": investigation.status,
     }
     if request.title is not None:
@@ -3375,6 +3564,31 @@ def update_investigation(
         investigation.question = question
     if request.description is not None:
         investigation.description = request.description.strip()
+    if request.tracking_mode is not None:
+        investigation.tracking_mode = request.tracking_mode
+        if request.tracking_mode == "continuous":
+            investigation.event_end_at = None
+    if "event_start_at" in request.model_fields_set:
+        investigation.event_start_at = request.event_start_at
+    if "event_end_at" in request.model_fields_set and investigation.tracking_mode != "continuous":
+        investigation.event_end_at = request.event_end_at
+    comparable_start = investigation.event_start_at
+    comparable_end = investigation.event_end_at
+    if comparable_start is not None and comparable_start.tzinfo is None:
+        comparable_start = comparable_start.replace(tzinfo=timezone.utc)
+    if comparable_end is not None and comparable_end.tzinfo is None:
+        comparable_end = comparable_end.replace(tzinfo=timezone.utc)
+    if (
+        comparable_start is not None
+        and comparable_end is not None
+        and comparable_end < comparable_start
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="event_end_at must not be earlier than event_start_at",
+        )
+    if request.settings is not None:
+        investigation.settings_json = request.settings.model_dump()
     if request.status is not None:
         investigation.status = request.status
     investigation.updated_at = utcnow()
@@ -3391,6 +3605,10 @@ def update_investigation(
                 "title": investigation.title,
                 "question": investigation.question,
                 "description": investigation.description,
+                "tracking_mode": investigation.tracking_mode or "one_time",
+                "event_start_at": iso(investigation.event_start_at),
+                "event_end_at": iso(investigation.event_end_at),
+                "settings": dict(investigation.settings_json or {}),
                 "status": investigation.status,
             },
         },

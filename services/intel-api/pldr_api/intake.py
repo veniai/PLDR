@@ -538,6 +538,8 @@ async def submit_web_intake(
     language: str,
     input_type: str = "web",
     review_extra: dict[str, Any] | None = None,
+    *,
+    defer_candidates: bool = False,
 ) -> IntakeItem:
     requested_url = str(url)
     common = {
@@ -580,6 +582,9 @@ async def submit_web_intake(
         )
         session.add(item)
         session.commit()
+        if defer_candidates:
+            session.refresh(item)
+            return item
         return await generate_candidates(session, item)
     except (ArchivedIntakeError, IntakeMutationConflictError):
         # Candidate generation crosses an await boundary.  If another request
@@ -603,7 +608,12 @@ async def submit_web_intake(
         )
 
 
-async def submit_text_intake(session: Session, request: Any) -> IntakeItem:
+async def submit_text_intake(
+    session: Session,
+    request: Any,
+    *,
+    defer_candidates: bool = False,
+) -> IntakeItem:
     common = {
         "source_description": request.source_description.strip(),
         "title": _clean_known(request.title),
@@ -629,6 +639,8 @@ async def submit_text_intake(session: Session, request: Any) -> IntakeItem:
         session.add(item)
         session.commit()
         session.refresh(item)
+        if defer_candidates:
+            return item
         return await generate_candidates(session, item)
     except (ArchivedIntakeError, IntakeMutationConflictError):
         session.rollback()
@@ -671,6 +683,8 @@ async def submit_file_intake(
     upload: Any,
     source_description: str,
     language: str,
+    *,
+    defer_candidates: bool = False,
 ) -> IntakeItem:
     filename = Path(upload.filename or "").name
     suffix = Path(filename).suffix.lower()
@@ -741,6 +755,8 @@ async def submit_file_intake(
         session.add(item)
         session.commit()
         session.refresh(item)
+        if defer_candidates:
+            return item
         return await generate_candidates(session, item)
     except (ArchivedIntakeError, IntakeMutationConflictError):
         session.rollback()
@@ -775,6 +791,8 @@ async def submit_rss_intake(
     xml: str | None,
     source_name: str,
     language: str,
+    *,
+    defer_candidates: bool = False,
 ) -> list[IntakeItem]:
     try:
         if not xml:
@@ -820,6 +838,7 @@ async def submit_rss_intake(
                     synthetic_html,
                     language,
                     input_type="rss",
+                    defer_candidates=defer_candidates,
                 )
             )
         return results

@@ -203,6 +203,68 @@ class InvestigationWorkflowTest(unittest.TestCase):
             "Port disruption",
         )
 
+    def test_topic_scope_mode_time_and_settings_are_persisted(self):
+        created = self.client.post(
+            "/pldr-api/v1/investigations",
+            json={
+                "title": "海上无人作战",
+                "question": "海上无人作战能力正在如何演变？",
+                "description": "关注公开来源中的装备、部署与实战运用。",
+                "tracking_mode": "continuous",
+                "event_start_at": "2026-01-01T00:00:00Z",
+                "event_end_at": "2026-12-31T23:59:59Z",
+                "settings": {
+                    "source_language": "auto",
+                    "report_language": "zh-CN",
+                    "publication_window": "30d",
+                    "auto_select_limit": 5,
+                },
+            },
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        topic = created.json()
+        self.assertEqual(topic["tracking_mode"], "continuous")
+        self.assertEqual(topic["event_start_at"], "2026-01-01T00:00:00Z")
+        self.assertIsNone(topic["event_end_at"])
+        self.assertEqual(topic["settings"]["source_language"], "auto")
+        self.assertEqual(topic["settings"]["report_language"], "zh-CN")
+        self.assertEqual(topic["settings"]["publication_window"], "30d")
+        self.assertEqual(topic["settings"]["auto_select_limit"], 5)
+
+        investigation_id = topic["id"]
+        updated = self.client.patch(
+            f"/pldr-api/v1/investigations/{investigation_id}",
+            json={
+                "tracking_mode": "one_time",
+                "event_end_at": "2026-06-30T23:59:59Z",
+            },
+        )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["tracking_mode"], "one_time")
+        self.assertEqual(updated.json()["event_end_at"], "2026-06-30T23:59:59Z")
+
+        invalid = self.client.patch(
+            f"/pldr-api/v1/investigations/{investigation_id}",
+            json={"event_end_at": "2025-12-31T23:59:59Z"},
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        fetched = self.client.get(
+            f"/pldr-api/v1/investigations/{investigation_id}"
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(fetched.json()["event_end_at"], "2026-06-30T23:59:59Z")
+
+        invalid_create = self.client.post(
+            "/pldr-api/v1/investigations",
+            json={
+                "title": "Invalid time range",
+                "question": "Should this invalid time range be stored?",
+                "event_start_at": "2026-02-01T00:00:00Z",
+                "event_end_at": "2026-01-01T00:00:00Z",
+            },
+        )
+        self.assertEqual(invalid_create.status_code, 422, invalid_create.text)
+
     def test_search_context_and_selection_are_db_only_idempotent_and_nonempty(self):
         hit = SearchHit(
             original_url="https://public.example.org/search-hit",

@@ -64,7 +64,7 @@ const state = {
   investigationMode: "loading",
   investigationError: "",
   activeInvestigationId: null,
-  activeInvestigationTab: "overview",
+  activeInvestigationTab: "outcomes",
   investigationSectionByTab: { materials: "discovery", outcomes: "events" },
   investigationDetails: new Map(),
   investigationTasks: new Map(),
@@ -75,6 +75,8 @@ const state = {
   investigationEventDetails: new Map(),
   investigationEventErrors: new Map(),
   investigationEventRequestTokens: new Map(),
+  investigationOutcomes: new Map(),
+  investigationOutcomeErrors: new Map(),
   investigationPollTimer: null,
   investigationRequestSerial: 0,
   investigationCreateRequestSerial: 0,
@@ -97,6 +99,7 @@ const API_ROUTES = Object.freeze({
   investigation: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}`,
   investigationTasks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/tasks`,
   investigationActivity: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/activity`,
+  investigationOutcome: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/outcome`,
   investigationLinks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/links`,
   investigationIntakeAction: (investigationId, itemId, action) => `/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/intake/${encodeURIComponent(itemId)}/${action}`,
   taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`,
@@ -112,13 +115,14 @@ const API_ROUTES = Object.freeze({
 const LOCAL_INVESTIGATION_KEY = "pldr.investigations.v1";
 const NEW_INVESTIGATION_VALUE = "__new_investigation__";
 const UNASSIGNED_VALUE = "__unassigned__";
-const INVESTIGATION_TABS = new Set(["overview", "materials", "review", "outcomes", "activity"]);
+const INVESTIGATION_TABS = new Set(["overview", "materials", "outcomes", "activity"]);
 const INVESTIGATION_SECTIONS = Object.freeze({
   materials: new Set(["discovery", "monitoring"]),
   outcomes: new Set(["events", "claims", "reports"]),
 });
 const LEGACY_INVESTIGATION_TABS = Object.freeze({
   today: { tab: "overview" },
+  review: { tab: "overview" },
   discovery: { tab: "materials", section: "discovery" },
   monitoring: { tab: "materials", section: "monitoring" },
   events: { tab: "outcomes", section: "events" },
@@ -146,7 +150,7 @@ const LABELS = {
   intakeStatus: {
     queued: "已排队",
     parsed: "已解析",
-    candidate_ready: "候选待审",
+    candidate_ready: "等待确认",
     generation_failed: "生成失败",
     confirmed: "已确认入档",
     rejected: "不采用",
@@ -650,6 +654,16 @@ function normalizeInvestigation(raw, syncMode = "server") {
     title: source.title || source.name || "未命名专题",
     question: source.question || source.objective || source.description || "尚未填写核心调查问题。",
     description: source.description || "",
+    tracking_mode: source.tracking_mode || "one_time",
+    event_start_at: source.event_start_at || null,
+    event_end_at: source.event_end_at || null,
+    settings: {
+      source_language: "auto",
+      report_language: "zh-CN",
+      publication_window: "30d",
+      auto_select_limit: 5,
+      ...(source.settings || source.settings_json || {}),
+    },
     status: source.status || "active",
     created_at: source.created_at || null,
     updated_at: source.updated_at || source.last_updated || source.created_at || null,
@@ -743,6 +757,10 @@ function createLocalInvestigation(fields) {
     title: fields.title,
     question: fields.question || fields.title,
     description: fields.description || "",
+    tracking_mode: fields.tracking_mode || "one_time",
+    event_start_at: fields.event_start_at || null,
+    event_end_at: fields.event_end_at || null,
+    settings: fields.settings || {},
     status: "active",
     created_at: now,
     updated_at: now,
@@ -763,6 +781,10 @@ async function createInvestigation(fields) {
     title: fields.title.trim(),
     question: (fields.question || fields.title).trim(),
     description: (fields.description || "").trim(),
+    tracking_mode: fields.tracking_mode || "one_time",
+    event_start_at: fields.event_start_at || null,
+    event_end_at: fields.tracking_mode === "continuous" ? null : fields.event_end_at || null,
+    settings: fields.settings || {},
     status: "active",
   };
   if (state.investigationMode !== "unavailable") {
@@ -966,9 +988,15 @@ function investigationMetrics(investigation) {
   const tasks = tasksForInvestigation(investigation);
   const taskStatus = investigation?.task_status || investigation?.raw?.task_status || {};
   const statusActive = ["queued", "fetching", "generating", "ready", "failed"].reduce((sum, key) => sum + Number(taskStatus[key] || 0), 0);
+  const processing = ["queued", "fetching", "generating"].reduce((sum, key) => sum + Number(taskStatus[key] || 0), 0);
+  const ready = Number(raw.ready ?? raw.review_ready ?? taskStatus.ready ?? tasks.filter((task) => canonicalTaskStage(task) === "ready").length);
+  const failed = Number(raw.failed ?? taskStatus.failed ?? tasks.filter((task) => canonicalTaskStage(task) === "failed").length);
   return {
     tasks: Number(raw.pending_tasks ?? (Object.keys(taskStatus).length ? statusActive : tasks.filter(taskIsActive).length)),
-    ready: Number(raw.ready ?? raw.review_ready ?? taskStatus.ready ?? tasks.filter((task) => canonicalTaskStage(task) === "ready").length),
+    ready,
+    failed,
+    processing: Object.keys(taskStatus).length ? processing : tasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length,
+    attention: ready + failed,
     events: Number(raw.events ?? raw.event_count ?? eventsForInvestigation(investigation).length),
     sources: Number(raw.sources ?? raw.collection_targets ?? raw.source_count ?? targetsForInvestigation(investigation).length),
   };
@@ -1035,7 +1063,7 @@ function updateDestinationFields(kind) {
           ? (unclassifiedInvestigation()
             ? "检索与材料会进入服务端“系统待归类”（inv_unclassified），异步进度仍可追踪，但不会冒充用户专题。"
             : "旧版后端未返回系统待归类专题；将保留原采集箱兼容流程，不会声称已归入用户专题。")
-          : "材料处理状态会在专题“待审核”中持续显示。";
+          : "材料处理状态会在专题的“待我处理”中持续显示。";
   }
   if (kind === "search" && state.searchResults.length) renderSearchResults();
 }
@@ -1082,8 +1110,8 @@ function renderInvestigationHome() {
         <h3>${escapeHtml(investigation.title)}</h3>
         <p>${escapeHtml(investigation.question)}</p>
         <span class="investigation-card-metrics">
-          <span><strong>${metrics.tasks}</strong>待处理</span>
-          <span><strong>${metrics.ready}</strong>待审核</span>
+          <span><strong>${metrics.attention}</strong>待我处理</span>
+          <span><strong>${metrics.processing}</strong>系统处理中</span>
           <span><strong>${metrics.events}</strong>已确认事件</span>
         </span>
       </button>`;
@@ -1096,7 +1124,7 @@ function renderInvestigationHome() {
       <button class="btn btn-primary" type="button" data-investigation-action="create">创建第一个专题</button>
     </div>`}${referenceInvestigations.length ? `<div class="investigation-list-divider"><span>参考入口</span><small>不计入“我的专题”，也不能作为资料归类目标</small></div>${renderCards(referenceInvestigations)}` : ""}`;
 
-  const assignments = allHomeAssignments();
+  const assignments = allHomeAssignments().filter(({ task }) => ["ready", "failed"].includes(canonicalTaskStage(task)));
   const visibleAssignments = assignments.slice(0, HOME_ASSIGNMENT_WINDOW);
   $("#assignment-count").textContent = String(assignments.length);
   $("#assignment-list").innerHTML = assignments.length ? `${visibleAssignments.map(({ task, investigation }) => {
@@ -1195,6 +1223,7 @@ async function loadInvestigationWorkspace(investigationId, { quiet = false } = {
     api(API_ROUTES.investigation(investigation.id)),
     loadAllInvestigationTasks(investigation.id),
     loadAllInvestigationActivity(investigation.id),
+    api(API_ROUTES.investigationOutcome(investigation.id)),
   ]);
   if (requestSerial !== state.investigationRequestSerial || state.activeInvestigationId !== investigation.id) return;
   if (calls[0].status === "fulfilled") {
@@ -1220,6 +1249,18 @@ async function loadInvestigationWorkspace(investigationId, { quiet = false } = {
     state.investigationActivities.delete(investigation.id);
     state.investigationActivityErrors.set(investigation.id, calls[2].reason);
   }
+  if (calls[3].status === "fulfilled") {
+    const outcome = calls[3].value;
+    state.investigationOutcomes.set(investigation.id, outcome);
+    state.investigationOutcomeErrors.delete(investigation.id);
+    (outcome.events || []).forEach((event) => {
+      state.investigationEventDetails.set(event.id, event);
+      state.investigationEventErrors.delete(event.id);
+    });
+  } else {
+    state.investigationOutcomes.delete(investigation.id);
+    state.investigationOutcomeErrors.set(investigation.id, calls[3].reason);
+  }
   const detailLinks = unwrapItems(state.investigationDetails.get(investigation.id), "links");
   state.investigationLinks.set(investigation.id, detailLinks);
   renderInvestigationHome();
@@ -1237,10 +1278,10 @@ function scheduleInvestigationPoll() {
   state.investigationPollTimer = window.setTimeout(() => loadInvestigationWorkspace(investigation.id, { quiet: true }), 2500);
 }
 
-function normalizeInvestigationRoute(tab = "overview", section = null) {
+function normalizeInvestigationRoute(tab = "outcomes", section = null) {
   const legacy = LEGACY_INVESTIGATION_TABS[tab];
   if (legacy) return { tab: legacy.tab, section: legacy.section || null };
-  const normalizedTab = INVESTIGATION_TABS.has(tab) ? tab : "overview";
+  const normalizedTab = INVESTIGATION_TABS.has(tab) ? tab : "outcomes";
   const allowedSections = INVESTIGATION_SECTIONS[normalizedTab];
   const fallbackSection = normalizedTab === "materials" ? "discovery" : normalizedTab === "outcomes" ? "events" : null;
   return {
@@ -1254,11 +1295,11 @@ function activeInvestigationSection(tab = state.activeInvestigationTab) {
 }
 
 function investigationShowsClaims() {
-  return state.activeInvestigationTab === "outcomes" && activeInvestigationSection("outcomes") === "claims";
+  return state.activeInvestigationTab === "outcomes";
 }
 
 function investigationNeedsEvidence() {
-  return state.activeInvestigationTab === "overview" || investigationShowsClaims();
+  return investigationShowsClaims();
 }
 
 function eventOverviewInvestigation() {
@@ -1447,7 +1488,7 @@ async function showClassicWorkspace({ syncUrl = true, scopeInvestigationId = nul
   return true;
 }
 
-async function openInvestigation(investigationId, tab = "overview", { syncUrl = true, section = null } = {}) {
+async function openInvestigation(investigationId, tab = "outcomes", { syncUrl = true, section = null } = {}) {
   closeRouteScopedSurfaces();
   resetEventOverviewContext();
   const investigation = state.investigations.find((item) => item.id === investigationId);
@@ -1524,6 +1565,14 @@ function setInvestigationSection(section, { syncUrl = true } = {}) {
   if (investigationNeedsEvidence()) loadInvestigationEvidence(activeInvestigation());
 }
 
+function investigationScopeLabel(investigation) {
+  const mode = investigation.tracking_mode === "continuous" ? "持续关注" : "一次性研究";
+  const start = investigation.event_start_at ? formatDate(investigation.event_start_at) : "不限起始时间";
+  if (investigation.tracking_mode === "continuous") return `${mode} · 事件时间：${start}起`;
+  const end = investigation.event_end_at ? formatDate(investigation.event_end_at) : "不限结束时间";
+  return `${mode} · 事件时间：${start} 至 ${end}`;
+}
+
 function renderInvestigationPage() {
   const investigation = activeInvestigation();
   if (!investigation) return;
@@ -1535,20 +1584,18 @@ function renderInvestigationPage() {
       <span class="eyebrow">ACTIVE INVESTIGATION</span>
       <h1 id="investigation-page-title">${escapeHtml(investigation.title)}</h1>
       <p>${escapeHtml(investigation.question)}${investigation.description ? ` · ${escapeHtml(investigation.description)}` : ""}</p>
+      <div class="investigation-scope-line"><span>${escapeHtml(investigationScopeLabel(investigation))}</span></div>
     </div>
     <div class="investigation-page-actions">
-      <button class="btn btn-ghost" type="button" data-investigation-action="search">⌕ 发现资料</button>
-      <button class="btn btn-ghost" type="button" data-investigation-action="import">＋ 导入资料</button>
-      <button class="btn btn-primary" type="button" data-investigation-action="review">核对候选（${metrics.ready}）</button>
+      <button class="btn btn-ghost" type="button" data-investigation-action="search">⌕ 自动发现</button>
+      <button class="btn btn-ghost" type="button" data-investigation-action="import">＋ 添加资料</button>
+      <button class="btn btn-primary" type="button" data-investigation-action="review">待我处理（${metrics.attention}）</button>
     </div>`;
   $$("[data-investigation-tab]", $("#investigation-tabs")).forEach((button) => {
     const active = button.dataset.investigationTab === state.activeInvestigationTab;
     button.classList.toggle("active", active);
     if (button.getAttribute("role") === "tab") button.setAttribute("aria-selected", String(active));
   });
-  const reviewCount = $("#investigation-review-tab-count");
-  if (reviewCount) reviewCount.textContent = String(metrics.ready);
-  $("#investigation-more-menu")?.classList.toggle("active", state.activeInvestigationTab === "activity");
   renderInvestigationPanel(investigation);
   renderMetrics();
 }
@@ -1586,7 +1633,13 @@ function renderInvestigationPanel(investigation) {
       actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取完整操作记录</button>',
     })
     : "";
-  $("#investigation-panel").innerHTML = `${queueError}${eventError}${activityError}${content}`;
+  const outcomeError = state.activeInvestigationTab === "outcomes" && state.investigationOutcomeErrors.get(investigation.id)
+    ? renderOperationalError(state.investigationOutcomeErrors.get(investigation.id), {
+      stage: "fetch",
+      actionHtml: '<button class="btn btn-ghost" type="button" data-investigation-action="refresh">重新读取专题成果</button>',
+    })
+    : "";
+  $("#investigation-panel").innerHTML = `${queueError}${eventError}${activityError}${outcomeError}${content}`;
 }
 
 function investigationSectionNav(tab, options) {
@@ -1597,23 +1650,168 @@ function investigationSectionNav(tab, options) {
 }
 
 function renderInvestigationMaterials(investigation) {
-  const section = activeInvestigationSection("materials");
-  const nav = investigationSectionNav("materials", [
-    ["discovery", "搜索资料"],
-    ["monitoring", "监测来源", targetsForInvestigation(investigation).length],
-  ]);
-  return `${nav}${section === "monitoring" ? renderInvestigationMonitoring(investigation) : renderInvestigationDiscovery(investigation)}`;
+  return `${investigationPanelHeading("MATERIALS", "资料与来源", "查看已经导入的资料、固定网站和搜索记录；这里是原始材料区，不是最终结论。")}
+    <div class="material-entry-grid">
+      <button type="button" class="material-entry-card" data-investigation-action="import"><span>01</span><strong>添加我的资料</strong><small>网页、粘贴文本或本地文件</small></button>
+      <button type="button" class="material-entry-card" data-investigation-action="add-source"><span>02</span><strong>关注固定网站</strong><small>网页或 RSS 持续采集</small></button>
+      <button type="button" class="material-entry-card" data-investigation-action="search"><span>03</span><strong>自动搜索公开资料</strong><small>关键词发现并处理选中原文</small></button>
+    </div>
+    <div class="materials-overview-stack">${renderInvestigationDiscovery(investigation)}${renderInvestigationMonitoring(investigation)}</div>`;
+}
+
+function fallbackOutcomeForInvestigation(investigation) {
+  // The dedicated outcome endpoint is authoritative.  If it is unavailable,
+  // fail closed and reuse only event cards explicitly marked confirmed.
+  const eventCards = eventsForInvestigation(investigation).filter((event) => event.status === "confirmed");
+  const events = eventCards
+    .map((event) => state.investigationEventDetails.get(event.id) || event)
+    .sort((a, b) => new Date(b.updated_at || b.start_at || 0) - new Date(a.updated_at || a.start_at || 0));
+  const claims = events.flatMap((event) => (event.claims || []).map((claim) => ({
+    ...claim,
+    event_id: event.id,
+    event_title: event.title,
+    evidence_count: (claim.evidence || []).length,
+  })));
+  const entities = [...new Map(events.flatMap((event) => event.entities || []).map((entity) => [entity.id, entity])).values()];
+  const sourceIds = new Set(events.flatMap((event) => event.documents || []).map((document) => document.source?.id).filter(Boolean));
+  const evidenceCount = claims.reduce((sum, claim) => sum + Number(claim.evidence_count || 0), 0);
+  const latestEvent = events[0] || null;
+  return {
+    current_answer: latestEvent ? {
+      status: "available",
+      headline: `已确认 ${events.length} 个事件，当前最新进展：${latestEvent.title}`,
+      text: latestEvent.assessment?.judgement || latestEvent.summary || "该事件已进入正式档案。",
+      notice: "只展示已确认的正式对象。",
+    } : {
+      status: "empty",
+      headline: "尚未形成正式成果",
+      text: "资料可以继续在后台处理；只有经过人工采用的内容才会出现在这里。",
+      notice: "没有使用搜索摘要或 AI 草稿填充结论。",
+    },
+    changes: { basis: "topic_created", label: "当前累计", since: investigation.created_at, new_event_count: events.length, updated_event_count: 0 },
+    counts: {
+      events: events.length,
+      claims: claims.length,
+      evidence: evidenceCount,
+      sources: sourceIds.size,
+      entities: entities.length,
+      unresolved_claims: claims.filter((claim) => ["contested", "unverified"].includes(claim.status)).length,
+      claims_without_evidence: claims.filter((claim) => !claim.evidence_count).length,
+      waiting_for_review: investigationMetrics(investigation).ready,
+      processing: investigationMetrics(investigation).processing,
+      failed: investigationMetrics(investigation).failed,
+    },
+    events,
+    claims,
+    entities,
+    information_gaps: events.flatMap((event) => event.assessment?.information_gaps || []),
+    reports: reportsForInvestigation(investigation),
+  };
+}
+
+function outcomeForInvestigation(investigation) {
+  return state.investigationOutcomes.get(investigation.id) || fallbackOutcomeForInvestigation(investigation);
+}
+
+function outcomeStatusClass(status) {
+  return ({ confirmed: "supported", supported: "supported", contested: "contested", refuted: "refuted", unverified: "unverified" })[status] || "unverified";
+}
+
+function renderOutcomeHero(investigation, outcome) {
+  const answer = outcome.current_answer || {};
+  const counts = outcome.counts || {};
+  const continuous = investigation.tracking_mode === "continuous";
+  const empty = answer.status !== "available";
+  return `<section class="outcome-hero ${empty ? "empty" : "available"}">
+    <div class="outcome-hero-topline"><span>${continuous ? "持续关注" : "一次性研究"}</span><small>${continuous ? "当前成果会随人工确认持续更新" : "每次生成报告都会保留一个冻结版本"}</small></div>
+    <span class="panel-kicker">CURRENT ANSWER</span>
+    <h2>${escapeHtml(answer.headline || "尚未形成正式成果")}</h2>
+    <p class="outcome-answer">${escapeHtml(answer.text || "只有经过人工确认的内容才会进入专题成果。")}</p>
+    <p class="outcome-boundary">${escapeHtml(answer.notice || "未确认候选不会进入成果。")}</p>
+    <div class="outcome-hero-actions">
+      ${empty ? '<button class="btn btn-primary" type="button" data-investigation-action="review">查看待我处理</button>' : '<button class="btn btn-primary" type="button" data-investigation-action="generate-report">生成当前报告</button>'}
+      <button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新成果</button>
+      <span>${Number(counts.events || 0)} 个已确认事件 · ${Number(counts.evidence || 0)} 条证据 · ${Number(counts.sources || 0)} 个来源</span>
+    </div>
+  </section>`;
+}
+
+function renderOutcomeChanges(outcome) {
+  const counts = outcome.counts || {};
+  const changes = outcome.changes || {};
+  const hasBaseline = changes.basis === "latest_report";
+  return `<section class="workbench-surface outcome-changes">
+    <div class="workbench-surface-head"><div><h3>${escapeHtml(changes.label || "当前累计")}</h3><p>${hasBaseline ? `从 ${formatDate(changes.since, true)} 生成的上次报告开始计算` : "尚无报告基线，显示当前已经确认的全部成果"}</p></div></div>
+    <div class="outcome-change-grid">
+      <div><strong>${hasBaseline ? Number(changes.new_event_count || 0) : Number(counts.events || 0)}</strong><span>${hasBaseline ? "新增事件" : "已确认事件"}</span></div>
+      <div><strong>${hasBaseline ? Number(changes.updated_event_count || 0) : Number(counts.claims || 0)}</strong><span>${hasBaseline ? "更新事件" : "关键主张"}</span></div>
+      <div><strong>${Number(counts.unresolved_claims || 0)}</strong><span>仍有疑点</span></div>
+      <button type="button" data-investigation-action="review"><strong>${Number(counts.waiting_for_review || 0) + Number(counts.failed || 0)}</strong><span>待我处理</span></button>
+    </div>
+    ${Number(counts.processing || 0) ? `<p class="outcome-processing-note">另有 ${Number(counts.processing)} 份资料由系统后台处理中，无需操作。</p>` : ""}
+  </section>`;
+}
+
+function renderOutcomeFindings(outcome) {
+  const priority = { confirmed: 0, supported: 1, contested: 2, unverified: 3, refuted: 4 };
+  const claims = [...(outcome.claims || [])].sort((a, b) => (priority[a.status] ?? 9) - (priority[b.status] ?? 9));
+  return `<section class="workbench-surface outcome-findings" id="topic-key-findings">
+    <div class="workbench-surface-head"><div><h3>关键发现与证据</h3><p>先看结论状态，需要时再展开原文依据</p></div><span class="count-badge">${claims.length}</span></div>
+    ${claims.length ? `<div class="outcome-finding-list">${claims.map((claim) => {
+      const evidence = claim.evidence || [];
+      return `<details class="outcome-finding ${escapeHtml(outcomeStatusClass(claim.status))}">
+        <summary><span class="claim-status">${escapeHtml(LABELS.claim[claim.status] || claim.status || "待核实")}</span><strong>${escapeHtml(claim.text || "未填写主张")}</strong><small>${evidence.length} 条证据</small></summary>
+        <div class="outcome-finding-body">
+          <p class="outcome-finding-event">来自事件：${escapeHtml(claim.event_title || "未知事件")}<button class="text-btn" type="button" data-investigation-event="${escapeHtml(claim.event_id || "")}">打开事件档案</button></p>
+          ${evidence.length ? evidence.map((item) => `<blockquote class="outcome-evidence ${escapeHtml(item.stance || "context")}"><p>${escapeHtml(item.snippet || "")}</p><footer><span>${escapeHtml(item.document?.source?.name || "来源未知")} · ${formatDate(item.document?.published_at)}</span><a href="${escapeHtml(withEventContext(item.snapshot_url || item.document?.snapshot_url, claim.event_id))}" target="_blank" rel="noopener">查看固定原文 ↗</a></footer></blockquote>`).join("") : '<p class="outcome-gap-note">这条主张尚未连接固定原文证据。</p>'}
+        </div>
+      </details>`;
+    }).join("")}</div>` : '<div class="investigation-empty"><strong>还没有可展示的关键发现</strong><p>事件可以先被确认；主张和证据仍保持为空，不会自动编造。</p></div>'}
+  </section>`;
+}
+
+function renderOutcomeTimeline(outcome) {
+  const events = outcome.events || [];
+  return `<section class="workbench-surface outcome-timeline">
+    <div class="workbench-surface-head"><div><h3>事件时间线</h3><p>只包含本专题已经人工确认的事件</p></div><span class="count-badge">${events.length}</span></div>
+    ${events.length ? `<div class="outcome-timeline-list">${events.map((event) => `<article><time>${event.start_at ? formatDate(event.start_at, true) : "发生时间待核实"}</time><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.summary || "暂无摘要")}</p></div><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">查看依据</button></article>`).join("")}</div>` : '<div class="investigation-empty"><strong>暂无正式事件</strong><p>待确认内容不会提前出现在时间线。</p></div>'}
+  </section>`;
+}
+
+function renderOutcomeEntitiesAndGaps(outcome) {
+  const entities = outcome.entities || [];
+  const gaps = [...new Set((outcome.information_gaps || []).map((item) => String(item).trim()).filter(Boolean))];
+  const counts = outcome.counts || {};
+  return `<div class="outcome-secondary-grid">
+    <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>关键参与方</h3><p>来自已确认事件的实体关系</p></div><span class="count-badge">${entities.length}</span></div>
+      ${entities.length ? `<div class="outcome-entity-list">${entities.map((entity) => `<div><strong>${escapeHtml(entity.name)}</strong><span>${escapeHtml(entity.role || entity.type || "相关")}</span></div>`).join("")}</div>` : '<div class="investigation-empty"><strong>尚未确认参与方</strong></div>'}
+    </section>
+    <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>未知与下一步</h3><p>明确说出还不知道什么</p></div></div>
+      <ul class="outcome-gap-list">${gaps.map((gap) => `<li>${escapeHtml(gap)}</li>`).join("")}${Number(counts.claims_without_evidence || 0) ? `<li>${Number(counts.claims_without_evidence)} 条主张尚未连接固定证据。</li>` : ""}${Number(counts.unresolved_claims || 0) ? `<li>${Number(counts.unresolved_claims)} 条主张仍处于待核实或证据冲突状态。</li>` : ""}</ul>
+      ${!gaps.length && !Number(counts.claims_without_evidence || 0) && !Number(counts.unresolved_claims || 0) ? '<p class="outcome-gap-note">当前没有登记明确缺口；这不等于信息已经完整。</p>' : ""}
+    </section>
+  </div>`;
+}
+
+function renderOutcomeReportHistory(investigation, outcome) {
+  const reports = outcome.reports || [];
+  const canGenerate = Number(outcome.counts?.events || 0) > 0;
+  return `<section class="workbench-surface outcome-reports">
+    <div class="workbench-surface-head"><div><h3>报告与历史版本</h3><p>报告只使用生成时已经确认的正式成果</p></div><button class="btn btn-primary" type="button" data-investigation-action="generate-report" ${canGenerate ? "" : "disabled"}>生成当前报告</button></div>
+    ${reports.length ? `<div class="outcome-report-list">${reports.map((report, index) => `<article><div><span>${index ? "历史版本" : "最新版本"}</span><h4>${escapeHtml(report.title || `PLDR 专题报告：${investigation.title}`)}</h4><p>${formatDate(report.generated_at || report.created_at, true)} · ${escapeHtml(report.event_count ?? "未知")} 个事件 · ${escapeHtml(report.evidence_count ?? "未知")} 条证据</p></div>${report.url ? `<a class="btn btn-ghost" href="${escapeHtml(report.url)}" target="_blank" rel="noopener">打开报告 ↗</a>` : ""}</article>`).join("")}</div>` : '<div class="investigation-empty"><strong>尚未生成报告</strong><p>专题成果会持续显示；生成报告后会留下可回看的冻结版本。</p></div>'}
+  </section>`;
 }
 
 function renderInvestigationOutcomes(investigation) {
-  const section = activeInvestigationSection("outcomes");
-  const nav = investigationSectionNav("outcomes", [
-    ["events", "已确认事件", eventsForInvestigation(investigation).length],
-    ["claims", "主张与证据"],
-    ["reports", "报告", reportsForInvestigation(investigation).length],
-  ]);
-  const renderer = section === "claims" ? renderInvestigationClaims : section === "reports" ? renderInvestigationReports : renderInvestigationEvents;
-  return `${nav}${renderer(investigation)}`;
+  const outcome = outcomeForInvestigation(investigation);
+  return `<div class="topic-outcome-page">
+    ${renderOutcomeHero(investigation, outcome)}
+    ${renderOutcomeChanges(outcome)}
+    ${renderOutcomeFindings(outcome)}
+    ${renderOutcomeTimeline(outcome)}
+    ${renderOutcomeEntitiesAndGaps(outcome)}
+    ${renderOutcomeReportHistory(investigation, outcome)}
+  </div>`;
 }
 
 function investigationPanelHeading(eyebrow, title, description, actions = "") {
@@ -1663,7 +1861,7 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
     const intake = task.intake_item || state.intakeItems.find((item) => item.id === intakeId);
     let primaryAction = "";
     if (canReview) {
-      primaryAction = `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">核对候选</button>`;
+      primaryAction = `<button class="btn btn-primary" type="button" data-investigation-action="open-review" data-intake-id="${escapeHtml(intakeId)}">查看并决定</button>`;
     } else if (canRetryTask) {
       primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">${escapeHtml(taskFailureActionLabel(normalizedError))}</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.status === "generation_failed") {
@@ -1677,7 +1875,7 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
       && intakeId
       && recordAllowsAction(task, "remove_from_investigation", "remove");
     const secondaryAction = canRemoveFromInvestigation
-      ? `<button class="text-btn task-secondary-action" type="button" data-investigation-action="remove-task" data-task-id="${escapeHtml(taskId || "")}" data-intake-id="${escapeHtml(intakeId)}">从专题移除</button>`
+      ? `<button class="text-btn task-secondary-action" type="button" data-investigation-action="remove-task" data-task-id="${escapeHtml(taskId || "")}" data-intake-id="${escapeHtml(intakeId)}" title="移到本专题已删除，可恢复">删除</button>`
       : "";
     const degradation = task.degradation || (task.degraded && task.error ? task.error : null);
     return `
@@ -1782,30 +1980,28 @@ function renderSituationAssessment(investigation) {
         <span>${failedTasks ? `${failedTasks} 个处理失败` : "处理队列无失败"}</span>
         <span>${sourceFailures ? `${sourceFailures} 个监测来源异常` : "已关联监测来源无已知异常"}</span>
       </div>
-      <div class="situation-actions"><button class="text-btn" type="button" data-investigation-action="claims">核对主张与证据</button><button class="text-btn" type="button" data-investigation-action="review">处理待审与失败</button></div>
+      <div class="situation-actions"><button class="text-btn" type="button" data-investigation-action="claims">查看主张与证据</button><button class="text-btn" type="button" data-investigation-action="review">处理并确认入档</button></div>
     </section>`;
 }
 
 function renderInvestigationToday(investigation) {
   const tasks = tasksForInvestigation(investigation);
   const active = tasks.filter(taskIsActive);
-  const metrics = investigationMetrics(investigation);
-  const failed = active.filter((task) => canonicalTaskStage(task) === "failed").length;
-  const processing = active.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length;
-  return `${investigationPanelHeading("TODAY · ATTENTION QUEUE", "今天需要处理什么", "按处理阶段组织，不是资讯流；所有数字来自当前后端或明确标注的本地关联。", `<button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新</button>`)}
+  const readyTasks = active.filter((task) => canonicalTaskStage(task) === "ready");
+  const failedTasks = active.filter((task) => canonicalTaskStage(task) === "failed");
+  const processingTasks = active.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task)));
+  const attention = readyTasks.length + failedTasks.length;
+  return `${investigationPanelHeading("MY ACTIONS", "待我处理", "这里只放需要你作决定或恢复的内容。系统正在处理的资料不要求你操作。", `<button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新</button>`)}
     <div class="investigation-stats">
-      <div class="investigation-stat"><span>待核对</span><strong>${metrics.ready}</strong><small>需要你确认</small></div>
-      <div class="investigation-stat"><span>处理中</span><strong>${processing}</strong><small>排队、抓取或生成草稿</small></div>
-      <div class="investigation-stat"><span>需要处理</span><strong>${failed}</strong><small>查看原因后恢复</small></div>
-      <div class="investigation-stat"><span>已确认事件</span><strong>${metrics.events}</strong><small>正式档案，不含候选</small></div>
+      <div class="investigation-stat"><span>需要你确认</span><strong>${readyTasks.length}</strong><small>采用、修改后采用或不采用</small></div>
+      <div class="investigation-stat"><span>需要处理</span><strong>${failedTasks.length}</strong><small>看清原因后重试或删除</small></div>
+      <div class="investigation-stat"><span>系统处理中</span><strong>${processingTasks.length}</strong><small>无需操作，完成后自动出现</small></div>
+      <div class="investigation-stat"><span>本轮待办</span><strong>${attention}</strong><small>${attention ? "处理完即可离开" : "当前无需人工操作"}</small></div>
     </div>
-    <div class="investigation-today-grid">
-      <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>优先处理</h3><p>失败与待审核优先，随后显示实际处理进度</p></div><span class="count-badge warning">${active.length}</span></div>${renderTaskRows(active)}</section>
-      <aside class="investigation-rail">
-        ${renderSituationAssessment(investigation)}
-        <div class="workbench-surface"><div class="workbench-surface-head"><div><h3>采集覆盖</h3><p>当前专题的可靠来源</p></div></div><div class="workbench-surface-body"><p class="muted">${targetsForInvestigation(investigation).length} 个已关联监测来源。${state.collectionSummary ? "全局监测服务已连接。" : "监测摘要暂不可用。"}</p><button class="btn btn-ghost" type="button" data-investigation-action="monitoring">查看来源状态</button></div></div>
-        ${renderMiniMap(investigation)}
-      </aside>
+    <div class="attention-queue-stack">
+      <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>需要你确认</h3><p>打开原文和系统整理结果，只做一个明确决定</p></div><span class="count-badge warning">${readyTasks.length}</span></div>${renderTaskRows(readyTasks, "本轮没有需要确认的内容。")}</section>
+      <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>需要处理</h3><p>失败原因、影响和解决办法会直接显示</p></div><span class="count-badge warning">${failedTasks.length}</span></div>${renderTaskRows(failedTasks, "当前没有处理失败的内容。")}</section>
+      <details class="processing-queue" ${processingTasks.length ? "" : "open"}><summary><span>系统正在处理</span><strong>${processingTasks.length}</strong><small>无需操作</small></summary>${renderTaskRows(processingTasks, "系统当前没有后台处理任务。")}</details>
     </div>`;
 }
 
@@ -2027,9 +2223,236 @@ function renderInvestigationActivity(investigation) {
     </section>`;
 }
 
+function syncInvestigationModeFields() {
+  const continuous = $('input[name="investigation-create-mode"]:checked')?.value === "continuous";
+  $("#investigation-create-event-end-field").hidden = continuous;
+  $("#investigation-create-event-start-label").textContent = continuous ? "关注起点（可选）" : "事件开始时间（可选）";
+  if (continuous) {
+    $("#investigation-create-event-end").value = "";
+    $("#investigation-create-event-end").setCustomValidity("");
+  }
+}
+
+function suggestedInvestigationQuestion(title) {
+  const cleaned = String(title || "").trim();
+  return cleaned ? `关于“${cleaned}”，目前有哪些得到公开资料支持的关键事件、参与方、主张和证据？` : "";
+}
+
+function syncInvestigationStarterSuggestions() {
+  const title = $("#investigation-create-name").value.trim();
+  const question = $("#investigation-create-question");
+  const keyword = $("#investigation-create-keyword");
+  if (!question.value.trim() || question.dataset.autoSuggested === "true") {
+    question.value = suggestedInvestigationQuestion(title);
+    question.dataset.autoSuggested = "true";
+    $("#investigation-create-question-note").textContent = title
+      ? "已根据专题名称生成建议，你可以直接修改。"
+      : "填写专题名称后，系统会建议一个核心问题。";
+  }
+  if (!keyword.value.trim() || keyword.dataset.autoSeeded === "true") {
+    keyword.value = title;
+    keyword.dataset.autoSeeded = "true";
+  }
+}
+
+function dateInputToIso(value, endOfDay = false) {
+  if (!value) return null;
+  return `${value}T${endOfDay ? "23:59:59" : "00:00:00"}Z`;
+}
+
+function investigationCreateFields() {
+  const trackingMode = $('input[name="investigation-create-mode"]:checked')?.value || "continuous";
+  return {
+    title: $("#investigation-create-name").value,
+    question: $("#investigation-create-question").value,
+    description: $("#investigation-create-description").value,
+    tracking_mode: trackingMode,
+    event_start_at: dateInputToIso($("#investigation-create-event-start").value),
+    event_end_at: trackingMode === "continuous" ? null : dateInputToIso($("#investigation-create-event-end").value, true),
+    settings: {
+      source_language: "auto",
+      report_language: "zh-CN",
+      publication_window: "all",
+      auto_select_limit: 10,
+    },
+    starter_keyword: $("#investigation-create-keyword").value.trim(),
+    starter_urls: $("#investigation-create-source-urls").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+    starter_text: $("#investigation-create-text").value.trim(),
+    starter_files: [...$("#investigation-create-files").files],
+  };
+}
+
+function validateInvestigationCreate() {
+  syncInvestigationStarterSuggestions();
+  const fields = [$("#investigation-create-name"), $("#investigation-create-question")];
+  const invalid = fields.find((field) => !field.reportValidity());
+  if (invalid) return false;
+  const start = $("#investigation-create-event-start").value;
+  const end = $("#investigation-create-event-end").value;
+  if (start && end && end < start) {
+    $("#investigation-create-event-end").setCustomValidity("结束时间不能早于开始时间");
+    $("#investigation-create-event-end").reportValidity();
+    return false;
+  }
+  $("#investigation-create-event-end").setCustomValidity("");
+  const urlsField = $("#investigation-create-source-urls");
+  const urls = urlsField.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  const invalidUrl = urls.find((value) => {
+    try {
+      return !["http:", "https:"].includes(new URL(value).protocol);
+    } catch (_) {
+      return true;
+    }
+  });
+  urlsField.setCustomValidity(invalidUrl ? `无法识别这个公开地址：${invalidUrl}` : "");
+  if (invalidUrl) {
+    urlsField.reportValidity();
+    return false;
+  }
+  const textField = $("#investigation-create-text");
+  textField.setCustomValidity(textField.value.trim() && textField.value.trim().length < 10 ? "粘贴资料至少需要 10 个字符。" : "");
+  if (!textField.reportValidity()) return false;
+  return true;
+}
+
+function starterUrlLooksLikeFeed(value) {
+  try {
+    const parsed = new URL(value);
+    return /(?:\.(?:rss|atom|xml)|\/(?:feed|rss|atom)\/?$)/i.test(parsed.pathname)
+      || /(?:^|[?&])format=(?:rss|atom|xml)(?:&|$)/i.test(parsed.search);
+  } catch (_) {
+    return false;
+  }
+}
+
+function starterItems(payload) {
+  return payload?.intake_items || [payload?.intake_item].filter(Boolean);
+}
+
+function setInvestigationCreateProgress(message, type = "") {
+  const result = $("#investigation-create-result");
+  result.className = `import-result ${type}`.trim();
+  result.textContent = message;
+}
+
+async function linkStarterItems(investigation, items, origin, errors) {
+  if (!items.length) return;
+  try {
+    const association = await associateInvestigationObjects(investigation, "intake", items.map((item) => item.id), { origin });
+    if (association.failed) errors.push(`${association.failed} 条资料已经保存，但没有成功加入专题`);
+  } catch (error) {
+    errors.push(`资料已经保存，但加入专题失败：${error.message || "未知错误"}`);
+  }
+}
+
+async function startInitialTopicCollection(investigation, fields) {
+  const keyword = fields.starter_keyword || fields.title.trim();
+  const messages = [];
+  const errors = [];
+  let importedCount = 0;
+  if (keyword && isServerInvestigation(investigation)) {
+    setInvestigationCreateProgress("专题已创建，正在搜索公开资料…");
+    try {
+      const searchPayload = await api(API_ROUTES.search, {
+        method: "POST",
+        body: JSON.stringify({ keyword, scope: "news", language: detectSearchLanguage(keyword), limit: 10, page_size: 10, page: 1, investigation_id: investigation.id }),
+      });
+      const candidates = searchPayloadResults(searchPayload)
+        .slice(0, fields.settings.auto_select_limit);
+      if (candidates.length) {
+        await api(API_ROUTES.searchSelect, {
+          method: "POST",
+          body: JSON.stringify({ result_ids: candidates.map((result) => result.id), request_id: makeClientId("topic-onboarding"), investigation_id: investigation.id, actor: "analyst" }),
+        });
+        messages.push(`已搜索“${keyword}”并提交前 ${candidates.length} 条原文处理任务`);
+      } else {
+        messages.push(`已完成“${keyword}”搜索，但当前没有符合发布时间偏好的结果`);
+      }
+    } catch (error) {
+      errors.push(`关键词搜索未启动：${error.message || "未知错误"}`);
+    }
+  } else if (keyword) {
+    errors.push("当前专题只保存在浏览器，关键词搜索未启动");
+  }
+
+  for (const [index, sourceUrl] of fields.starter_urls.entries()) {
+    setInvestigationCreateProgress(`正在保存公开地址（${index + 1}/${fields.starter_urls.length}）…`);
+    try {
+      const hostname = new URL(sourceUrl).hostname;
+      const feed = starterUrlLooksLikeFeed(sourceUrl);
+      const payload = await api(`${feed ? "/pldr-api/v1/import/rss" : "/pldr-api/v1/import/url"}?defer_candidates=true`, {
+        method: "POST",
+        body: JSON.stringify(feed
+          ? { url: sourceUrl, source_name: hostname || "公开 RSS", language: "auto" }
+          : { url: sourceUrl, source_name: hostname || null, language: "auto" }),
+      });
+      const items = starterItems(payload);
+      importedCount += items.length;
+      await linkStarterItems(investigation, items, feed ? "topic_onboarding_rss" : "topic_onboarding_url", errors);
+      items.filter((item) => item.status === "failed").forEach((item) => errors.push(`${hostname || sourceUrl} 处理失败：${item.error || "未取得有效正文"}`));
+    } catch (error) {
+      errors.push(`公开地址未保存：${error.message || "未知错误"}`);
+    }
+  }
+
+  if (fields.starter_text) {
+    setInvestigationCreateProgress("正在保存粘贴资料…");
+    try {
+      const payload = await api("/pldr-api/v1/intake/text?defer_candidates=true", {
+        method: "POST",
+        body: JSON.stringify({
+          text: fields.starter_text,
+          source_description: `${fields.title.trim()} · 用户粘贴资料`,
+          title: `${fields.title.trim()} · 补充资料`,
+          published_at: null,
+          language: "auto",
+        }),
+      });
+      const items = starterItems(payload);
+      importedCount += items.length;
+      await linkStarterItems(investigation, items, "topic_onboarding_text", errors);
+      items.filter((item) => item.status === "failed").forEach((item) => errors.push(`粘贴资料处理失败：${item.error || "未取得有效正文"}`));
+    } catch (error) {
+      errors.push(`粘贴资料未保存：${error.message || "未知错误"}`);
+    }
+  }
+
+  for (const [index, file] of fields.starter_files.entries()) {
+    setInvestigationCreateProgress(`正在保存本地文件（${index + 1}/${fields.starter_files.length}）…`);
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      body.append("source_description", `${fields.title.trim()} · 用户上传文件`);
+      body.append("language", "auto");
+      const payload = await api("/pldr-api/v1/intake/files?defer_candidates=true", { method: "POST", body });
+      const items = starterItems(payload);
+      importedCount += items.length;
+      await linkStarterItems(investigation, items, "topic_onboarding_file", errors);
+      items.filter((item) => item.status === "failed").forEach((item) => errors.push(`${file.name} 处理失败：${item.error || "未取得有效正文"}`));
+    } catch (error) {
+      errors.push(`${file.name} 未保存：${error.message || "未知错误"}`);
+    }
+  }
+
+  if (fields.starter_urls.length) messages.push(`已保存 ${importedCount} 条网页、RSS、文本或文件资料`);
+  else if (importedCount) messages.push(`已保存 ${importedCount} 条文本或文件资料`);
+  if (!fields.starter_urls.length && !fields.starter_text && !fields.starter_files.length) messages.push("已用专题名称或关键词启动公开资料搜索");
+  return { messages, errors };
+}
+
 function openInvestigationCreateModal() {
   const modal = $("#investigation-create-modal");
-  $("#investigation-create-form").reset();
+  const form = $("#investigation-create-form");
+  form.reset();
+  $("#investigation-create-question").dataset.autoSuggested = "true";
+  $("#investigation-create-keyword").dataset.autoSeeded = "true";
+  $("#investigation-create-question-note").textContent = "填写专题名称后，系统会建议一个核心问题。";
+  $("#investigation-create-source-urls").setCustomValidity("");
+  $("#investigation-create-text").setCustomValidity("");
+  const advanced = $("#investigation-create-form .onboarding-advanced");
+  if (advanced) advanced.open = false;
+  syncInvestigationModeFields();
+  $("#investigation-create-result").className = "import-result";
   $("#investigation-create-result").textContent = state.investigationMode === "unavailable" ? "专题服务不可用；提交后将创建明确标注的浏览器本地草稿。" : "";
   if (typeof modal.showModal === "function") modal.showModal();
   else modal.setAttribute("open", "");
@@ -2043,42 +2466,47 @@ function closeInvestigationCreateModal() {
   state.investigationCreateRequestSerial += 1;
   const button = $("#investigation-create-submit");
   button.disabled = false;
-  button.textContent = "创建并进入专题";
+  button.textContent = "创建专题并开始";
 }
 
 async function submitInvestigationCreate(event) {
   event.preventDefault();
+  if (!validateInvestigationCreate()) return;
   const requestSerial = ++state.investigationCreateRequestSerial;
   const button = $("#investigation-create-submit");
   button.disabled = true;
-  button.textContent = "正在创建…";
-  $("#investigation-create-result").className = "import-result";
+  button.textContent = "正在创建专题…";
+  setInvestigationCreateProgress("正在创建专题…");
+  let investigation = null;
   try {
-    const investigation = await createInvestigation({
-      title: $("#investigation-create-name").value,
-      question: $("#investigation-create-question").value,
-      description: $("#investigation-create-description").value,
-    });
+    const fields = investigationCreateFields();
+    investigation = await createInvestigation(fields);
     if (requestSerial !== state.investigationCreateRequestSerial || !$("#investigation-create-modal").open) {
       renderInvestigationHome();
       toast("专题已创建；你已切换页面，所以没有自动跳转。", "info", 6500);
       return;
     }
+    const outcome = await startInitialTopicCollection(investigation, fields);
+    await refreshInvestigationDirectory().catch(() => null);
+    if (requestSerial !== state.investigationCreateRequestSerial || !$("#investigation-create-modal").open) return;
     closeInvestigationCreateModal();
     renderInvestigationHome();
-    toast(investigation.sync_mode === "local" ? "已创建浏览器本地专题草稿；尚未同步服务端。" : "专题已在服务端持久创建。", investigation.sync_mode === "local" ? "info" : "success", 6500);
-    await openInvestigation(investigation.id, "overview");
+    await openInvestigation(investigation.id, "outcomes");
+    const summary = [...outcome.messages, ...outcome.errors].join("；");
+    toast(summary || "专题已创建。", outcome.errors.length ? "error" : investigation.sync_mode === "local" ? "info" : "success", outcome.errors.length ? 9000 : 7000);
   } catch (error) {
     if (requestSerial !== state.investigationCreateRequestSerial) {
-      toast(`后台创建专题失败：${error.message || "未知错误"}`, "error", 7000);
+      toast(`${investigation ? "专题已创建，但后续处理失败" : "后台创建专题失败"}：${error.message || "未知错误"}`, "error", 8000);
       return;
     }
-    $("#investigation-create-result").className = "import-result error";
-    $("#investigation-create-result").textContent = `创建失败：${error.message}。未显示虚假成功。`;
+    $("#investigation-create-result").className = `import-result ${investigation ? "success" : "error"}`;
+    $("#investigation-create-result").textContent = investigation
+      ? `专题已创建，但页面刷新失败：${error.message}。可关闭窗口后在“我的专题”中打开。`
+      : `创建失败：${error.message}。未显示虚假成功。`;
   } finally {
     if (requestSerial === state.investigationCreateRequestSerial) {
       button.disabled = false;
-      button.textContent = "创建并进入专题";
+      button.textContent = "创建专题并开始";
     }
   }
 }
@@ -2131,7 +2559,7 @@ async function handleInvestigationAction(action, node) {
   if (action === "create") return openInvestigationCreateModal();
   if (action === "search") return openExternalSearchModal(investigation?.id);
   if (action === "import") return openImportModal(investigation?.id);
-  if (action === "review") return setInvestigationTab("review");
+  if (action === "review") return openIntakeModal(null, false, isServerInvestigation(investigation) ? investigation.id : null);
   if (action === "claims") return setInvestigationTab("outcomes", { section: "claims" });
   if (action === "monitoring") return setInvestigationTab("materials", { section: "monitoring" });
   if (action === "classic") return showClassicWorkspace({ scopeInvestigationId: investigation?.id || null });
@@ -2164,7 +2592,7 @@ async function handleInvestigationAction(action, node) {
   if (["open-review", "accept-entry", "reject-entry"].includes(action)) {
     const intakeId = node.dataset.intakeId;
     await openIntakeModal(intakeId, false, isServerInvestigation(investigation) ? investigation.id : null);
-    if (action === "accept-entry") toast("请核对或编辑候选，预览影响后再确认入档。", "info", 6000);
+    if (action === "accept-entry") toast("请查看原文和整理结果，再选择采用、修改后采用或不采用。", "info", 6000);
     if (action === "reject-entry") toast("请在审核页展开“不采用”，填写原因后再次确认。", "info", 6000);
     return;
   }
@@ -2356,11 +2784,14 @@ function renderMetrics() {
     }
   } else if (investigation) {
     const metrics = investigationMetrics(investigation);
+    const topicTasks = tasksForInvestigation(investigation).filter(taskIsActive);
+    const needsAttention = topicTasks.filter((task) => ["ready", "failed"].includes(canonicalTaskStage(task))).length;
+    const processing = topicTasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length;
     items = [
-      ["queue", metrics.tasks, "专题待处理"],
-      ["review", metrics.ready, "专题待审核"],
-      ["events", metrics.events, "专题事件"],
-      ["sources", metrics.sources, "专题来源"],
+      ["queue", needsAttention, "待我处理"],
+      ["review", processing, "系统处理中"],
+      ["events", metrics.events, "已确认事件"],
+      ["sources", metrics.sources, "资料来源"],
     ];
     $("#metrics").setAttribute("aria-label", `${investigation.title} 专题指标`);
   } else {
@@ -2369,7 +2800,7 @@ function renderMetrics() {
     items = [
       ["investigations", userInvestigations.length, "我的专题"],
       ["queue", assignments.length, "待我处理"],
-      ["review", assignments.filter(({ task }) => canonicalTaskStage(task) === "ready").length, "待审核"],
+      ["review", assignments.filter(({ task }) => canonicalTaskStage(task) === "ready").length, "待确认"],
       ["failed", assignments.filter(({ task }) => canonicalTaskStage(task) === "failed").length, "失败待恢复"],
     ];
     $("#metrics").setAttribute("aria-label", "我的专题指标");
@@ -2983,18 +3414,8 @@ function detectSearchLanguage(keyword) {
   return "en";
 }
 
-function searchLanguageLabel(language) {
-  return ({ zh: "中文", en: "英语", ar: "阿拉伯语", fr: "法语" })[language] || language || "未知";
-}
-
 function selectedSearchLanguage(keyword = $("#search-keyword")?.value.trim() || "") {
-  const selected = $("#search-language")?.value || "auto";
-  const language = selected === "auto" ? detectSearchLanguage(keyword) : selected;
-  const note = $("#search-language-note");
-  if (note) note.textContent = selected === "auto"
-    ? `已自动识别为${searchLanguageLabel(language)}；如不准确可手动修改。`
-    : `已手动指定为${searchLanguageLabel(language)}。`;
-  return language;
+  return detectSearchLanguage(keyword);
 }
 
 function renderSearchProvider() {
@@ -3134,7 +3555,7 @@ function renderSearchHistory() {
       <article class="search-history-record">
         <button class="search-history-item ${run.id === currentId ? "active" : ""}" type="button" data-search-history-run="${escapeHtml(run.id)}">
           <span class="search-history-topline"><strong>${escapeHtml(run.keyword)}</strong><time>${formatDate(run.created_at, true)}</time></span>
-          <span>${escapeHtml(LABELS.searchScope[run.scope] || run.scope)} · ${run.language ? escapeHtml(searchLanguageLabel(run.language)) : "语言未知"}</span>
+          <span>${escapeHtml(LABELS.searchScope[run.scope] || run.scope)}</span>
           <small>${archived ? "已删除" : `已加载 ${Number(run.loaded_count ?? run.returned_count ?? 0)} 条${run.status === "failed" || run.error ? " · 查询失败" : ""}`}</small>
         </button>
         ${actionButton}
@@ -3270,10 +3691,6 @@ function applySearchPayload(payload, { append = false } = {}) {
   state.searchErrorSource = null;
   if (combinedPayload.keyword) $("#search-keyword").value = combinedPayload.keyword;
   if (combinedPayload.scope && $("#search-scope")) $("#search-scope").value = combinedPayload.scope;
-  if (combinedPayload.language && $("#search-language-note")) {
-    const mode = $("#search-language")?.value || "auto";
-    $("#search-language-note").textContent = `本次运行使用${searchLanguageLabel(combinedPayload.language)}；${mode === "auto" ? "下一次查询仍会按新关键词自动识别" : "下一次查询仍使用当前手动语言设置"}。`;
-  }
   if (runId) state.searchSelectionsByRun.set(runId, new Set(state.searchSelectedIds));
   upsertSearchHistory({ ...combinedPayload, id: runId, loaded_count: state.searchResults.length });
   renderSearchResults();
@@ -3764,7 +4181,7 @@ async function submitSelectedSearchResults() {
     if (runId) state.searchSelectionsByRun.set(runId, new Set());
     closeExternalSearchModal();
     renderInvestigationHome();
-    if (investigation) await openInvestigation(investigation.id, "review");
+    if (investigation) await openInvestigation(investigation.id, "overview");
     else showInvestigationHome();
     if (asynchronous) toast(`已提交 ${responseEntries.length || selectedIds.length} 条任务；专题会逐条显示抓取、生成和审核进度。`, "success", 6500);
     else {
@@ -3846,7 +4263,7 @@ async function submitImport(event) {
   const mode = state.importMode;
   const url = $("#import-url").value.trim();
   const sourceName = $("#import-source").value.trim();
-  const language = $("#import-language").value;
+  const language = "auto";
   const title = $("#import-title").value.trim();
   const published = $("#import-published").value;
   const submit = $("#import-submit");
@@ -3915,7 +4332,8 @@ async function submitImport(event) {
       toast(investigation.sync_mode === "local"
         ? `已导入 ${count} 条真实材料；专题归类仅保存在此浏览器。`
         : `已导入并关联到专题：${count} 条；候选仍需人工审核。`, "success", 7000);
-      await openInvestigation(investigation.id, "review");
+      await openInvestigation(investigation.id, "overview");
+      await openIntakeModal(items[0]?.id || null, false, isServerInvestigation(investigation) ? investigation.id : null);
     } else {
       toast(association.failed
         ? `材料已真实进入采集箱，但专题关联失败：${association.errors?.[0] || "未知错误"}`
@@ -4173,10 +4591,10 @@ function renderConfirmationPreview(preview) {
     </div>
     <div class="preview-change-lists">
       <section><h4>实体 ${formal.entities?.length || 0}</h4>${formal.entities?.length ? `<ul>${formal.entities.map((entity) => `<li><span>${escapeHtml(previewActionLabel(entity.action))}</span>${escapeHtml(entity.name || entity.merge_entity_id || "实体未知")}<small>${escapeHtml(entity.entity_type || "类型未知")} · ${escapeHtml(entity.role || "角色未知")}${entity.aliases?.length ? ` · 别名 ${escapeHtml(entity.aliases.join("、"))}` : ""}</small></li>`).join("")}</ul>` : "<p>不创建或合并实体。</p>"}</section>
-      <section><h4>主张 ${formal.claims?.length || 0}</h4>${formal.claims?.length ? `<ul>${formal.claims.map((claim) => `<li><span>${escapeHtml(previewActionLabel(claim.action))}</span>${escapeHtml(claim.text || claim.merge_claim_id || "主张未知")}<small>${escapeHtml(LABELS.claim[claim.status] || claim.status || "状态未知")} · 置信度 ${percent(claim.confidence)}${claim.temporal_scope ? ` · ${escapeHtml(claim.temporal_scope)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要写入的主张。</p>"}</section>
-      <section><h4>证据 ${formal.evidence?.length || 0}</h4>${formal.evidence?.length ? `<ul>${formal.evidence.map((evidence) => `<li><span>${escapeHtml(LABELS.stance[evidence.stance] || evidence.stance || "背景")}</span><q>${escapeHtml(evidence.snippet || "证据原句未知")}</q><small>强度 ${percent(evidence.strength)}${evidence.note ? ` · ${escapeHtml(evidence.note)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要固定的证据原句。</p>"}</section>
+      <section><h4>主张 ${formal.claims?.length || 0}</h4>${formal.claims?.length ? `<ul>${formal.claims.map((claim) => `<li><span>${escapeHtml(previewActionLabel(claim.action))}</span>${escapeHtml(claim.text || claim.merge_claim_id || "主张未知")}<small>${escapeHtml(LABELS.claim[claim.status] || claim.status || "状态未知")}${claim.temporal_scope ? ` · ${escapeHtml(claim.temporal_scope)}` : ""}</small></li>`).join("")}</ul>` : "<p>没有要写入的主张。</p>"}</section>
+      <section><h4>证据 ${formal.evidence?.length || 0}</h4>${formal.evidence?.length ? `<ul>${formal.evidence.map((evidence) => `<li><span>${escapeHtml(LABELS.stance[evidence.stance] || evidence.stance || "背景")}</span><q>${escapeHtml(evidence.snippet || "证据原句未知")}</q><small>${escapeHtml(evidence.note === "Human-confirmed from isolated intake candidate; machine candidate retained in intake." ? "固定到本次核对的原文快照" : evidence.note || "固定到原文快照")}</small></li>`).join("")}</ul>` : "<p>没有要固定的证据原句。</p>"}</section>
     </div>
-    ${formal.actions?.length ? `<section class="preview-action-summary"><h4>确认保存后将执行</h4><ol>${formal.actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ol>${formal.candidate_generation?.degraded ? "<p>这份基础草稿已经过当前表单校验，仍以你的本次确认为准。</p>" : ""}</section>` : ""}
+    ${formal.actions?.length ? `<section class="preview-action-summary"><h4>确认采用后将执行</h4><ol>${formal.actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ol>${formal.candidate_generation?.degraded ? "<p>这份基础草稿已经过当前表单校验，仍以你的本次确认为准。</p>" : ""}</section>` : ""}
     ${formal.scope?.mode ? `<div class="preview-scope-note">对象范围：${formal.scope.mode === "investigation-only" ? "仅限当前专题" : "已显式允许跨专题复用"}</div>` : ""}
     <details class="preview-technical"><summary>审计追踪</summary><pre>${escapeHtml(JSON.stringify(preview.trace || {}, null, 2))}</pre></details>`;
 }
@@ -4208,6 +4626,13 @@ function renderIntakeReview(item) {
   const entityOptions = state.intakeOptions.entities || [];
   const claimOptions = state.intakeOptions.claims || [];
   const generation = item.candidate_generation || {};
+  const readyItems = state.intakeItems.filter((candidate) => candidate.status === "candidate_ready" && !recordIsArchived(candidate));
+  const readyIndex = Math.max(0, readyItems.findIndex((candidate) => candidate.id === item.id));
+  const normalizedTitle = String(event.title || "").trim().toLocaleLowerCase();
+  const suggestedMerge = normalizedTitle
+    ? eventOptions.find((option) => String(option.title || "").trim().toLocaleLowerCase() === normalizedTitle)
+    : null;
+  const defaultDisposition = suggestedMerge ? "merge" : "create";
   const degraded = ["fallback", "fallback-after-error"].includes(generation.mode);
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">
@@ -4217,28 +4642,38 @@ function renderIntakeReview(item) {
     </div>` : "";
   return `
     <section class="intake-review-material">
-      <div class="intake-step-heading"><span>步骤 2</span><div><h3>核对原始材料</h3><p>证据必须能在固定快照中找到原句。</p></div></div>
+      <div class="intake-step-heading"><span>查看原文</span><div><h3>这份资料实际说了什么？</h3><p>采用前先确认关键原句确实存在于固定原文中。</p></div></div>
       ${renderReviewMaterialSummary(item)}
       ${renderIntakeSnapshots(item)}
       ${renderIntakeFacts(item)}
       <div class="intake-mobile-next"><button class="btn btn-primary" type="button" data-intake-step="2">原文已核对，查看候选 →</button></div>
     </section>
     <section class="intake-review-decision">
-    <div class="intake-step-heading"><span>步骤 3</span><div><h3>决定如何入档</h3><p>编辑机器候选，先预览正式区变化，再由人工确认。</p></div></div>
+    <div class="intake-step-heading"><span>作出决定</span><div><h3>采用这份整理结果吗？</h3><p>${readyItems.length ? `本轮第 ${readyIndex + 1} / ${readyItems.length} 条；处理后会自动打开下一条。` : "确认前不会进入专题成果。"}</p></div></div>
     ${degradedWarning}
     <form class="review-form" data-review-form="${escapeHtml(item.id)}">
+      <section class="review-candidate-summary">
+        <div class="review-candidate-summary-head"><span>${suggestedMerge ? "建议合并" : "建议新建事件"}</span><small>${claims.length} 条主张 · ${evidence.length} 条原文证据</small></div>
+        <h3>${escapeHtml(event.title || "事件标题尚未识别")}</h3>
+        <p>${escapeHtml(event.summary || "系统没有生成摘要，请查看原文后修改或不采用。")}</p>
+        ${claims.length ? `<ul>${claims.slice(0, 3).map((candidate) => `<li>${escapeHtml(candidate.machine?.fields?.text || "未填写主张")}</li>`).join("")}</ul>` : '<p class="outcome-gap-note">没有提出可确认的主张。</p>'}
+        ${suggestedMerge ? `<div class="review-merge-suggestion">发现同名正式事件“${escapeHtml(suggestedMerge.title)}”，默认建议合并；你可以在“修改后采用”中更改。</div>` : ""}
+      </section>
+      <details id="intake-editor" class="review-editor-disclosure">
+        <summary>修改详细内容或合并目标</summary>
+        <div class="review-editor-body">
       <section class="review-section">
-        <h3>人工处置</h3>
+        <h3>保存方式</h3>
         <div class="review-grid">
           <label><span>处置方式</span>
             <select id="intake-disposition">
-              <option value="create">新建正式事件</option>
-              <option value="merge">合并到既有事件</option>
-              <option value="modify">修改候选后新建</option>
+              <option value="create" ${defaultDisposition === "create" ? "selected" : ""}>新建正式事件</option>
+              <option value="merge" ${defaultDisposition === "merge" ? "selected" : ""}>合并到既有事件</option>
+              <option value="modify">修改后新建事件</option>
             </select>
           </label>
           <label><span>合并目标事件</span>
-            <select id="intake-merge-event"><option value="">请选择既有事件</option>${eventOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.title)}</option>`).join("")}</select>
+            <select id="intake-merge-event"><option value="">请选择既有事件</option>${eventOptions.map((option) => `<option value="${escapeHtml(option.id)}" ${suggestedMerge?.id === option.id ? "selected" : ""}>${escapeHtml(option.title)}</option>`).join("")}</select>
           </label>
           <label><span>分析员</span><input id="intake-analyst" value="analyst" maxlength="160"></label>
         </div>
@@ -4301,17 +4736,20 @@ function renderIntakeReview(item) {
           ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${fields.start_offset}-${fields.end_offset}</p>`}
         </div>`;
       }).join("")}</section>
+      <div class="review-editor-apply"><button class="btn btn-primary" type="button" data-intake-action="preview">检查修改后的内容</button></div>
+        </div>
+      </details>
       <section id="intake-reject-panel" class="review-section review-reject-section" hidden>
         <div class="review-reject-heading"><div><h3>不采用这份草稿</h3><p>材料和机器草稿会保留用于审计，正式档案不会改变。</p></div><button class="text-btn" type="button" data-intake-action="cancel-reject">取消</button></div>
-        <label><span>原因</span><textarea id="intake-reject-reason" rows="2" placeholder="填写原因后再次点“确认不采用”"></textarea></label>
+        <label><span>简单说明原因</span><textarea id="intake-reject-reason" rows="2" placeholder="例如：与本专题无关、内容重复或来源无法核实"></textarea></label>
       </section>
-      <div id="intake-preview" class="intake-preview" aria-live="polite"><p class="muted">点击“核对并保存到档案”会先检查证据定位并展示保存摘要，不会立即写入正式档案。</p></div>
+      <div id="intake-preview" class="intake-preview" aria-live="polite"><p class="muted">选择“采用”后，系统会先在这里说明将新增或合并什么，再请你最后确认。</p></div>
       <div class="review-actions">
-        <p class="review-later-note">关闭窗口即可稍后处理，正式档案不会改变。</p>
-        ${renderIntakeRecordActions(item)}
+        <p class="review-later-note">关闭窗口即可稍后处理；未确认内容不会进入专题成果。</p>
         <button class="btn btn-ghost" type="button" data-intake-action="reject-toggle" aria-expanded="false" aria-controls="intake-reject-panel">不采用</button>
-        <button class="btn btn-primary" type="button" data-intake-action="preview">核对并保存到档案</button>
-        <button class="btn btn-primary" type="button" data-intake-action="confirm" hidden disabled title="请先核对并通过校验">确认保存</button>
+        <button class="btn btn-ghost" type="button" data-intake-action="modify">修改后采用</button>
+        <button class="btn btn-primary" type="button" data-intake-action="accept">采用</button>
+        <button class="btn btn-primary" type="button" data-intake-action="confirm" hidden disabled title="请先检查采用后的变化">确认采用</button>
       </div>
     </form>
     </section>`;
@@ -4471,8 +4909,8 @@ async function openIntakeModal(itemId = null, quiet = false, scopeInvestigationI
   state.intakeScopeInvestigationId = scopeInvestigationId;
   state.intakeScopeInvestigationTitle = state.investigations.find((item) => item.id === scopeInvestigationId)?.title || null;
   const modalTitle = state.intakeScopeInvestigationTitle
-    ? `“${state.intakeScopeInvestigationTitle}”待审核材料`
-    : "待处理采集箱";
+    ? `待我确认 · ${state.intakeScopeInvestigationTitle}`
+    : "待我确认";
   $("#intake-modal-title").textContent = modalTitle;
   $("#intake-modal-title").title = modalTitle;
   state.intakeVisibility = "active";
@@ -4511,7 +4949,7 @@ function closeIntakeModal() {
   invalidateIntakePreview();
   state.intakeScopeInvestigationId = null;
   state.intakeScopeInvestigationTitle = null;
-  $("#intake-modal-title").textContent = "待处理采集箱";
+  $("#intake-modal-title").textContent = "待我确认";
   $("#intake-modal-title").removeAttribute("title");
   state.intakeVisibility = "active";
   if (state.globalIntakeItems.length) {
@@ -4578,15 +5016,20 @@ function setIntakeConfirmEnabled(enabled) {
   const modal = $("#intake-modal") || document;
   const confirmButton = $('[data-intake-action="confirm"]', modal);
   const previewButton = $('[data-intake-action="preview"]', modal);
+  const acceptButton = $('[data-intake-action="accept"]', modal);
   if (confirmButton) {
     confirmButton.hidden = !enabled;
     confirmButton.disabled = state.intakeActionBusy || !enabled;
-    confirmButton.textContent = "确认保存";
-    confirmButton.title = enabled ? "核对已通过；确认后才会写入正式档案" : "请先核对并通过校验";
+    confirmButton.textContent = "确认采用";
+    confirmButton.title = enabled ? "确认后才会写入正式档案和专题成果" : "请先检查采用后的变化";
   }
   if (previewButton) {
     previewButton.hidden = Boolean(enabled);
     previewButton.disabled = state.intakeActionBusy;
+  }
+  if (acceptButton) {
+    acceptButton.hidden = Boolean(enabled);
+    acceptButton.disabled = state.intakeActionBusy;
   }
 }
 
@@ -4605,7 +5048,7 @@ function setIntakeRejectExpanded(expanded) {
 
 function setIntakeActionBusy(busy) {
   state.intakeActionBusy = busy;
-  $$('[data-intake-action="preview"], [data-intake-action="reject-toggle"], [data-intake-action="cancel-reject"], [data-intake-action$="-record"]', $("#intake-modal") || document)
+  $$('[data-intake-action="preview"], [data-intake-action="accept"], [data-intake-action="modify"], [data-intake-action="reject-toggle"], [data-intake-action="cancel-reject"], [data-intake-action$="-record"]', $("#intake-modal") || document)
     .forEach((button) => { button.disabled = busy; });
   setIntakeConfirmEnabled(Boolean(state.intakePreviewApproval));
 }
@@ -4733,6 +5176,19 @@ async function handleIntakeAction(action, domEvent = null) {
   }
   const item = selectedIntakeItem();
   if (!item) return;
+  if (action === "modify") {
+    const editor = $("#intake-editor");
+    if (editor) {
+      editor.open = true;
+      const disposition = $("#intake-disposition");
+      if (disposition?.value === "create") disposition.value = "modify";
+      invalidateIntakePreview("修改完成后，点击“检查修改后的内容”。");
+      editor.scrollIntoView({ behavior: "smooth", block: "start" });
+      window.setTimeout(() => $("#intake-event-title")?.focus(), 250);
+    }
+    return;
+  }
+  if (action === "accept") action = "preview";
   if (action === "cancel-reject") {
     setIntakeRejectExpanded(false);
     return;
@@ -4852,8 +5308,8 @@ async function handleIntakeAction(action, domEvent = null) {
       const payload = buildConfirmation(item);
       const fingerprint = confirmationFingerprint(payload);
       if (state.intakePreviewApproval?.itemId !== item.id || state.intakePreviewApproval?.fingerprint !== fingerprint) {
-        invalidateIntakePreview("确认内容尚未预览，或预览后字段已变化。请重新预览再确认。");
-        throw new Error("请先预览当前内容并通过校验，再确认入档。");
+        invalidateIntakePreview("采用内容尚未检查，或检查后字段已变化。请重新检查再确认。");
+        throw new Error("请先检查采用后的变化，再确认采用。");
       }
       const result = await api(intakeReviewRoute(item.id, "confirm"), {
         method: "POST",
@@ -5391,7 +5847,7 @@ async function submitCollectionTarget(event) {
         target_type: $("#collection-target-type").value,
         url: $("#collection-url").value.trim(),
         interval_seconds: Number($("#collection-interval").value) * 60,
-        language: $("#collection-language").value,
+        language: "auto",
         run_immediately: $("#collection-run-immediately").checked,
         ...(isServerInvestigation(destination) ? { investigation_id: destination.id, actor: "analyst" } : {}),
       }),
@@ -5684,6 +6140,15 @@ function bindEvents() {
   $("#btn-investigation-back").addEventListener("click", () => showInvestigationHome());
   $("#investigation-create-close").addEventListener("click", closeInvestigationCreateModal);
   $("#investigation-create-cancel").addEventListener("click", closeInvestigationCreateModal);
+  $$('input[name="investigation-create-mode"]').forEach((input) => input.addEventListener("change", syncInvestigationModeFields));
+  $("#investigation-create-name").addEventListener("input", syncInvestigationStarterSuggestions);
+  $("#investigation-create-question").addEventListener("input", () => {
+    $("#investigation-create-question").dataset.autoSuggested = "false";
+    $("#investigation-create-question-note").textContent = "核心问题将用于组织后续资料和成果。";
+  });
+  $("#investigation-create-keyword").addEventListener("input", () => {
+    $("#investigation-create-keyword").dataset.autoSeeded = "false";
+  });
   $("#investigation-create-form").addEventListener("submit", submitInvestigationCreate);
   $("#search-destination").addEventListener("change", async () => {
     updateDestinationFields("search");
@@ -5749,10 +6214,6 @@ function bindEvents() {
     if (event.key === "Enter") event.preventDefault();
   });
   $("#search-result-state").addEventListener("change", renderSearchResults);
-  $("#search-language").addEventListener("change", () => selectedSearchLanguage());
-  $("#search-keyword").addEventListener("input", () => {
-    if ($("#search-language").value === "auto") selectedSearchLanguage();
-  });
   $("#search-history-toggle").addEventListener("click", () => {
     const panel = $("#search-history-panel");
     const collapsed = panel.classList.toggle("collapsed");
@@ -5841,13 +6302,16 @@ function bindEvents() {
     const assignment = event.target.closest("[data-investigation-assignment]");
     if (assignment) {
       const investigationId = assignment.dataset.investigationId;
-      if (investigationId) openInvestigation(investigationId, "review");
+      if (investigationId) {
+        await openInvestigation(investigationId, "overview");
+        await openIntakeModal(assignment.dataset.intakeId || null, false, investigationId);
+      }
       else if (assignment.dataset.intakeId) openIntakeModal(assignment.dataset.intakeId);
       return;
     }
     const investigationCard = event.target.closest("[data-investigation-id]");
     if (investigationCard && investigationCard.classList.contains("investigation-card")) {
-      openInvestigation(investigationCard.dataset.investigationId, "overview");
+      openInvestigation(investigationCard.dataset.investigationId, "outcomes");
       return;
     }
     const collectionTarget = event.target.closest("[data-collection-target]");

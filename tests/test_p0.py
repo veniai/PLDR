@@ -1246,6 +1246,53 @@ class P0Test(unittest.TestCase):
             migration_engine.dispose()
             shutil.rmtree(migration_root, ignore_errors=True)
 
+    def test_investigation_onboarding_schema_migration_preserves_existing_topics(self):
+        from pldr_api import main as main_module
+
+        migration_root = Path(tempfile.mkdtemp(prefix="pldr-topic-migration-"))
+        migration_engine = create_engine(f"sqlite:///{migration_root / 'legacy.db'}")
+        try:
+            with migration_engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "CREATE TABLE investigations ("
+                        "id VARCHAR(80) PRIMARY KEY, title VARCHAR(160) NOT NULL, "
+                        "question TEXT, description TEXT, status VARCHAR(20), "
+                        "created_at DATETIME, updated_at DATETIME)"
+                    )
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO investigations "
+                        "(id, title, question, description, status, created_at, updated_at) "
+                        "VALUES ('legacy-topic', '既有专题', '既有问题', '', 'active', "
+                        "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+            with patch.object(main_module, "engine", migration_engine):
+                main_module.ensure_compatible_schema()
+                main_module.ensure_compatible_schema()
+            columns = {
+                column["name"]
+                for column in inspect(migration_engine).get_columns("investigations")
+            }
+            self.assertTrue(
+                {"tracking_mode", "event_start_at", "event_end_at", "settings_json"}.issubset(columns)
+            )
+            with migration_engine.connect() as connection:
+                row = connection.execute(
+                    text(
+                        "SELECT title, tracking_mode, settings_json "
+                        "FROM investigations WHERE id='legacy-topic'"
+                    )
+                ).one()
+            self.assertEqual(row.title, "既有专题")
+            self.assertEqual(row.tracking_mode, "one_time")
+            self.assertEqual(str(row.settings_json), "{}")
+        finally:
+            migration_engine.dispose()
+            shutil.rmtree(migration_root, ignore_errors=True)
+
     def test_review_dispositions_are_atomic_idempotent_and_traceable(self):
         baseline = counts(SessionLocal())
 

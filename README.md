@@ -4,7 +4,14 @@
 
 PLDR 是一个面向开源情报工作的证据优先工作台。它借鉴 Palantir 的对象、关系和受控 AI 思路，但不照搬通用企业本体：PLDR 以“来源—文档—快照—主张—证据—研判”为核心链路，让每项分析结论都能回到材料、版本和原文片段。
 
-当前仓库已完成 **P1 外部关键词发现**，并实现 **P1 可靠采集的固定网页与 RSS 纵向切片**。工作台以“专题”而不是一组互不相干的页面为操作单位：确定网页、RSS、后续 API 来源、粘贴文本、本地文件和关键词搜索属于并列输入；关键词搜索用于发现尚不知道 URL 的材料，不替代已知来源采集，也不会绕过人工确认。内置专题用于演示从并行输入、候选隔离、人工审核、事件聚合、主张证据、结构化研判到证据简报生成的完整闭环：
+产品定位、阶段顺序和验收要求分别见：
+
+- `docs/product/PRODUCT-VISION.md`：为什么做以及哪些原则不能破坏；
+- `docs/product/FUNCTIONAL-PERFORMANCE-REQUIREMENTS.md`：用户功能、性能指标、当前状态和验收口径；
+- `docs/product/ROADMAP.md`：P0 至 P4 的阶段顺序和退出条件；
+- `docs/research/REFERENCE-PROJECTS.md`：参考项目对应的用户问题、要求编号和使用边界。
+
+当前仓库已完成 **P1 外部关键词发现**，并实现 **P1 可靠采集的固定网页与 RSS 纵向切片**。工作台以“专题”而不是一组互不相干的页面为操作单位：确定网页、RSS、后续 API 来源、粘贴文本、本地文件和关键词搜索属于并列输入；关键词搜索用于发现尚不知道 URL 的材料，不替代已知来源采集，也不会绕过人工确认。内置专题用于演示从并行输入、候选隔离、人工审核、事件聚合、主张证据、结构化研判到证据简报生成的完整闭环。完整 P1 还必须把这些能力放入至少一个冻结范围和来源的真实专题包，并证明分析员能够回答“今天出现了什么、依据是什么、还缺什么”：
 
 ```text
 确定网页 ───────────────────────────────┐
@@ -156,4 +163,4 @@ LLM_TIMEOUT_SECONDS=60
 
 ## 当前边界
 
-P1 关键词发现和固定网页/RSS 可靠采集切片已经形成可运行闭环，但**完整 P1 尚未退出**。API/浏览器来源、RSS 条目原文追抓、30–50 个真实来源、连续 72 小时、PostgreSQL/PostGIS、模型调用成本与最终验收报告仍待完成；任何未确认候选都不会进入正式档案或报告。详见 `STATUS.md`、`docs/product/P1-EXTERNAL-KEYWORD-DISCOVERY.md`、`docs/product/P1-RELIABLE-COLLECTION-SLICE.md` 与 `docs/product/ROADMAP.md`。
+P1 关键词发现和固定网页/RSS 可靠采集切片已经形成可运行闭环，但**完整 P1 尚未退出**。首个真实专题包及其“今天”输出、API/必要的受控浏览器来源、RSS 条目原文追抓、30–50 个真实来源、连续 72 小时、安全与性能基准、PostgreSQL/PostGIS、模型调用成本与最终验收报告仍待完成；任何未确认候选都不会进入正式档案或报告。详见 `STATUS.md`、`docs/product/FUNCTIONAL-PERFORMANCE-REQUIREMENTS.md`、`docs/product/P1-EXTERNAL-KEYWORD-DISCOVERY.md`、`docs/product/P1-RELIABLE-COLLECTION-SLICE.md` 与 `docs/product/ROADMAP.md`。

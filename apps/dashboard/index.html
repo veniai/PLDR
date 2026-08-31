@@ -20,7 +20,7 @@
       <div id="metrics" class="metrics" aria-label="专题指标"></div>
       <div class="topbar-actions">
         <button id="btn-workbench-home" class="topbar-link active" type="button">我的专题</button>
-        <button id="btn-classic-workspace" class="topbar-link" type="button">事件总览</button>
+        <button id="btn-classic-workspace" class="topbar-link" type="button">高级：全部事件档案</button>
         <div class="system-state">
           <span class="live-dot" aria-hidden="true"></span>
           <span id="system-state-text">正在连接</span>
@@ -76,16 +76,9 @@
         </div>
         <header id="investigation-page-header" class="investigation-page-header"></header>
         <nav id="investigation-tabs" class="investigation-tabs" role="tablist" aria-label="专题工作区">
-          <button type="button" role="tab" data-investigation-tab="overview">概览</button>
-          <button type="button" role="tab" data-investigation-tab="materials">资料</button>
-          <button type="button" role="tab" data-investigation-tab="review">待审核 <span id="investigation-review-tab-count" class="tab-count">0</span></button>
-          <button type="button" role="tab" data-investigation-tab="outcomes">成果</button>
-          <details id="investigation-more-menu" class="investigation-more-menu">
-            <summary>更多</summary>
-            <div class="investigation-more-popover">
-              <button type="button" data-investigation-tab="activity">操作记录</button>
-            </div>
-          </details>
+          <button type="button" role="tab" data-investigation-tab="outcomes">专题成果</button>
+          <button type="button" role="tab" data-investigation-tab="overview">待我处理</button>
+          <button type="button" role="tab" data-investigation-tab="materials">资料与来源</button>
         </nav>
         <div id="investigation-panel" class="investigation-panel" role="tabpanel" aria-live="polite"></div>
       </section>
@@ -116,7 +109,7 @@
           <span aria-hidden="true">⌕</span> 外部关键词发现
         </button>
         <button class="btn btn-ghost intake-button" id="btn-intake" type="button">
-          <span aria-hidden="true">▤</span> 待处理采集箱
+          <span aria-hidden="true">▤</span> 待我确认
           <span id="intake-count" class="count-badge">0</span>
         </button>
         <button class="btn btn-ghost" id="btn-import" type="button">
@@ -304,16 +297,6 @@
                 </select>
               </label>
               <label class="form-field">
-                <span>语言</span>
-                <select id="search-language">
-                  <option value="auto" selected>自动识别</option>
-                  <option value="zh">中文</option>
-                  <option value="en">英语</option>
-                  <option value="ar">阿拉伯语</option>
-                  <option value="fr">法语</option>
-                </select>
-              </label>
-              <label class="form-field">
                 <span>每次加载</span>
                 <select id="search-page-size">
                   <option value="20" selected>20 条</option>
@@ -322,7 +305,7 @@
               </label>
               <button id="search-submit" class="btn btn-primary search-submit" type="submit">开始搜索</button>
             </div>
-            <div id="search-language-note" class="search-language-note">输入关键词后自动识别语言，也可手动指定。</div>
+            <div class="search-language-note">无需选择来源语言；系统按查询内容自动处理并保留原始资料。</div>
             <div id="search-provider-summary" class="search-provider-summary"></div>
             <fieldset class="destination-picker search-destination-picker">
               <legend>处理后加入</legend>
@@ -411,21 +394,10 @@
         <span>受支持文件：TXT / Markdown / HTML / PDF，最大 5 MiB</span>
         <input id="import-file" type="file" accept=".txt,.md,.markdown,.html,.htm,.pdf">
       </label>
-      <div class="form-grid">
-        <label class="form-field">
-          <span id="import-source-label">来源说明</span>
-          <input id="import-source" type="text" maxlength="160" placeholder="网页可留空；文本/文件必填">
-        </label>
-        <label class="form-field">
-          <span>语言</span>
-          <select id="import-language">
-            <option value="en">英语</option>
-            <option value="zh">中文</option>
-            <option value="ar">阿拉伯语</option>
-            <option value="fr">法语</option>
-          </select>
-        </label>
-      </div>
+      <label class="form-field">
+        <span id="import-source-label">来源说明</span>
+        <input id="import-source" type="text" maxlength="160" placeholder="网页可留空；文本/文件必填">
+      </label>
       <label id="import-title-field" class="form-field">
         <span>已知标题（可选；未知请留空）</span>
         <input id="import-title" type="text" maxlength="500" placeholder="未知则留空">
@@ -469,7 +441,7 @@
       <section class="collection-command" aria-labelledby="collection-add-title">
         <div class="collection-command-copy">
           <h3 id="collection-add-title">添加可靠公共来源</h3>
-          <p>固定网页按版本监测；RSS 按条目发现。新材料都进入待审箱，重复项只保留运行记录。</p>
+          <p>固定网页按版本监测；RSS 按条目发现。新材料都进入待确认区，重复项只保留运行记录。</p>
         </div>
         <form id="collection-source-form" class="collection-source-form">
           <label class="form-field">
@@ -494,15 +466,6 @@
               <option value="60" selected>每 1 小时</option>
               <option value="360">每 6 小时</option>
               <option value="1440">每天</option>
-            </select>
-          </label>
-          <label class="form-field">
-            <span>语言</span>
-            <select id="collection-language">
-              <option value="en">英语</option>
-              <option value="zh">中文</option>
-              <option value="ar">阿拉伯语</option>
-              <option value="fr">法语</option>
             </select>
           </label>
           <label class="collection-run-now">
@@ -534,15 +497,15 @@
   <dialog id="intake-modal" class="modal intake-modal" aria-labelledby="intake-modal-title">
     <div class="modal-header">
       <div>
-        <span class="panel-kicker">P0.3 INTAKE REVIEW</span>
-        <h2 id="intake-modal-title">待处理采集箱</h2>
+        <span class="panel-kicker">HUMAN REVIEW</span>
+        <h2 id="intake-modal-title">待我确认</h2>
       </div>
       <button id="intake-close" class="icon-btn" type="button" aria-label="关闭采集箱">×</button>
     </div>
     <nav id="intake-mobile-steps" class="intake-mobile-steps" aria-label="移动端审核步骤">
-      <button type="button" data-intake-step="0">1 选择材料</button>
-      <button type="button" data-intake-step="1">2 核对原文</button>
-      <button type="button" data-intake-step="2">3 决定入档</button>
+      <button type="button" data-intake-step="0">1 选择内容</button>
+      <button type="button" data-intake-step="1">2 查看原文</button>
+      <button type="button" data-intake-step="2">3 作出决定</button>
     </nav>
     <div class="intake-layout">
       <section class="intake-list-panel" aria-label="采集箱条目">
@@ -564,30 +527,94 @@
       <div class="modal-header">
         <div>
           <span class="panel-kicker">NEW INVESTIGATION</span>
-          <h2 id="investigation-create-title">创建专题</h2>
+          <h2 id="investigation-create-title">创建专题并开始收集</h2>
+          <p>说清楚想了解什么，再提供任意一种起始资料；其余由系统处理。</p>
         </div>
         <button id="investigation-create-close" class="icon-btn" type="button" aria-label="关闭创建专题窗口">×</button>
       </div>
-      <label class="form-field">
-        <span>专题名称</span>
-        <input id="investigation-create-name" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪" required>
-      </label>
-      <label class="form-field">
-        <span>核心调查问题</span>
-        <textarea id="investigation-create-question" rows="4" minlength="4" maxlength="800" placeholder="我们需要回答什么问题？" required></textarea>
-      </label>
-      <label class="form-field">
-        <span>范围说明（可选）</span>
-        <textarea id="investigation-create-description" rows="3" maxlength="1200" placeholder="对象、时间范围、地区或明确不包含的内容"></textarea>
-      </label>
-      <div class="form-notice">
-        创建专题不会生成事件或证据。后续资料仍需真实抓取、候选生成和人工确认。
-      </div>
-      <div id="investigation-create-result" class="import-result" aria-live="polite"></div>
-      <div class="modal-actions">
-        <button id="investigation-create-cancel" class="btn btn-ghost" type="button">取消</button>
-        <button id="investigation-create-submit" class="btn btn-primary" type="submit">创建并进入专题</button>
-      </div>
+      <section class="investigation-create-step" aria-labelledby="investigation-create-step-1-title">
+        <div class="onboarding-columns">
+          <div class="onboarding-column onboarding-goal">
+            <div class="onboarding-step-heading">
+              <span class="panel-kicker">1 · 调查目标</span>
+              <h3 id="investigation-create-step-1-title">这个专题要回答什么？</h3>
+            </div>
+            <label class="form-field">
+              <span>专题名称</span>
+              <input id="investigation-create-name" type="text" minlength="2" maxlength="160" placeholder="例如：海上无人作战" required>
+              <small>用于识别专题；填写后系统会建议一个核心问题。</small>
+            </label>
+            <label class="form-field">
+              <span>核心问题</span>
+              <textarea id="investigation-create-question" rows="3" minlength="4" maxlength="800" placeholder="例如：海上无人作战能力正在如何演变，哪些装备和行动已经得到公开证据支持？" required></textarea>
+              <small id="investigation-create-question-note">系统建议仅用于起步，你可以直接修改。</small>
+            </label>
+            <div class="onboarding-field-grid">
+              <label class="form-field"><span id="investigation-create-event-start-label">关注起点（可选）</span><input id="investigation-create-event-start" type="date"><small>指事件发生时间，不是新闻发布时间。</small></label>
+              <label id="investigation-create-event-end-field" class="form-field" hidden><span>事件结束时间（可选）</span><input id="investigation-create-event-end" type="date"><small>指事件发生时间，不是新闻发布时间。</small></label>
+            </div>
+            <details class="onboarding-advanced">
+              <summary>可选：进一步限定研究范围</summary>
+              <div>
+                <label class="form-field">
+                  <span>范围说明</span>
+                  <textarea id="investigation-create-description" rows="3" maxlength="1200" placeholder="例如：关注公开来源中的装备、部署与实战运用；不纳入无法回溯原文的传闻。"></textarea>
+                </label>
+              </div>
+            </details>
+
+          </div>
+
+          <div class="onboarding-column onboarding-materials">
+            <div class="onboarding-step-heading">
+              <span class="panel-kicker">2 · 首批资料</span>
+              <h3>从哪里开始？</h3>
+              <p>四种方式可以同时使用。没有填写关键词时，系统会用专题名称开始搜索。</p>
+            </div>
+            <div class="starter-material-grid">
+              <label class="starter-material-card starter-material-wide">
+                <span>关键词或问题</span>
+                <input id="investigation-create-keyword" type="text" minlength="2" maxlength="400" placeholder="例如：海上无人作战 无人艇 无人潜航器">
+                <small>系统自动识别查询语言，不需要选择来源语言。</small>
+              </label>
+              <label class="starter-material-card starter-material-wide">
+                <span>网页或 RSS 地址</span>
+                <textarea id="investigation-create-source-urls" rows="3" maxlength="12000" placeholder="每行一个公开地址，可同时添加多个"></textarea>
+                <small>仅支持无需登录的公共 HTTP(S) 地址。</small>
+              </label>
+              <label class="starter-material-card">
+                <span>粘贴资料正文</span>
+                <textarea id="investigation-create-text" rows="5" maxlength="200000" placeholder="可直接粘贴已经获得的资料原文"></textarea>
+                <small>原文会被固定保存，未知信息不会被编造。</small>
+              </label>
+              <label class="starter-material-card">
+                <span>上传本地文件</span>
+                <input id="investigation-create-files" type="file" accept=".txt,.md,.markdown,.html,.htm,.pdf" multiple>
+                <small>支持 TXT、Markdown、HTML、PDF；单个文件最大 5 MiB。</small>
+              </label>
+            </div>
+          </div>
+
+          <div class="onboarding-column onboarding-update">
+            <div class="onboarding-section-heading compact">
+              <span class="panel-kicker">3 · 更新方式</span>
+              <h3>这个专题是否继续更新？</h3>
+            </div>
+            <fieldset class="tracking-mode-fieldset">
+              <legend class="sr-only">更新方式</legend>
+              <label><input type="radio" name="investigation-create-mode" value="continuous" checked><span><strong>持续关注（默认）</strong><small>以后可以继续搜索和补充资料。</small></span></label>
+              <label><input type="radio" name="investigation-create-mode" value="one_time"><span><strong>一次性研究</strong><small>围绕明确时间段形成阶段性结论。</small></span></label>
+            </fieldset>
+          </div>
+        </div>
+
+        <div class="form-notice">系统会保存原始资料并生成候选，但不会把搜索摘要或 AI 草稿直接写成正式结论。</div>
+        <div id="investigation-create-result" class="import-result" aria-live="polite"></div>
+        <div class="modal-actions onboarding-final-actions">
+          <button id="investigation-create-cancel" class="btn btn-ghost" type="button">取消</button>
+          <button id="investigation-create-submit" class="btn btn-primary" type="submit">创建专题并开始</button>
+        </div>
+      </section>
     </form>
   </dialog>
 

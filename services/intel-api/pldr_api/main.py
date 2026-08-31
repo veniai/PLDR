@@ -113,6 +113,30 @@ def require_admin_token(x_pldr_admin_token: str | None = Header(default=None)) -
 def ensure_compatible_schema() -> None:
     """Add additive P0.3 columns to an existing P0.2 database without rebuilding user data."""
     inspector = inspect(engine)
+    if "investigations" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("investigations")}
+        additions = {
+            "tracking_mode": "VARCHAR(20) DEFAULT 'one_time'",
+            "event_start_at": "DATETIME",
+            "event_end_at": "DATETIME",
+            "settings_json": "JSON",
+        }
+        missing_columns = set(additions) - columns
+        if missing_columns:
+            with engine.begin() as connection:
+                for name, definition in additions.items():
+                    if name in missing_columns:
+                        connection.execute(
+                            text(f"ALTER TABLE investigations ADD COLUMN {name} {definition}")
+                        )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE investigations SET "
+                    "tracking_mode = COALESCE(tracking_mode, 'one_time'), "
+                    "settings_json = COALESCE(settings_json, '{}')"
+                )
+            )
     if "events" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("events")}
         if "metadata_json" not in columns:
@@ -581,7 +605,11 @@ def create_report(request: ReportRequest, session: Session = Depends(get_session
 
 @app.post("/api/v1/import/url", include_in_schema=False)
 @app.post("/pldr-api/v1/import/url")
-async def import_url(request: ImportUrlRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+async def import_url(
+    request: ImportUrlRequest,
+    defer_candidates: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     try:
         item = await submit_web_intake(
             session,
@@ -590,6 +618,7 @@ async def import_url(request: ImportUrlRequest, session: Session = Depends(get_s
             request.title,
             request.html,
             request.language,
+            defer_candidates=defer_candidates,
         )
     except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
         session.rollback()
@@ -599,7 +628,11 @@ async def import_url(request: ImportUrlRequest, session: Session = Depends(get_s
 
 @app.post("/api/v1/import/rss", include_in_schema=False)
 @app.post("/pldr-api/v1/import/rss")
-async def import_rss_feed(request: ImportRssRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+async def import_rss_feed(
+    request: ImportRssRequest,
+    defer_candidates: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     try:
         items = await submit_rss_intake(
             session,
@@ -607,6 +640,7 @@ async def import_rss_feed(request: ImportRssRequest, session: Session = Depends(
             request.xml,
             request.source_name,
             request.language,
+            defer_candidates=defer_candidates,
         )
     except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
         session.rollback()
@@ -764,9 +798,17 @@ async def retry_external_search_result(
 
 @app.post("/api/v1/intake/text", include_in_schema=False)
 @app.post("/pldr-api/v1/intake/text")
-async def intake_text(request: IntakeTextRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
+async def intake_text(
+    request: IntakeTextRequest,
+    defer_candidates: bool = Query(default=False),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
     try:
-        item = await submit_text_intake(session, request)
+        item = await submit_text_intake(
+            session,
+            request,
+            defer_candidates=defer_candidates,
+        )
     except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -779,10 +821,17 @@ async def intake_file(
     file: UploadFile = File(...),
     source_description: str = Form(...),
     language: str = Form("en"),
+    defer_candidates: bool = Query(default=False),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        item = await submit_file_intake(session, file, source_description, language)
+        item = await submit_file_intake(
+            session,
+            file,
+            source_description,
+            language,
+            defer_candidates=defer_candidates,
+        )
     except (ArchivedIntakeError, IntakeMutationConflictError) as exc:
         session.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
