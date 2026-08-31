@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+
+
+class InvestigationSettings(BaseModel):
+    source_language: Literal["auto", "zh-CN", "en", "ar"] = "auto"
+    report_language: Literal["zh-CN", "en"] = "zh-CN"
+    publication_window: Literal["all", "24h", "7d", "30d"] = "30d"
+    auto_select_limit: int = Field(default=5, ge=1, le=10)
 
 
 class InvestigationCreate(BaseModel):
@@ -11,6 +19,10 @@ class InvestigationCreate(BaseModel):
     # both keys, while persistence keeps one canonical question/goal value.
     objective: str | None = Field(default=None, max_length=4000)
     description: str = Field(default="", max_length=20_000)
+    tracking_mode: Literal["one_time", "continuous"] = "one_time"
+    event_start_at: datetime | None = None
+    event_end_at: datetime | None = None
+    settings: InvestigationSettings = Field(default_factory=InvestigationSettings)
     status: Literal["active", "paused", "closed", "archived"] = "active"
     actor: str = Field(default="analyst", min_length=1, max_length=160)
 
@@ -22,12 +34,24 @@ class InvestigationCreate(BaseModel):
             raise ValueError("title must contain visible characters")
         return cleaned
 
+    @model_validator(mode="after")
+    def validate_event_window(self):
+        if self.event_start_at and self.event_end_at and self.event_end_at < self.event_start_at:
+            raise ValueError("event_end_at must not be earlier than event_start_at")
+        if self.tracking_mode == "continuous":
+            self.event_end_at = None
+        return self
+
 
 class InvestigationUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=240)
     question: str | None = Field(default=None, max_length=4000)
     objective: str | None = Field(default=None, max_length=4000)
     description: str | None = Field(default=None, max_length=20_000)
+    tracking_mode: Literal["one_time", "continuous"] | None = None
+    event_start_at: datetime | None = None
+    event_end_at: datetime | None = None
+    settings: InvestigationSettings | None = None
     status: Literal["active", "paused", "closed", "archived"] | None = None
     actor: str = Field(default="analyst", min_length=1, max_length=160)
 

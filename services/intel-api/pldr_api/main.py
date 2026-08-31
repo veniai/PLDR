@@ -113,6 +113,30 @@ def require_admin_token(x_pldr_admin_token: str | None = Header(default=None)) -
 def ensure_compatible_schema() -> None:
     """Add additive P0.3 columns to an existing P0.2 database without rebuilding user data."""
     inspector = inspect(engine)
+    if "investigations" in inspector.get_table_names():
+        columns = {column["name"] for column in inspector.get_columns("investigations")}
+        additions = {
+            "tracking_mode": "VARCHAR(20) DEFAULT 'one_time'",
+            "event_start_at": "DATETIME",
+            "event_end_at": "DATETIME",
+            "settings_json": "JSON",
+        }
+        missing_columns = set(additions) - columns
+        if missing_columns:
+            with engine.begin() as connection:
+                for name, definition in additions.items():
+                    if name in missing_columns:
+                        connection.execute(
+                            text(f"ALTER TABLE investigations ADD COLUMN {name} {definition}")
+                        )
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE investigations SET "
+                    "tracking_mode = COALESCE(tracking_mode, 'one_time'), "
+                    "settings_json = COALESCE(settings_json, '{}')"
+                )
+            )
     if "events" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("events")}
         if "metadata_json" not in columns:

@@ -456,6 +456,10 @@ class Investigation(Base):
     title: Mapped[str] = mapped_column(String(240), nullable=False)
     question: Mapped[str] = mapped_column(Text, default="")
     description: Mapped[str] = mapped_column(Text, default="")
+    tracking_mode: Mapped[str] = mapped_column(String(20), default="one_time")
+    event_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    event_end_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    settings_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(30), default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(

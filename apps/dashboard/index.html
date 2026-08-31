@@ -76,16 +76,9 @@
         </div>
         <header id="investigation-page-header" class="investigation-page-header"></header>
         <nav id="investigation-tabs" class="investigation-tabs" role="tablist" aria-label="专题工作区">
-          <button type="button" role="tab" data-investigation-tab="overview">概览</button>
-          <button type="button" role="tab" data-investigation-tab="materials">资料</button>
-          <button type="button" role="tab" data-investigation-tab="review">待审核 <span id="investigation-review-tab-count" class="tab-count">0</span></button>
-          <button type="button" role="tab" data-investigation-tab="outcomes">成果</button>
-          <details id="investigation-more-menu" class="investigation-more-menu">
-            <summary>更多</summary>
-            <div class="investigation-more-popover">
-              <button type="button" data-investigation-tab="activity">操作记录</button>
-            </div>
-          </details>
+          <button type="button" role="tab" data-investigation-tab="overview">工作台</button>
+          <button type="button" role="tab" data-investigation-tab="materials">资料库</button>
+          <button type="button" role="tab" data-investigation-tab="outcomes">已确认成果</button>
         </nav>
         <div id="investigation-panel" class="investigation-panel" role="tabpanel" aria-live="polite"></div>
       </section>
@@ -469,7 +462,7 @@
       <section class="collection-command" aria-labelledby="collection-add-title">
         <div class="collection-command-copy">
           <h3 id="collection-add-title">添加可靠公共来源</h3>
-          <p>固定网页按版本监测；RSS 按条目发现。新材料都进入待审箱，重复项只保留运行记录。</p>
+          <p>固定网页按版本监测；RSS 按条目发现。新材料都进入待确认区，重复项只保留运行记录。</p>
         </div>
         <form id="collection-source-form" class="collection-source-form">
           <label class="form-field">
@@ -568,26 +561,76 @@
         </div>
         <button id="investigation-create-close" class="icon-btn" type="button" aria-label="关闭创建专题窗口">×</button>
       </div>
-      <label class="form-field">
-        <span>专题名称</span>
-        <input id="investigation-create-name" type="text" minlength="2" maxlength="160" placeholder="例如：红海航运风险追踪" required>
-      </label>
-      <label class="form-field">
-        <span>核心调查问题</span>
-        <textarea id="investigation-create-question" rows="4" minlength="4" maxlength="800" placeholder="我们需要回答什么问题？" required></textarea>
-      </label>
-      <label class="form-field">
-        <span>范围说明（可选）</span>
-        <textarea id="investigation-create-description" rows="3" maxlength="1200" placeholder="对象、时间范围、地区或明确不包含的内容"></textarea>
-      </label>
-      <div class="form-notice">
-        创建专题不会生成事件或证据。后续资料仍需真实抓取、候选生成和人工确认。
+      <div class="onboarding-progress" aria-label="创建专题进度">
+        <span class="active" data-investigation-create-progress="1">1 明确要解决的问题</span>
+        <span data-investigation-create-progress="2">2 开始收集资料</span>
       </div>
+      <section id="investigation-create-step-1" class="investigation-create-step" aria-labelledby="investigation-create-step-1-title">
+        <div class="onboarding-step-heading">
+          <span class="panel-kicker">STEP 1</span>
+          <h3 id="investigation-create-step-1-title">这个专题要回答什么？</h3>
+        </div>
+        <label class="form-field">
+          <span>专题名称</span>
+          <input id="investigation-create-name" type="text" minlength="2" maxlength="160" placeholder="例如：海上无人作战" required>
+          <small>只用于识别专题，不决定搜索结果。</small>
+        </label>
+        <label class="form-field">
+          <span>核心问题</span>
+          <textarea id="investigation-create-question" rows="3" minlength="4" maxlength="800" placeholder="例如：海上无人作战能力正在如何演变，哪些装备和行动已经得到公开证据支持？" required></textarea>
+          <small>用一句可以持续回答、也可以被证据修正的问题来描述。</small>
+        </label>
+        <fieldset class="tracking-mode-fieldset">
+          <legend>专题类型</legend>
+          <label><input type="radio" name="investigation-create-mode" value="continuous" checked><span><strong>持续关注</strong><small>后续可以不断补充新资料和更新成果。</small></span></label>
+          <label><input type="radio" name="investigation-create-mode" value="one_time"><span><strong>一次性研究</strong><small>围绕一个明确时间段形成阶段性结论。</small></span></label>
+        </fieldset>
+        <div class="onboarding-field-grid">
+          <label class="form-field"><span>事件发生时间（开始，可选）</span><input id="investigation-create-event-start" type="date"></label>
+          <label id="investigation-create-event-end-field" class="form-field" hidden><span>事件发生时间（结束，可选）</span><input id="investigation-create-event-end" type="date"></label>
+        </div>
+        <label class="form-field">
+          <span>范围说明（可选）</span>
+          <textarea id="investigation-create-description" rows="3" maxlength="1200" placeholder="例如：关注公开来源中的装备、部署与实战运用；不纳入无法回溯原文的传闻。"></textarea>
+        </label>
+        <div class="modal-actions">
+          <button id="investigation-create-cancel" class="btn btn-ghost" type="button">取消</button>
+          <button id="investigation-create-next" class="btn btn-primary" type="button">下一步：添加起始资料</button>
+        </div>
+      </section>
+      <section id="investigation-create-step-2" class="investigation-create-step" aria-labelledby="investigation-create-step-2-title" hidden>
+        <div class="onboarding-step-heading">
+          <span class="panel-kicker">STEP 2</span>
+          <h3 id="investigation-create-step-2-title">先从哪里发现资料？</h3>
+          <p>系统会保存原文并生成候选；候选必须由你确认后才进入正式档案。</p>
+        </div>
+        <label class="form-field">
+          <span>起始关键词（推荐）</span>
+          <input id="investigation-create-keyword" type="text" minlength="2" maxlength="400" placeholder="例如：海上无人作战 无人艇 无人潜航器">
+        </label>
+        <div class="onboarding-field-grid">
+          <label class="form-field"><span>资料发布时间偏好</span><select id="investigation-create-publication-window"><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d" selected>最近 30 天</option><option value="all">不限</option></select><small>日期未知的搜索结果仍会保留。</small></label>
+          <label class="form-field"><span>自动处理前几条</span><select id="investigation-create-auto-limit"><option value="3">3 条</option><option value="5" selected>5 条</option><option value="10">10 条</option></select></label>
+        </div>
+        <div class="onboarding-source-row">
+          <label class="form-field"><span>固定网页或 RSS（可选）</span><input id="investigation-create-source-url" type="url" maxlength="2000" placeholder="https://example.org/news 或 RSS 地址"></label>
+          <label class="form-field"><span>类型</span><select id="investigation-create-source-type"><option value="web_page">固定网页</option><option value="rss_feed">RSS</option></select></label>
+        </div>
+        <details class="onboarding-advanced">
+          <summary>高级设置：语言</summary>
+          <div class="onboarding-field-grid">
+            <label class="form-field"><span>来源语言</span><select id="investigation-create-source-language"><option value="auto" selected>自动识别</option><option value="zh-CN">中文</option><option value="en">英文</option><option value="ar">阿拉伯语</option></select></label>
+            <label class="form-field"><span>报告语言</span><select id="investigation-create-report-language"><option value="zh-CN" selected>中文</option><option value="en">英文</option></select></label>
+          </div>
+        </details>
+        <div class="form-notice">搜索结果和 AI 草稿都不是正式证据。只有你确认入档后，事件、主张和证据才会进入“已确认成果”。</div>
+        <div class="modal-actions onboarding-final-actions">
+          <button id="investigation-create-back" class="btn btn-ghost" type="button">上一步</button>
+          <button id="investigation-create-only" class="btn btn-ghost" type="button">暂时只创建专题</button>
+          <button id="investigation-create-submit" class="btn btn-primary" type="submit">创建专题并开始发现</button>
+        </div>
+      </section>
       <div id="investigation-create-result" class="import-result" aria-live="polite"></div>
-      <div class="modal-actions">
-        <button id="investigation-create-cancel" class="btn btn-ghost" type="button">取消</button>
-        <button id="investigation-create-submit" class="btn btn-primary" type="submit">创建并进入专题</button>
-      </div>
     </form>
   </dialog>
 

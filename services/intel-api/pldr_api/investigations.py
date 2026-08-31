@@ -185,6 +185,10 @@ def create_investigation_record(
         title=request.title.strip(),
         question=_question_from_request(request) or "",
         description=request.description.strip(),
+        tracking_mode=request.tracking_mode,
+        event_start_at=request.event_start_at,
+        event_end_at=request.event_end_at,
+        settings_json=request.settings.model_dump(),
         status=request.status,
         created_at=now,
         updated_at=now,
@@ -201,6 +205,9 @@ def create_investigation_record(
         detail={
             "title": investigation.title,
             "question": investigation.question,
+            "tracking_mode": investigation.tracking_mode,
+            "event_start_at": iso(investigation.event_start_at),
+            "event_end_at": iso(investigation.event_end_at),
             "status": investigation.status,
         },
     )
@@ -646,6 +653,10 @@ def serialize_investigation(
         "question": investigation.question,
         "objective": investigation.question,
         "description": investigation.description,
+        "tracking_mode": investigation.tracking_mode or "one_time",
+        "event_start_at": iso(investigation.event_start_at),
+        "event_end_at": iso(investigation.event_end_at),
+        "settings": dict(investigation.settings_json or {}),
         "status": investigation.status,
         "created_at": iso(investigation.created_at),
         "updated_at": iso(investigation.updated_at),
@@ -3366,6 +3377,10 @@ def update_investigation(
         "title": investigation.title,
         "question": investigation.question,
         "description": investigation.description,
+        "tracking_mode": investigation.tracking_mode or "one_time",
+        "event_start_at": iso(investigation.event_start_at),
+        "event_end_at": iso(investigation.event_end_at),
+        "settings": dict(investigation.settings_json or {}),
         "status": investigation.status,
     }
     if request.title is not None:
@@ -3375,6 +3390,31 @@ def update_investigation(
         investigation.question = question
     if request.description is not None:
         investigation.description = request.description.strip()
+    if request.tracking_mode is not None:
+        investigation.tracking_mode = request.tracking_mode
+        if request.tracking_mode == "continuous":
+            investigation.event_end_at = None
+    if "event_start_at" in request.model_fields_set:
+        investigation.event_start_at = request.event_start_at
+    if "event_end_at" in request.model_fields_set and investigation.tracking_mode != "continuous":
+        investigation.event_end_at = request.event_end_at
+    comparable_start = investigation.event_start_at
+    comparable_end = investigation.event_end_at
+    if comparable_start is not None and comparable_start.tzinfo is None:
+        comparable_start = comparable_start.replace(tzinfo=timezone.utc)
+    if comparable_end is not None and comparable_end.tzinfo is None:
+        comparable_end = comparable_end.replace(tzinfo=timezone.utc)
+    if (
+        comparable_start is not None
+        and comparable_end is not None
+        and comparable_end < comparable_start
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="event_end_at must not be earlier than event_start_at",
+        )
+    if request.settings is not None:
+        investigation.settings_json = request.settings.model_dump()
     if request.status is not None:
         investigation.status = request.status
     investigation.updated_at = utcnow()
@@ -3391,6 +3431,10 @@ def update_investigation(
                 "title": investigation.title,
                 "question": investigation.question,
                 "description": investigation.description,
+                "tracking_mode": investigation.tracking_mode or "one_time",
+                "event_start_at": iso(investigation.event_start_at),
+                "event_end_at": iso(investigation.event_end_at),
+                "settings": dict(investigation.settings_json or {}),
                 "status": investigation.status,
             },
         },

@@ -477,6 +477,31 @@ class TopicUxContractTest(unittest.TestCase):
             source,
         )
 
+    def test_topic_onboarding_presents_one_clear_human_confirmation_flow(self):
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200, page.text)
+        html = page.text
+        for label in ("工作台", "资料库", "已确认成果"):
+            self.assertIn(label, html)
+        self.assertNotIn('data-investigation-tab="review"', html)
+        self.assertNotIn('id="investigation-more-menu"', html)
+        self.assertIn("1 明确要解决的问题", html)
+        self.assertIn("2 开始收集资料", html)
+        self.assertIn("事件发生时间（开始，可选）", html)
+        self.assertIn("资料发布时间偏好", html)
+        self.assertIn("高级设置：语言", html)
+        self.assertIn("创建专题并开始发现", html)
+
+        script = self.client.get("/assets/app.js")
+        self.assertEqual(script.status_code, 200, script.text)
+        source = script.text
+        self.assertIn("async function startInitialTopicCollection", source)
+        self.assertIn("searchPayloadResults(searchPayload)", source)
+        self.assertIn("await api(API_ROUTES.searchSelect", source)
+        self.assertIn('await api("/pldr-api/v1/collection/targets"', source)
+        self.assertIn('if (action === "review") return openIntakeModal', source)
+        self.assertIn("搜索结果和 AI 草稿都不是正式证据", html)
+
 
 if __name__ == "__main__":
     unittest.main()
