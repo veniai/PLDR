@@ -626,7 +626,7 @@ class TopicUxContractTest(unittest.TestCase):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200, page.text)
         html = page.text
-        for label in ("专题成果", "待我处理", "资料与来源"):
+        for label in ("专题成果", "待处理", "资料与来源"):
             self.assertIn(label, html)
         self.assertLess(
             html.index('data-investigation-tab="outcomes"'),
@@ -671,6 +671,11 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn('data-intake-action="accept">采用', source)
         self.assertIn('data-intake-action="modify">修改后采用', source)
         self.assertIn('data-intake-action="reject-toggle"', source)
+        for deprecated_label in ("待我处理", "待我确认"):
+            self.assertNotIn(deprecated_label, html)
+            self.assertNotIn(deprecated_label, source)
+        self.assertNotIn("MY QUEUE", html)
+        self.assertNotIn("MY ACTIONS", source)
         self.assertNotIn("预览入档", source)
         self.assertIn("searchPayloadResults(searchPayload)", source)
         self.assertIn("await api(API_ROUTES.searchSelect", source)

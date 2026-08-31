@@ -1063,7 +1063,7 @@ function updateDestinationFields(kind) {
           ? (unclassifiedInvestigation()
             ? "检索与材料会进入服务端“系统待归类”（inv_unclassified），异步进度仍可追踪，但不会冒充用户专题。"
             : "旧版后端未返回系统待归类专题；将保留原采集箱兼容流程，不会声称已归入用户专题。")
-          : "材料处理状态会在专题的“待我处理”中持续显示。";
+          : "材料处理状态会在专题的“待处理”中持续显示。";
   }
   if (kind === "search" && state.searchResults.length) renderSearchResults();
 }
@@ -1110,7 +1110,7 @@ function renderInvestigationHome() {
         <h3>${escapeHtml(investigation.title)}</h3>
         <p>${escapeHtml(investigation.question)}</p>
         <span class="investigation-card-metrics">
-          <span><strong>${metrics.attention}</strong>待我处理</span>
+          <span><strong>${metrics.attention}</strong>待处理</span>
           <span><strong>${metrics.processing}</strong>系统处理中</span>
           <span><strong>${metrics.events}</strong>已确认事件</span>
         </span>
@@ -1589,7 +1589,7 @@ function renderInvestigationPage() {
     <div class="investigation-page-actions">
       <button class="btn btn-ghost" type="button" data-investigation-action="search">⌕ 自动发现</button>
       <button class="btn btn-ghost" type="button" data-investigation-action="import">＋ 添加资料</button>
-      <button class="btn btn-primary" type="button" data-investigation-action="review">待我处理（${metrics.attention}）</button>
+      <button class="btn btn-primary" type="button" data-investigation-action="review">待处理（${metrics.attention}）</button>
     </div>`;
   $$("[data-investigation-tab]", $("#investigation-tabs")).forEach((button) => {
     const active = button.dataset.investigationTab === state.activeInvestigationTab;
@@ -1729,7 +1729,7 @@ function renderOutcomeHero(investigation, outcome) {
     <p class="outcome-answer">${escapeHtml(answer.text || "只有经过人工确认的内容才会进入专题成果。")}</p>
     <p class="outcome-boundary">${escapeHtml(answer.notice || "未确认候选不会进入成果。")}</p>
     <div class="outcome-hero-actions">
-      ${empty ? '<button class="btn btn-primary" type="button" data-investigation-action="review">查看待我处理</button>' : '<button class="btn btn-primary" type="button" data-investigation-action="generate-report">生成当前报告</button>'}
+      ${empty ? '<button class="btn btn-primary" type="button" data-investigation-action="review">查看待处理</button>' : '<button class="btn btn-primary" type="button" data-investigation-action="generate-report">生成当前报告</button>'}
       <button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新成果</button>
       <span>${Number(counts.events || 0)} 个已确认事件 · ${Number(counts.evidence || 0)} 条证据 · ${Number(counts.sources || 0)} 个来源</span>
     </div>
@@ -1746,7 +1746,7 @@ function renderOutcomeChanges(outcome) {
       <div><strong>${hasBaseline ? Number(changes.new_event_count || 0) : Number(counts.events || 0)}</strong><span>${hasBaseline ? "新增事件" : "已确认事件"}</span></div>
       <div><strong>${hasBaseline ? Number(changes.updated_event_count || 0) : Number(counts.claims || 0)}</strong><span>${hasBaseline ? "更新事件" : "关键主张"}</span></div>
       <div><strong>${Number(counts.unresolved_claims || 0)}</strong><span>仍有疑点</span></div>
-      <button type="button" data-investigation-action="review"><strong>${Number(counts.waiting_for_review || 0) + Number(counts.failed || 0)}</strong><span>待我处理</span></button>
+      <button type="button" data-investigation-action="review"><strong>${Number(counts.waiting_for_review || 0) + Number(counts.failed || 0)}</strong><span>待处理</span></button>
     </div>
     ${Number(counts.processing || 0) ? `<p class="outcome-processing-note">另有 ${Number(counts.processing)} 份资料由系统后台处理中，无需操作。</p>` : ""}
   </section>`;
@@ -1991,7 +1991,7 @@ function renderInvestigationToday(investigation) {
   const failedTasks = active.filter((task) => canonicalTaskStage(task) === "failed");
   const processingTasks = active.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task)));
   const attention = readyTasks.length + failedTasks.length;
-  return `${investigationPanelHeading("MY ACTIONS", "待我处理", "这里只放需要你作决定或恢复的内容。系统正在处理的资料不要求你操作。", `<button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新</button>`)}
+  return `${investigationPanelHeading("PENDING", "待处理", "这里只放需要你作决定或恢复的内容。系统正在处理的资料不要求你操作。", `<button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新</button>`)}
     <div class="investigation-stats">
       <div class="investigation-stat"><span>需要你确认</span><strong>${readyTasks.length}</strong><small>采用、修改后采用或不采用</small></div>
       <div class="investigation-stat"><span>需要处理</span><strong>${failedTasks.length}</strong><small>看清原因后重试或删除</small></div>
@@ -2788,7 +2788,7 @@ function renderMetrics() {
     const needsAttention = topicTasks.filter((task) => ["ready", "failed"].includes(canonicalTaskStage(task))).length;
     const processing = topicTasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length;
     items = [
-      ["queue", needsAttention, "待我处理"],
+      ["queue", needsAttention, "待处理"],
       ["review", processing, "系统处理中"],
       ["events", metrics.events, "已确认事件"],
       ["sources", metrics.sources, "资料来源"],
@@ -2799,7 +2799,7 @@ function renderMetrics() {
     const assignments = allHomeAssignments();
     items = [
       ["investigations", userInvestigations.length, "我的专题"],
-      ["queue", assignments.length, "待我处理"],
+      ["queue", assignments.length, "待处理"],
       ["review", assignments.filter(({ task }) => canonicalTaskStage(task) === "ready").length, "待确认"],
       ["failed", assignments.filter(({ task }) => canonicalTaskStage(task) === "failed").length, "失败待恢复"],
     ];
@@ -4909,8 +4909,8 @@ async function openIntakeModal(itemId = null, quiet = false, scopeInvestigationI
   state.intakeScopeInvestigationId = scopeInvestigationId;
   state.intakeScopeInvestigationTitle = state.investigations.find((item) => item.id === scopeInvestigationId)?.title || null;
   const modalTitle = state.intakeScopeInvestigationTitle
-    ? `待我确认 · ${state.intakeScopeInvestigationTitle}`
-    : "待我确认";
+    ? `待确认 · ${state.intakeScopeInvestigationTitle}`
+    : "待确认";
   $("#intake-modal-title").textContent = modalTitle;
   $("#intake-modal-title").title = modalTitle;
   state.intakeVisibility = "active";
@@ -4949,7 +4949,7 @@ function closeIntakeModal() {
   invalidateIntakePreview();
   state.intakeScopeInvestigationId = null;
   state.intakeScopeInvestigationTitle = null;
-  $("#intake-modal-title").textContent = "待我确认";
+  $("#intake-modal-title").textContent = "待确认";
   $("#intake-modal-title").removeAttribute("title");
   state.intakeVisibility = "active";
   if (state.globalIntakeItems.length) {
