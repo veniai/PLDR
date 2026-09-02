@@ -848,12 +848,20 @@ def serialize_investigation_outcome(
     latest_event = events[0] if events else None
     latest_assessment = (latest_event or {}).get("assessment") or {}
     if latest_event:
-        answer_text = str(latest_assessment.get("judgement") or latest_event.get("summary") or "").strip()
+        supported_claims = [
+            str(claim.get("text") or "").strip()
+            for claim in claims
+            if claim.get("status") in {"confirmed", "supported"}
+            and str(claim.get("text") or "").strip()
+        ]
+        answer_text = str(latest_assessment.get("judgement") or "").strip()
+        if not answer_text:
+            answer_text = "；".join(supported_claims[:3])
         current_answer = {
             "status": "available",
             "headline": f"已确认 {len(events)} 个事件，当前最新进展：{latest_event['title']}",
-            "text": answer_text or "该事件已进入正式档案，但尚未填写可展示的摘要。",
-            "basis": "formal_assessment" if latest_assessment.get("judgement") else "confirmed_event_summary",
+            "text": answer_text or "现有材料还不足以形成专题结论，请先补充来源或处理冲突。",
+            "basis": "formal_assessment" if latest_assessment.get("judgement") else ("supported_claims" if supported_claims else "insufficient_evidence"),
             "event_id": latest_event["id"],
             "notice": "仅汇总本专题已人工确认的正式对象；未确认候选不会进入成果。",
         }
@@ -2522,10 +2530,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             if item.status == "generation_failed":
                 fallback_error = item.candidate_error or "Configured model candidate generation failed"
                 from .intake import generate_deterministic_candidates
-
-                item = generate_deterministic_candidates(
-                    session, item, model_error=fallback_error
-                )
+                item = generate_deterministic_candidates(session, item, model_error=fallback_error)
             # Candidate generation commits independently. An analyst may have
             # confirmed/rejected/cancelled the item immediately afterward, so
             # restart and fence before writing the selection trace or terminal

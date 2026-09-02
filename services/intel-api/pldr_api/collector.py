@@ -8,8 +8,8 @@ from .database import Base, SessionLocal, engine
 from .investigations import bootstrap_legacy_investigations, run_review_task_once
 
 
-async def _run_loop(*, poll_seconds: float) -> None:
-    worker_id = worker_identity()
+async def _worker_loop(*, poll_seconds: float, slot: int) -> None:
+    worker_id = f"{worker_identity()}:slot-{slot}"
     prefer_review = True
     while True:
         if prefer_review:
@@ -23,6 +23,13 @@ async def _run_loop(*, poll_seconds: float) -> None:
         prefer_review = not prefer_review
         if completed is None:
             await asyncio.sleep(poll_seconds)
+
+
+async def _run_loop(*, poll_seconds: float, concurrency: int) -> None:
+    await asyncio.gather(*(
+        _worker_loop(poll_seconds=poll_seconds, slot=slot)
+        for slot in range(1, concurrency + 1)
+    ))
 
 
 async def _run_single() -> None:
@@ -43,9 +50,17 @@ def main() -> int:
         default=2.0,
         help="idle delay for --loop (default: 2 seconds)",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="number of bounded worker slots for --loop (default: 4)",
+    )
     args = parser.parse_args()
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be positive")
+    if args.concurrency <= 0 or args.concurrency > 32:
+        parser.error("--concurrency must be between 1 and 32")
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as session:
         bootstrap_legacy_investigations(session)
@@ -53,7 +68,7 @@ def main() -> int:
         if args.once:
             asyncio.run(_run_single())
         else:
-            asyncio.run(_run_loop(poll_seconds=args.poll_seconds))
+            asyncio.run(_run_loop(poll_seconds=args.poll_seconds, concurrency=args.concurrency))
     except KeyboardInterrupt:
         return 130
     return 0

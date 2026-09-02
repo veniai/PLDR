@@ -34,7 +34,7 @@ services:
     build:
       context: .
       dockerfile: services/intel-api/Dockerfile
-    command: ["python", "-m", "pldr_api.collector", "--loop", "--poll-seconds", "${PLDR_COLLECTION_POLL_SECONDS:-2}"]
+    command: ["python", "-m", "pldr_api.collector", "--loop", "--poll-seconds", "${PLDR_COLLECTION_POLL_SECONDS:-2}", "--concurrency", "${PLDR_COLLECTOR_CONCURRENCY:-4}"]
     depends_on:
       pldr-p0:
         condition: service_healthy

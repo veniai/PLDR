@@ -35,11 +35,18 @@ def build_report(
     unresolved_claim_count=0
     claims_without_evidence=0
     source_ids=set()
+    source_documents=[]
+    seen_documents=set()
     information_gaps=[]
+    key_findings=[]
     for event in events:
         for document in event.get("documents",[]):
             source_id=(document.get("source") or {}).get("id")
             if source_id: source_ids.add(source_id)
+            document_key=document.get("id") or (document.get("source") or {}).get("name"), document.get("title")
+            if document_key not in seen_documents:
+                seen_documents.add(document_key)
+                source_documents.append(document)
         assessment=event.get("assessment") or {}
         for gap in assessment.get("information_gaps") or []:
             cleaned=str(gap).strip()
@@ -52,10 +59,17 @@ def build_report(
                 claims_without_evidence+=1
             for evidence in claim["evidence"]:
                 evidence["index"]=evidence_index; evidence_index+=1
+            if claim.get("text") and len(key_findings) < 8:
+                key_findings.append({
+                    "text": claim["text"],
+                    "status": claim.get("status") or "unverified",
+                    "event_title": event.get("title") or "未知事件",
+                    "evidence_count": len(claim.get("evidence") or []),
+                })
     if unresolved_claim_count:
-        information_gaps.append(f"{unresolved_claim_count} 条主张仍处于待核实或证据冲突状态。")
+        information_gaps.append(f"{unresolved_claim_count} 条关键信息需要补充来源或处理冲突。")
     if claims_without_evidence:
-        information_gaps.append(f"{claims_without_evidence} 条主张尚未连接固定原文证据。")
+        information_gaps.append(f"{claims_without_evidence} 条关键信息尚未连接可定位的原文依据。")
     # Keep the frozen report's headline aligned with the live outcome page:
     # prefer the newest known event time, then the most recently linked event.
     latest_event=max(
@@ -67,7 +81,8 @@ def build_report(
         ),
     )[1]
     latest_assessment=latest_event.get("assessment") or {}
-    current_answer=latest_assessment.get("judgement") or latest_event.get("summary") or "尚未填写专题结论。"
+    supported_findings=[item["text"] for item in key_findings if item["status"] in {"confirmed", "supported"}]
+    current_answer=latest_assessment.get("judgement") or ("；".join(supported_findings[:3]) if supported_findings else "现有材料还不足以形成专题结论，请先补充来源或处理冲突。")
     html=env.get_template("report.html").render(
         title=report_title,
         generated_at=generated_at.isoformat().replace("+00:00","Z"),
@@ -79,7 +94,9 @@ def build_report(
         evidence_count=evidence_index-1,
         source_count=len(source_ids),
         information_gaps=information_gaps,
-        claim_status_labels={"confirmed":"已证实","supported":"有证据支持","contested":"证据存在冲突","unverified":"待核实","refuted":"已反驳"},
+        key_findings=key_findings,
+        source_documents=source_documents,
+        claim_status_labels={"confirmed":"人工核实","supported":"有原文支持","contested":"来源有冲突","unverified":"需要补充来源","refuted":"已有反证"},
         stance_labels={"supports":"支持","contradicts":"冲突","context":"背景"},
     )
     stamp=generated_at.strftime("%Y%m%dT%H%M%SZ"); filename=f"{safe_slug(report_title)}-{stamp}.html"; REPORT_DIR.mkdir(parents=True,exist_ok=True); (REPORT_DIR/filename).write_text(html,encoding="utf-8")

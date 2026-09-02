@@ -679,6 +679,31 @@ class P0Test(unittest.TestCase):
         self.assertIn("not an exact substring", blocked.json()["detail"])
         self.assertEqual(counts(SessionLocal()), baseline)
 
+        exact_quote = "The model input states that the warehouse inspection found twelve pallets and one damaged container."
+        duplicate_result = {
+            "mode": "api",
+            "model": "test-model",
+            "result": {
+                "event": {"title": "Duplicate wording", "summary": "A model output with duplicated wording."},
+                "entities": [],
+                "claims": [{
+                    "text": exact_quote,
+                    "evidence": [{"snippet": exact_quote, "stance": "supports", "strength": 0.8}],
+                }],
+            },
+        }
+        with patch("pldr_api.intake.run_model_task", return_value=duplicate_result):
+            duplicate = self.client.post(
+                "/pldr-api/v1/import/url",
+                json={"url": "https://duplicate-claim.example.org/report", "html": html, "language": "en"},
+            )
+        self.assertEqual(duplicate.status_code, 200, duplicate.text)
+        duplicate_item = duplicate.json()["intake_item"]
+        self.assertEqual(duplicate_item["status"], "generation_failed")
+        self.assertIn("must not duplicate", duplicate_item["candidate_generation"]["error"])
+        self.assertFalse(duplicate_item["candidates"])
+        self.assertEqual(counts(SessionLocal()), baseline)
+
     def test_intake_archive_is_reversible_idempotent_and_never_changes_processing_state(self):
         with patch(
             "pldr_api.intake.run_model_task",
