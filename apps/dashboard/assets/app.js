@@ -101,6 +101,7 @@ const API_ROUTES = Object.freeze({
   investigationTasks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/tasks`,
   investigationActivity: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/activity`,
   investigationOutcome: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/outcome`,
+  investigationReorganization: (id, action) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/reorganization/${action}`,
   investigationLinks: (id) => `/pldr-api/v1/investigations/${encodeURIComponent(id)}/links`,
   investigationIntakeAction: (investigationId, itemId, action) => `/pldr-api/v1/investigations/${encodeURIComponent(investigationId)}/intake/${encodeURIComponent(itemId)}/${action}`,
   taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`,
@@ -140,10 +141,11 @@ const ACTIVE_INTAKE_STATUSES = new Set(["queued", "parsed", "candidate_ready", "
 const LABELS = {
   importance: { critical: "极高", high: "高", medium: "中", low: "低" },
   claim: {
-    confirmed: "人工核实",
-    supported: "有原文支持",
+    confirmed: "人工确认",
+    supported: "多源印证",
+    single_source: "单一来源",
     contested: "存在冲突",
-    unverified: "需要补充来源",
+    unverified: "缺少依据",
     refuted: "已有反证",
   },
   stance: { supports: "支持", contradicts: "冲突", context: "背景" },
@@ -1702,6 +1704,8 @@ function fallbackOutcomeForInvestigation(investigation) {
       sources: sourceIds.size,
       entities: entities.length,
       unresolved_claims: claims.filter((claim) => ["contested", "unverified"].includes(claim.status)).length,
+      single_source_claims: claims.filter((claim) => claim.source_verification?.status === "single_source").length,
+      multi_source_claims: claims.filter((claim) => claim.source_verification?.status === "supported").length,
       claims_without_evidence: claims.filter((claim) => !claim.evidence_count).length,
       waiting_for_review: investigationMetrics(investigation).ready,
       processing: investigationMetrics(investigation).processing,
@@ -1720,7 +1724,7 @@ function outcomeForInvestigation(investigation) {
 }
 
 function outcomeStatusClass(status) {
-  return ({ confirmed: "supported", supported: "supported", contested: "contested", refuted: "refuted", unverified: "unverified" })[status] || "unverified";
+  return ({ confirmed: "supported", supported: "supported", single_source: "unverified", contested: "contested", refuted: "refuted", unverified: "unverified" })[status] || "unverified";
 }
 
 function renderOutcomeHero(investigation, outcome) {
@@ -1736,6 +1740,7 @@ function renderOutcomeHero(investigation, outcome) {
     <p class="outcome-boundary">${escapeHtml(answer.notice || "未确认候选不会进入成果。")}</p>
     <div class="outcome-hero-actions">
       ${empty ? '<button class="btn btn-primary" type="button" data-investigation-action="review">查看待处理</button>' : '<button class="btn btn-primary" type="button" data-investigation-action="generate-report">生成当前报告</button>'}
+      ${Number(counts.events || 0) >= 2 ? '<button class="btn btn-ghost" type="button" data-investigation-action="reorganize">重新整理专题</button>' : ""}
       <button class="btn btn-ghost" type="button" data-investigation-action="refresh">↻ 刷新成果</button>
       <span>${Number(counts.events || 0)} 个已确认事件 · ${Number(counts.evidence || 0)} 条证据 · ${Number(counts.sources || 0)} 个来源</span>
     </div>
@@ -1759,17 +1764,18 @@ function renderOutcomeChanges(outcome) {
 }
 
 function renderOutcomeFindings(outcome) {
-  const priority = { confirmed: 0, supported: 1, contested: 2, unverified: 3, refuted: 4 };
+  const priority = { confirmed: 0, supported: 1, single_source: 2, contested: 3, unverified: 4, refuted: 5 };
   const claims = [...(outcome.claims || [])].sort((a, b) => (priority[a.status] ?? 9) - (priority[b.status] ?? 9));
   return `<section class="workbench-surface outcome-findings" id="topic-key-findings">
     <div class="workbench-surface-head"><div><h3>关键发现与证据</h3><p>先看结论状态，需要时再展开原文依据</p></div><span class="count-badge">${claims.length}</span></div>
     ${claims.length ? `<div class="outcome-finding-list">${claims.map((claim) => {
       const evidence = claim.evidence || [];
       return `<details class="outcome-finding ${escapeHtml(outcomeStatusClass(claim.status))}">
-        <summary><span class="claim-status">${escapeHtml(LABELS.claim[claim.status] || claim.status || "需要补充来源")}</span><strong>${escapeHtml(claim.text || "未填写关键信息")}</strong><small>${evidence.length} 条原文依据</small></summary>
+        <summary><span class="claim-status">${escapeHtml(LABELS.claim[claim.status] || claim.status || "缺少依据")}</span><strong>${escapeHtml(claim.text || "未填写关键信息")}</strong><small>${Number(claim.source_verification?.independent_source_count || 0)} 个独立来源</small></summary>
         <div class="outcome-finding-body">
           <p class="outcome-finding-event">来自事件：${escapeHtml(claim.event_title || "未知事件")}<button class="text-btn" type="button" data-investigation-event="${escapeHtml(claim.event_id || "")}">打开事件档案</button></p>
           ${evidence.length ? evidence.map((item) => `<blockquote class="outcome-evidence ${escapeHtml(item.stance || "context")}"><p>${escapeHtml(item.snippet || "")}</p><footer><span>${escapeHtml(item.document?.source?.name || "来源未知")} · ${formatDate(item.document?.published_at)}</span><a href="${escapeHtml(withEventContext(item.snapshot_url || item.document?.snapshot_url, claim.event_id))}" target="_blank" rel="noopener">查看保存的原文 ↗</a></footer></blockquote>`).join("") : '<p class="outcome-gap-note">这条信息还没有连接可定位的原文依据。</p>'}
+          ${claim.status === "single_source" || claim.status === "unverified" ? `<button class="btn btn-ghost" type="button" data-investigation-find-source="${escapeHtml(claim.text || claim.event_title || "")}">搜索更多来源</button>` : ""}
         </div>
       </details>`;
     }).join("")}</div>` : '<div class="investigation-empty"><strong>还没有可展示的关键发现</strong><p>事件可以先被确认；主张和证据仍保持为空，不会自动编造。</p></div>'}
@@ -1796,9 +1802,9 @@ function renderOutcomeEntitiesAndGaps(outcome) {
       ${entities.length ? `<div class="outcome-entity-list">${entities.map((entity) => `<div><strong>${escapeHtml(entity.name)}</strong><span>${escapeHtml(entity.role || entity.type || "相关")}</span></div>`).join("")}</div>` : '<div class="investigation-empty"><strong>尚未确认参与方</strong></div>'}
     </section>
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>未知与下一步</h3><p>明确说出还不知道什么</p></div></div>
-      <ul class="outcome-gap-list">${gaps.map((gap) => `<li>${escapeHtml(gap)}</li>`).join("")}${Number(counts.claims_without_evidence || 0) ? `<li>${Number(counts.claims_without_evidence)} 条关键信息缺少可定位的原文依据。</li>` : ""}${Number(counts.unresolved_claims || 0) ? `<li>${Number(counts.unresolved_claims)} 条关键信息需要补充来源或处理冲突。</li>` : ""}</ul>
-      <button class="btn btn-ghost" type="button" data-investigation-action="import">补充资料</button>
-      ${!gaps.length && !Number(counts.claims_without_evidence || 0) && !Number(counts.unresolved_claims || 0) ? '<p class="outcome-gap-note">当前没有登记明确缺口；这不等于信息已经完整。</p>' : ""}
+      <ul class="outcome-gap-list">${gaps.map((gap) => `<li>${escapeHtml(gap)}</li>`).join("")}${Number(counts.single_source_claims || 0) ? `<li>${Number(counts.single_source_claims)} 条关键信息目前只有一个独立来源。</li>` : ""}${Number(counts.claims_without_evidence || 0) ? `<li>${Number(counts.claims_without_evidence)} 条关键信息缺少可定位的原文依据。</li>` : ""}${Number(counts.unresolved_claims || 0) ? `<li>${Number(counts.unresolved_claims)} 条关键信息存在冲突或缺少依据。</li>` : ""}</ul>
+      <button class="btn btn-ghost" type="button" data-investigation-action="search">搜索更多来源</button>
+      ${!gaps.length && !Number(counts.single_source_claims || 0) && !Number(counts.claims_without_evidence || 0) && !Number(counts.unresolved_claims || 0) ? '<p class="outcome-gap-note">当前没有登记明确缺口；这不等于信息已经完整。</p>' : ""}
     </section>
   </div>`;
 }
@@ -2564,6 +2570,51 @@ async function generateInvestigationReport() {
   }
 }
 
+async function reorganizeInvestigation() {
+  const investigation = activeInvestigation();
+  if (!isServerInvestigation(investigation)) return;
+  let preview;
+  setBusy(true, "正在归并资料并提炼关键发现");
+  try {
+    preview = await api(API_ROUTES.investigationReorganization(investigation.id, "preview"), { method: "POST" });
+  } catch (error) {
+    toast(`专题重新整理失败：${error.message || "大模型暂时不可用"}`, "error", 9000);
+    return;
+  } finally {
+    setBusy(false);
+  }
+  const groupLines = (preview.groups || []).slice(0, 10).map((group, index) => (
+    `${index + 1}. ${group.title}（${group.source_event_ids?.length || 0} 份资料）\n${(group.findings || []).slice(0, 2).map((finding) => `   · ${finding.text}`).join("\n")}`
+  ));
+  const accepted = window.confirm([
+    `系统建议把 ${preview.source_event_count} 个现有条目整理为 ${preview.proposed_event_count} 个真实事件：`,
+    "",
+    `专题结论：${preview.current_answer || "暂时无法形成总体结论"}`,
+    "",
+    ...groupLines,
+    "",
+    "确认后，专题成果和新报告将按这些事件展示；原始资料和旧记录仍会保留。是否采用？",
+  ].join("\n"));
+  if (!accepted) {
+    toast("已保留原专题内容，没有进行修改。", "info");
+    return;
+  }
+  setBusy(true, "正在保存重新整理后的专题");
+  try {
+    const result = await api(API_ROUTES.investigationReorganization(investigation.id, "confirm"), {
+      method: "POST",
+      body: JSON.stringify({ draft_id: preview.draft_id, actor: "analyst" }),
+    });
+    await refreshInvestigationDirectory();
+    await loadInvestigationWorkspace(investigation.id, { quiet: true });
+    toast(`重新整理完成：${result.source_event_count || preview.source_event_count} 个条目归并为 ${result.event_count || preview.proposed_event_count} 个真实事件。`, "success", 8000);
+  } catch (error) {
+    toast(`保存重新整理结果失败：${error.message || "未知错误"}`, "error", 9000);
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function handleInvestigationAction(action, node) {
   const investigation = activeInvestigation();
   if (action === "create") return openInvestigationCreateModal();
@@ -2593,6 +2644,7 @@ async function handleInvestigationAction(action, node) {
     return;
   }
   if (action === "search") return openExternalSearchModal(investigation?.id);
+  if (action === "reorganize") return reorganizeInvestigation();
   if (action === "import") return openImportModal(investigation?.id);
   if (action === "review") return openIntakeModal(null, false, isServerInvestigation(investigation) ? investigation.id : null);
   if (action === "claims") return setInvestigationTab("outcomes", { section: "claims" });
@@ -2819,14 +2871,15 @@ function renderMetrics() {
     }
   } else if (investigation) {
     const metrics = investigationMetrics(investigation);
+    const outcomeCounts = outcomeForInvestigation(investigation)?.counts || {};
     const topicTasks = tasksForInvestigation(investigation).filter(taskIsActive);
     const needsAttention = topicTasks.filter((task) => ["ready", "failed"].includes(canonicalTaskStage(task))).length;
     const processing = topicTasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length;
     items = [
       ["queue", needsAttention, "待处理"],
       ["review", processing, "系统处理中"],
-      ["events", metrics.events, "已确认事件"],
-      ["sources", metrics.sources, "资料来源"],
+      ["events", outcomeCounts.events ?? metrics.events, "已确认事件"],
+      ["sources", outcomeCounts.sources ?? metrics.sources, "资料来源"],
     ];
     $("#metrics").setAttribute("aria-label", `${investigation.title} 专题指标`);
   } else {
@@ -3411,7 +3464,7 @@ function setImportMode(mode) {
   $("#import-source").required = isTextMode || isFileMode;
 }
 
-async function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId) {
+async function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId, { keyword = "", autoStart = false } = {}) {
   const modal = $("#search-modal");
   const openSerial = state.searchRequestSerial;
   state.searchHistoryVisibility = "active";
@@ -3426,7 +3479,9 @@ async function openExternalSearchModal(preferredInvestigationId = state.activeIn
   updateSearchSelectionCount();
   await loadSearchHistory(destinationId);
   if (openSerial !== state.searchRequestSerial || !modal.open) return;
+  if (keyword) $("#search-keyword").value = keyword;
   $("#search-keyword").focus();
+  if (keyword && autoStart) $("#search-form").requestSubmit();
 }
 
 function closeExternalSearchModal() {
@@ -4830,7 +4885,7 @@ function renderIntakeReview(item) {
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
           <label><span>简明说法</span><textarea data-claim-field="text" rows="3">${escapeHtml(fields.text || "")}</textarea></label>
           <div class="review-grid">
-            <label><span>依据状态</span><select data-claim-field="status"><option value="unverified" ${status === "unverified" ? "selected" : ""}>需要补充来源</option><option value="supported" ${status === "supported" ? "selected" : ""}>有原文支持</option><option value="contested" ${status === "contested" ? "selected" : ""}>来源有冲突</option><option value="confirmed" ${status === "confirmed" ? "selected" : ""}>人工核实</option><option value="refuted" ${status === "refuted" ? "selected" : ""}>已有反证</option></select></label>
+            <label><span>原文关系</span><select data-claim-field="status"><option value="unverified" ${status === "unverified" ? "selected" : ""}>尚无直接支持</option><option value="supported" ${status === "supported" ? "selected" : ""}>原文支持</option><option value="contested" ${status === "contested" ? "selected" : ""}>原文有冲突</option><option value="confirmed" ${status === "confirmed" ? "selected" : ""}>人工确认</option><option value="refuted" ${status === "refuted" ? "selected" : ""}>已有反证</option></select></label>
             <label><span>置信度（0–1）</span><input type="number" min="0" max="1" step="0.05" data-claim-field="confidence" value="${escapeHtml(confidence)}"></label>
             <label><span>时间范围</span><input data-claim-field="temporal_scope" value="${escapeHtml(fields.temporal_scope || "")}" maxlength="120"></label>
             <label><span>处置</span><select data-claim-field="action"><option value="create">新建</option><option value="merge">合并</option><option value="exclude">排除</option></select></label>
@@ -6410,6 +6465,14 @@ function bindEvents() {
     const investigationSection = event.target.closest("[data-investigation-section]");
     if (investigationSection) {
       setInvestigationSection(investigationSection.dataset.investigationSection);
+      return;
+    }
+    const findSource = event.target.closest("[data-investigation-find-source]");
+    if (findSource) {
+      await openExternalSearchModal(state.activeInvestigationId, {
+        keyword: String(findSource.dataset.investigationFindSource || "").slice(0, 180),
+        autoStart: true,
+      });
       return;
     }
     const investigationAction = event.target.closest("[data-investigation-action]");

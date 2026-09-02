@@ -239,15 +239,53 @@ def serialize_evidence(evidence: Evidence, event_id: str | None = None) -> dict[
     }
 
 
+def derive_claim_source_status(evidence_items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe corroboration from provenance instead of model confidence.
+
+    A single saved page is useful evidence, but it is not multi-source
+    corroboration.  The public status is therefore computed from independent
+    source groups and evidence stances every time it is displayed.
+    """
+    supporting_groups: set[str] = set()
+    contradicting_groups: set[str] = set()
+    all_groups: set[str] = set()
+    for evidence in evidence_items:
+        source = ((evidence.get("document") or {}).get("source") or {})
+        group = str(source.get("independence_group") or source.get("id") or "").strip()
+        if not group:
+            continue
+        all_groups.add(group)
+        if evidence.get("stance") == "supports":
+            supporting_groups.add(group)
+        elif evidence.get("stance") == "contradicts":
+            contradicting_groups.add(group)
+    if contradicting_groups:
+        status = "contested"
+    elif len(supporting_groups) >= 2:
+        status = "supported"
+    elif all_groups:
+        status = "single_source"
+    else:
+        status = "unverified"
+    return {
+        "status": status,
+        "independent_source_count": len(all_groups),
+        "supporting_source_count": len(supporting_groups),
+        "contradicting_source_count": len(contradicting_groups),
+    }
+
+
 def serialize_claim(claim: Claim) -> dict[str, Any]:
+    evidence = [serialize_evidence(x, claim.event_id) for x in claim.evidence_items]
     return {
         "id": claim.id,
         "text": claim.text,
         "status": claim.status,
+        "source_verification": derive_claim_source_status(evidence),
         "confidence": claim.confidence,
         "origin": claim.origin,
         "temporal_scope": claim.temporal_scope,
-        "evidence": [serialize_evidence(x, claim.event_id) for x in claim.evidence_items],
+        "evidence": evidence,
     }
 
 

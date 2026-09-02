@@ -412,7 +412,7 @@ class TopicUxContractTest(unittest.TestCase):
         report_page = self.client.get(report.json()["url"])
         self.assertEqual(report_page.status_code, 200, report_page.text)
         self.assertIn("这是生成时的冻结版本", report_page.text)
-        self.assertIn("1 条关键信息需要补充来源或处理冲突", report_page.text)
+        self.assertIn("1 条关键信息目前只有一个独立来源", report_page.text)
         self.assertIn("关键发现", report_page.text)
         self.assertIn("来源附录", report_page.text)
         self.assertNotIn("SHA-256", report_page.text)
@@ -433,6 +433,83 @@ class TopicUxContractTest(unittest.TestCase):
             changed["changes"]["new_event_ids"],
             [second_confirmation.json()["final_event_id"]],
         )
+
+    def test_topic_reorganization_groups_pages_and_report_does_not_repeat_articles(self):
+        topic = self.create_topic("Grouped topic")
+        confirmed_event_ids = []
+        for marker in ("source-one", "source-two"):
+            item = self.create_intake(marker)
+            self.link(topic, "intake", item["id"])
+            response = self.client.post(
+                f"/pldr-api/v1/investigations/{topic}/intake/{item['id']}/confirm",
+                json=self.confirmation(item),
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            confirmed_event_ids.append(response.json()["final_event_id"])
+
+        before = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
+        self.assertEqual(before["counts"]["events"], 2)
+        evidence_ids = [claim["evidence"][0]["id"] for claim in before["claims"]]
+        model_result = {
+            "mode": "api",
+            "model": "test-synthesis-model",
+            "result": {
+                "current_answer": "两份独立公开资料均显示该通道在检查后恢复运行。",
+                "groups": [{
+                    "title": "受监测通道在检查后恢复运行",
+                    "summary": "两份资料描述的是同一次通道恢复事件，而不是两个网页事件。",
+                    "event_time": None,
+                    "location_name": None,
+                    "source_event_ids": confirmed_event_ids,
+                    "findings": [{
+                        "text": "受监测通道在独立检查确认安全后恢复运行。",
+                        "evidence_ids": evidence_ids,
+                    }],
+                }],
+                "information_gaps": ["仍需确认恢复运行的准确时间。"],
+            },
+        }
+        with patch("pldr_api.llm.run_model_task", new=AsyncMock(return_value=model_result)):
+            preview = self.client.post(
+                f"/pldr-api/v1/investigations/{topic}/reorganization/preview"
+            )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["source_event_count"], 2)
+        self.assertEqual(preview.json()["proposed_event_count"], 1)
+        unchanged = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
+        self.assertEqual(unchanged["counts"]["events"], 2)
+
+        confirmed = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/reorganization/confirm",
+            json={"draft_id": preview.json()["draft_id"], "actor": "topic-user"},
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertTrue(confirmed.json()["created"])
+        after = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
+        self.assertEqual(after["counts"]["events"], 1)
+        self.assertEqual(after["current_answer"]["basis"], "confirmed_topic_synthesis")
+        self.assertEqual(after["claims"][0]["status"], "supported")
+        self.assertEqual(after["claims"][0]["source_verification"]["independent_source_count"], 2)
+        self.assertEqual(after["claims"][0]["text"], "受监测通道在独立检查确认安全后恢复运行。")
+
+        report = self.client.post(
+            "/pldr-api/v1/reports",
+            json={"investigation_id": topic, "title": "Grouped report"},
+        )
+        self.assertEqual(report.status_code, 200, report.text)
+        page = self.client.get(report.json()["url"]).text
+        self.assertIn("两份独立公开资料均显示", page)
+        self.assertIn("多源印证", page)
+        self.assertIn("按真实事件归并资料，不按网页逐篇复述", page)
+        self.assertNotIn("The public dispatch source-one states", page)
+        self.assertNotIn("The public dispatch source-two states", page)
+
+        repeated = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/reorganization/confirm",
+            json={"draft_id": preview.json()["draft_id"], "actor": "topic-user"},
+        )
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertFalse(repeated.json()["created"])
 
     def test_preview_uses_the_same_defaults_as_confirmed_formal_objects(self):
         topic = self.create_topic("Preview defaults")
