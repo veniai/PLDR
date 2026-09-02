@@ -83,7 +83,14 @@ class TopicUxContractTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["intake_item"]["status"], "candidate_ready")
-        return response.json()["intake_item"]
+        item = response.json()["intake_item"]
+        candidates = {candidate["object_type"]: candidate for candidate in item["candidates"]}
+        self.assertNotEqual(
+            candidates["claim"]["machine"]["fields"]["text"],
+            candidates["evidence"]["machine"]["fields"]["snippet"],
+            "关键信息必须是归纳后的说法，不能直接复制原文依据",
+        )
+        return item
 
     def test_topic_starter_material_is_saved_before_background_candidate_generation(self):
         topic = self.create_topic("Background starter material")
@@ -405,7 +412,10 @@ class TopicUxContractTest(unittest.TestCase):
         report_page = self.client.get(report.json()["url"])
         self.assertEqual(report_page.status_code, 200, report_page.text)
         self.assertIn("这是生成时的冻结版本", report_page.text)
-        self.assertIn("1 条主张仍处于待核实或证据冲突状态", report_page.text)
+        self.assertIn("1 条关键信息需要补充来源或处理冲突", report_page.text)
+        self.assertIn("关键发现", report_page.text)
+        self.assertIn("来源附录", report_page.text)
+        self.assertNotIn("SHA-256", report_page.text)
         baseline = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
         self.assertEqual(baseline["changes"]["basis"], "latest_report")
         self.assertEqual(baseline["changes"]["new_event_count"], 0)
@@ -668,9 +678,16 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("function renderOutcomeFindings", source)
         self.assertIn('.filter((event) => event.status === "confirmed")', source)
         self.assertIn("investigationOutcome: (id)", source)
-        self.assertIn('data-intake-action="accept">采用', source)
-        self.assertIn('data-intake-action="modify">修改后采用', source)
+        self.assertIn('data-intake-action="accept">加入专题', source)
+        self.assertIn('data-intake-action="modify">修改', source)
         self.assertIn('data-intake-action="reject-toggle"', source)
+        self.assertIn('data-intake-batch="accept"', source)
+        self.assertIn('data-intake-batch="reject"', source)
+        self.assertIn('data-investigation-action="archive-topic"', source)
+        self.assertIn('data-investigation-action="restore-topic"', source)
+        self.assertIn('ACTIVE_INTAKE_STATUSES.has(item.status)', source)
+        self.assertNotIn("材料指纹", source)
+        self.assertNotIn("提取文本快照（SHA-256", source)
         for deprecated_label in ("待我处理", "待我确认"):
             self.assertNotIn(deprecated_label, html)
             self.assertNotIn(deprecated_label, source)

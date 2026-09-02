@@ -31,6 +31,7 @@ from pldr_api.collection import (
     run_once,
     utcnow,
 )
+from pldr_api.collector import _run_loop
 from pldr_api.database import Base, SessionLocal, engine
 from pldr_api.importers import (
     FetchedPublicText,
@@ -1486,6 +1487,17 @@ class P1CollectionTest(unittest.TestCase):
             json={"name": "   ", "url": "https://example.org/status"},
         )
         self.assertEqual(blank.status_code, 422, blank.text)
+
+    def test_collector_loop_starts_the_configured_bounded_worker_slots(self):
+        worker = AsyncMock(return_value=None)
+        with patch("pldr_api.collector._worker_loop", new=worker):
+            asyncio.run(_run_loop(poll_seconds=0.25, concurrency=4))
+        self.assertEqual(worker.await_count, 4)
+        self.assertEqual(
+            {call.kwargs["slot"] for call in worker.await_args_list},
+            {1, 2, 3, 4},
+        )
+        self.assertTrue(all(call.kwargs["poll_seconds"] == 0.25 for call in worker.await_args_list))
 
 
 if __name__ == "__main__":

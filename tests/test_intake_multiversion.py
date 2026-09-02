@@ -71,7 +71,7 @@ class IntakeMultiVersionTest(unittest.TestCase):
                 "entities": [],
                 "claims": [
                     {
-                        "text": body,
+                        "text": f"资料显示：{title}",
                         "uncertainty": None,
                         "temporal_scope": None,
                         "evidence": [{"snippet": body, "stance": "supports", "strength": 0.9}],
@@ -106,7 +106,7 @@ class IntakeMultiVersionTest(unittest.TestCase):
                 {
                     "candidate_key": "claim:1",
                     "action": "create",
-                    "text": body,
+                    "text": f"资料显示：{title}",
                     "status": "verified",
                     "confidence": 0.9,
                     "temporal_scope": "",

@@ -239,7 +239,7 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
         "output_contract": {
             "event": "one object; use null for unknown fields",
             "entities": "list; use [] when unknown",
-            "claims": "list with evidence arrays; every evidence.snippet must be an exact snapshot substring",
+            "claims": "list of concise paraphrased propositions with evidence arrays; claim.text must never copy evidence verbatim, while every evidence.snippet must be an exact snapshot substring",
         },
     }
     try:
@@ -324,26 +324,30 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
 
 
 def deterministic_candidate_result(item: IntakeItem) -> dict[str, Any]:
+    """Build a visibly basic draft without pretending that a quote is a claim.
+
+    The claim is a short proposition derived from the known document title;
+    the evidence remains an exact snapshot substring.  This keeps the two
+    user-facing concepts distinct even when the configured model is absent.
+    """
     snapshot = item.extracted_snapshot
     sentences = [part.strip() for part in re.split(r"(?<=[.!?。！？])\s+", snapshot) if part.strip()]
     quote = next((part for part in sentences if len(part) >= 30), snapshot[:240].strip())
+    known_title = _clean_known(item.title)
+    claim_text = f"资料显示：{known_title}" if known_title else "该资料描述了一项需要进一步核实的事件进展"
     return {
         "event": {
-            "title": _clean_known(item.title),
+            "title": known_title,
             "summary": snapshot[:500],
-            # Publication time describes the document, not necessarily the
-            # event. A deterministic fallback has no basis to equate them.
             "event_time": None,
             "location_name": None,
         },
         "entities": [],
-        "claims": [
-            {
-                "text": quote,
-                "uncertainty": "Deterministic fallback quotes the snapshot; an analyst must interpret it.",
-                "evidence": [{"snippet": quote, "stance": "context", "strength": 0.5}],
-            }
-        ],
+        "claims": [{
+            "text": claim_text,
+            "uncertainty": "Basic draft derived from the document title; verify against the exact quote.",
+            "evidence": [{"snippet": quote, "stance": "supports", "strength": 0.5}],
+        }],
     }
 
 
@@ -353,42 +357,23 @@ def generate_deterministic_candidates(
     *,
     model_error: str,
 ) -> IntakeItem:
-    """Persist an explicitly-labelled reviewable fallback after a model error.
-
-    The error remains visible and the investigation task stays retryable; this
-    prevents a provider timeout from becoming a dead end without representing
-    deterministic extraction as a model result.
-    """
+    """Persist an explicitly-labelled retryable basic draft after a model error."""
     baseline = _generation_baseline(item)
     item_id = item.id
     session.rollback()
-    item = lock_intake_for_mutation(
-        session,
-        item_id,
-        action="generating fallback candidates",
-    )
-    _require_generation_baseline(
-        item,
-        baseline,
-        action="applying fallback candidates",
-    )
+    item = lock_intake_for_mutation(session, item_id, action="generating fallback candidates")
+    _require_generation_baseline(item, baseline, action="applying fallback candidates")
     for candidate in list(item.candidates):
         session.delete(candidate)
     session.flush()
-    result = deterministic_candidate_result(item)
-    _store_candidates(session, item, result, "fallback-after-error", None)
+    _store_candidates(session, item, deterministic_candidate_result(item), "fallback-after-error", None)
     item.status = "candidate_ready"
     item.candidate_mode = "fallback-after-error"
     item.candidate_model = None
     item.candidate_error = model_error
     item.updated_at = utcnow()
     from .investigations import sync_linked_review_tasks_for_intake
-
-    sync_linked_review_tasks_for_intake(
-        session,
-        item,
-        actor="system:candidate-generation",
-    )
+    sync_linked_review_tasks_for_intake(session, item, actor="system:candidate-generation")
     session.expire(item, ["candidates"])
     session.commit()
     return item
@@ -464,8 +449,19 @@ def _store_candidates(
         if not isinstance(claim, dict):
             continue
         claim_key = f"claim:{claim_idx + 1}"
+        evidence_items = claim.get("evidence")
+        if not isinstance(evidence_items, list):
+            evidence_items = []
+        claim_text = claim.get("text")
+        if isinstance(claim_text, str) and any(
+            isinstance(evidence.get("snippet"), str)
+            and normalize_text(evidence["snippet"]) == normalize_text(claim_text)
+            for evidence in evidence_items
+            if isinstance(evidence, dict)
+        ):
+            raise ValueError("Claim text must summarize the information and must not duplicate an evidence quote")
         claim_fields = {
-            "text": claim.get("text"),
+            "text": claim_text,
             "uncertainty": claim.get("uncertainty"),
             "temporal_scope": claim.get("temporal_scope"),
         }
@@ -480,9 +476,6 @@ def _store_candidates(
             )
         )
         relations.append({"type": "event_claim", "from": claim_key, "to": event_key})
-        evidence_items = claim.get("evidence")
-        if not isinstance(evidence_items, list):
-            evidence_items = []
         for evidence in evidence_items:
             if not isinstance(evidence, dict):
                 continue

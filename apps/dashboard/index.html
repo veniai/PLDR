@@ -34,7 +34,7 @@
           <div class="investigation-hero-copy">
             <span class="eyebrow">INVESTIGATION WORKBENCH</span>
             <h1 id="investigation-home-title">从问题出发，推进你的专题调查</h1>
-            <p>把发现、采集、审核和证据组织在同一个专题里。AI 只生成候选，正式档案仍由你确认。</p>
+            <p>把发现、采集、整理和证据组织在同一个专题里。系统先整理，确认后才进入专题成果。</p>
           </div>
           <div class="investigation-hero-actions">
             <button id="btn-create-investigation" class="btn btn-primary" type="button">＋ 创建专题</button>
@@ -262,7 +262,7 @@
         <div>
           <span class="panel-kicker">DISCOVERY WORKSPACE</span>
           <h2 id="search-modal-title">公开资料关键词搜索</h2>
-          <p>搜索是线索入口；选中原页并处理后，才可能进入人工审核。</p>
+          <p>搜索是线索入口；选中原页后进入专题待处理。</p>
         </div>
         <button id="search-close" class="icon-btn" type="button" aria-label="关闭公开资料搜索">×</button>
       </div>
@@ -497,12 +497,12 @@
   <dialog id="intake-modal" class="modal intake-modal" aria-labelledby="intake-modal-title">
     <div class="modal-header">
       <div>
-        <span class="panel-kicker">HUMAN REVIEW</span>
+        <span class="panel-kicker">CONFIRM MATERIAL</span>
         <h2 id="intake-modal-title">待确认</h2>
       </div>
       <button id="intake-close" class="icon-btn" type="button" aria-label="关闭采集箱">×</button>
     </div>
-    <nav id="intake-mobile-steps" class="intake-mobile-steps" aria-label="移动端审核步骤">
+    <nav id="intake-mobile-steps" class="intake-mobile-steps" aria-label="移动端处理步骤">
       <button type="button" data-intake-step="0">1 选择内容</button>
       <button type="button" data-intake-step="1">2 查看原文</button>
       <button type="button" data-intake-step="2">3 作出决定</button>

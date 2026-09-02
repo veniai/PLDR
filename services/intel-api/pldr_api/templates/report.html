@@ -30,7 +30,6 @@
     .evidence footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px;color:#718b98;font-size:11px}
     .evidence a{flex:0 0 auto;color:#087a9f;font-weight:650;text-decoration:none}.evidence a:hover{text-decoration:underline}
     .sources{margin-top:13px;padding-top:12px;border-top:1px solid #e2eaee}.source-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;color:#597481;font-size:11px}
-    .hash{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#7d929c}
     @media(max-width:680px){.page{padding:16px 10px 40px}header,.event,.result{padding:20px 17px}.analysis-grid,.result-metrics{grid-template-columns:1fr 1fr}.evidence footer,.source-row{align-items:flex-start;flex-direction:column}}
     @media print{body{background:#fff}.page{max-width:none;padding:0}header,.event{box-shadow:none}.event{break-inside:avoid}.claim{break-inside:avoid}}
   </style>
@@ -52,8 +51,8 @@
       <p class="result-answer">{{ current_answer }}</p>
       <div class="result-metrics">
         <div><strong>{{ event_count }}</strong><span>已确认事件</span></div>
-        <div><strong>{{ claim_count }}</strong><span>关键主张</span></div>
-        <div><strong>{{ evidence_count }}</strong><span>固定证据</span></div>
+        <div><strong>{{ claim_count }}</strong><span>关键信息</span></div>
+        <div><strong>{{ evidence_count }}</strong><span>原文依据</span></div>
         <div><strong>{{ source_count }}</strong><span>来源</span></div>
       </div>
       {% if information_gaps %}
@@ -61,11 +60,23 @@
       {% endif %}
     </section>
 
+    {% if key_findings %}
+    <section class="result">
+      <h2>关键发现</h2>
+      {% for finding in key_findings %}
+      <article class="claim {{ finding.status }}">
+        <div class="claim-title"><span class="status">{{ claim_status_labels.get(finding.status, finding.status) }}</span><b>{{ finding.text }}</b></div>
+        <p class="meta">来自事件：{{ finding.event_title }} · {{ finding.evidence_count }} 条原文依据</p>
+      </article>
+      {% endfor %}
+    </section>
+    {% endif %}
+
     {% for event in events %}
     <section class="event">
       <h2>{{ event.title }}</h2>
       <p class="summary">{{ event.summary }}</p>
-      <p class="meta">发生时间 {{ event.start_at or "待核实" }} · 地点 {{ event.location.name or "待核实" }} · 资料 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }}</p>
+      <p class="meta">发生时间 {{ event.start_at or "时间待补充" }} · 地点 {{ event.location.name or "地点待补充" }} · 资料 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }}</p>
 
       {% if event.assessment %}
       <h3>结构化研判</h3>
@@ -78,7 +89,7 @@
       </div>
       {% endif %}
 
-      <h3>主张与证据</h3>
+      <h3>关键信息与原文依据</h3>
       {% for claim in event.claims %}
       <article class="claim {{ claim.status }}">
         <div class="claim-title"><span class="status">{{ claim_status_labels.get(claim.status, claim.status) }}</span><span class="claim-origin" data-origin="{{ claim.origin }}">{{ "人工确认" if claim.origin == "human-confirmed" else claim.origin }}</span><b>{{ claim.text }}</b></div>
@@ -87,27 +98,30 @@
           <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ stance_labels.get(evidence.stance, evidence.stance) }}</strong><span>固定原文证据</span></div>
           <blockquote>{{ evidence.snippet }}</blockquote>
           <footer>
-            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }} · 独立来源组 {{ evidence.document.source.independence_group }}</span>
+            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span>
             <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
           </footer>
         </div>
         {% else %}
-        <p class="meta">该主张尚未连接原文证据。</p>
+        <p class="meta">这条信息尚未连接可定位的原文依据。</p>
         {% endfor %}
       </article>
       {% endfor %}
 
-      <div class="sources">
-        <h3>关联资料</h3>
-        {% for document in event.documents %}
-        <div class="source-row">
-          <span>{{ document.source.name }} · {{ document.title or "未知标题" }}</span>
-          <span class="hash">{{ document.content_hash[:18] }}…</span>
-        </div>
-        {% endfor %}
-      </div>
     </section>
     {% endfor %}
+
+    <section class="result sources">
+        <h2>来源附录</h2>
+        {% for document in source_documents %}
+        <div class="source-row">
+          <span>{{ document.source.name }} · {{ document.title or "未知标题" }}</span>
+          <span>原文快照已保存</span>
+        </div>
+        {% else %}
+        <p class="meta">暂无关联资料。</p>
+        {% endfor %}
+    </section>
   </main>
 </body>
 </html>
