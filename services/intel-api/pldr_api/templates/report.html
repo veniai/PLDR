@@ -14,7 +14,7 @@
     .result h2{font-size:22px}.result-answer{margin:8px 0 0;color:#2f4b59;font-size:15px;line-height:1.8}.result-note{color:#718894;font-size:11px}
     .result-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px}.result-metrics div{padding:11px;border-radius:8px;background:#f2f7f9;text-align:center}.result-metrics strong{display:block;color:#164f68;font-size:22px}.result-metrics span{color:#708894;font-size:11px}
     .gaps{margin-top:15px;padding:13px 15px;background:#fff9eb;border-left:4px solid #cf941d;color:#6b5b37}.gaps h3{margin:0 0 7px;color:#7b6127}.gaps ul{margin:0;padding-left:20px;font-size:12px;line-height:1.65}
-    .event{margin-top:20px;padding:25px 27px;background:#fff;border:1px solid #d9e4e9;border-radius:12px;box-shadow:0 10px 30px rgba(25,61,78,.07)}
+    .event{margin:12px 0;padding:17px 18px;background:#f7fafb;border:1px solid #d9e4e9;border-radius:9px}
     h2{margin:0 0 10px;color:#0d4b66;font-size:21px}h3{margin:22px 0 9px;color:#24596f;font-size:15px}
     .summary{font-size:14px;line-height:1.75;color:#3a5260}.meta{color:#6c8795;font-size:12px;line-height:1.65}
     .assessment{padding:15px 17px;background:#edf7fa;border-left:4px solid #2a9fc3;border-radius:0 8px 8px 0;color:#294b5a;line-height:1.7}
@@ -24,12 +24,13 @@
     .claim{margin:12px 0;padding:15px 16px;background:#f5f9fb;border:1px solid #dce8ed;border-left:4px solid #4eaccb;border-radius:0 8px 8px 0}
     .claim.contested{border-left-color:#d29a35}.claim.unverified{border-left-color:#9568c4}.claim.refuted{border-left-color:#d4565b}
     .claim-title{display:flex;gap:9px;align-items:flex-start}.claim-title b{font-size:14px;line-height:1.55}.status,.claim-origin{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#dcecf2;color:#396477;font-size:10px}.claim-origin{background:#e7f4ea;color:#357149}
+    .citations{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.citations a{padding:4px 7px;border-radius:5px;background:#e8f3f7;color:#087a9f;font-size:11px;font-weight:650;text-decoration:none}.citations a:hover{text-decoration:underline}
     .evidence{margin:10px 0 0;padding:12px 14px;background:#fff;border:1px solid #dae5e9;border-left:3px solid #4da86f;border-radius:0 7px 7px 0}
     .evidence.contradicts{border-left-color:#d45c60}.evidence.context{border-left-color:#c89a36}.evidence blockquote{margin:7px 0;color:#334e5b;font-size:13px;line-height:1.65}
     .evidence-top{display:flex;gap:8px;color:#678392;font-size:11px}.evidence-top strong{color:#315f72}
     .evidence footer{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:8px;color:#718b98;font-size:11px}
     .evidence a{flex:0 0 auto;color:#087a9f;font-weight:650;text-decoration:none}.evidence a:hover{text-decoration:underline}
-    .sources{margin-top:13px;padding-top:12px;border-top:1px solid #e2eaee}.source-row{display:flex;justify-content:space-between;gap:12px;padding:6px 0;color:#597481;font-size:11px}
+    .sources{margin-top:13px;padding-top:12px;border-top:1px solid #e2eaee}.source-row{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid #edf2f4;color:#597481;font-size:11px}.source-row a{color:#087a9f;text-decoration:none}.source-row a:hover{text-decoration:underline}
     @media(max-width:680px){.page{padding:16px 10px 40px}header,.event,.result{padding:20px 17px}.analysis-grid,.result-metrics{grid-template-columns:1fr 1fr}.evidence footer,.source-row{align-items:flex-start;flex-direction:column}}
     @media print{body{background:#fff}.page{max-width:none;padding:0}header,.event{box-shadow:none}.event{break-inside:avoid}.claim{break-inside:avoid}}
   </style>
@@ -64,59 +65,37 @@
     <section class="result">
       <h2>关键发现</h2>
       {% for finding in key_findings %}
-      <article class="claim {{ finding.status }}">
+      <article class="claim {{ finding.status }}" data-origin="{{ finding.origin }}">
         <div class="claim-title"><span class="status">{{ claim_status_labels.get(finding.status, finding.status) }}</span><b>{{ finding.text }}</b></div>
-        <p class="meta">来自事件：{{ finding.event_title }} · {{ finding.evidence_count }} 条原文依据</p>
+        <p class="meta">来自事件：{{ finding.event_title }} · {{ finding.independent_source_count }} 个独立来源</p>
+        <div class="citations">
+          {% for evidence in finding.evidence %}
+          <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">原文 E{{ evidence.index }} · {{ evidence.document.source.name }}</a>
+          {% endfor %}
+        </div>
       </article>
       {% endfor %}
     </section>
     {% endif %}
 
-    {% for event in events %}
-    <section class="event">
-      <h2>{{ event.title }}</h2>
-      <p class="summary">{{ event.summary }}</p>
-      <p class="meta">发生时间 {{ event.start_at or "时间待补充" }} · 地点 {{ event.location.name or "地点待补充" }} · 资料 {{ event.document_count }} · 独立来源 {{ event.independent_source_count }}</p>
-
-      {% if event.assessment %}
-      <h3>结构化研判</h3>
-      <div class="assessment">{{ event.assessment.judgement }}</div>
-      <div class="analysis-grid">
-        <div><h4>关键假设</h4><ul>{% for item in event.assessment.assumptions %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
-        <div><h4>替代解释</h4><ul>{% for item in event.assessment.alternatives %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
-        <div><h4>信息缺口</h4><ul>{% for item in event.assessment.information_gaps %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
-        <div><h4>证伪条件</h4><ul>{% for item in event.assessment.falsifiers %}<li>{{ item }}</li>{% else %}<li>暂无登记</li>{% endfor %}</ul></div>
-      </div>
-      {% endif %}
-
-      <h3>关键信息与原文依据</h3>
-      {% for claim in event.claims %}
-      <article class="claim {{ claim.status }}">
-        <div class="claim-title"><span class="status">{{ claim_status_labels.get(claim.status, claim.status) }}</span><span class="claim-origin" data-origin="{{ claim.origin }}">{{ "人工确认" if claim.origin == "human-confirmed" else claim.origin }}</span><b>{{ claim.text }}</b></div>
-        {% for evidence in claim.evidence %}
-        <div class="evidence {{ evidence.stance }}">
-          <div class="evidence-top"><strong>[E{{ evidence.index }}] {{ stance_labels.get(evidence.stance, evidence.stance) }}</strong><span>固定原文证据</span></div>
-          <blockquote>{{ evidence.snippet }}</blockquote>
-          <footer>
-            <span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span>
-            <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">打开证据快照</a>
-          </footer>
-        </div>
-        {% else %}
-        <p class="meta">这条信息尚未连接可定位的原文依据。</p>
-        {% endfor %}
+    <section class="result">
+      <h2>事件脉络</h2>
+      <p class="result-note">按真实事件归并资料，不按网页逐篇复述。</p>
+      {% for event in events %}
+      <article class="event">
+        <h3>{{ event.title }}</h3>
+        <p class="summary">{{ event.summary }}</p>
+        <p class="meta">{{ event.start_at or "时间待补充" }} · {{ event.document_count }} 份资料 · {{ event.independent_source_count }} 个独立来源</p>
       </article>
       {% endfor %}
-
     </section>
-    {% endfor %}
 
     <section class="result sources">
         <h2>来源附录</h2>
         {% for document in source_documents %}
         <div class="source-row">
-          <span>{{ document.source.name }} · {{ document.title or "未知标题" }}</span>
-          <span>原文快照已保存</span>
+          <span>{{ document.source.name }} · {{ document.title or "未知标题" }} · {{ document.published_at or "发布时间未知" }}</span>
+          <span><a href="{{ document.snapshot_url }}" target="_blank" rel="noopener">查看保存的原文</a>{% if document.canonical_url %} · <a href="{{ document.canonical_url }}" target="_blank" rel="noopener">来源网页</a>{% endif %}</span>
         </div>
         {% else %}
         <p class="meta">暂无关联资料。</p>

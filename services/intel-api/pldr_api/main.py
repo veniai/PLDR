@@ -44,6 +44,7 @@ from .intake import (
 from .llm import run_model_task
 from .models import (
     Claim,
+    DecisionLog,
     Document,
     Entity,
     Event,
@@ -567,6 +568,21 @@ def create_report(request: ReportRequest, session: Session = Depends(get_session
             ):
                 contains_demo_material = True
                 break
+        reorganization_detail: dict[str, Any] = {}
+        if investigation is not None:
+            latest_reorganization = session.scalar(
+                select(DecisionLog)
+                .where(
+                    DecisionLog.investigation_id == investigation.id,
+                    DecisionLog.action == "reorganization.confirmed",
+                )
+                .order_by(DecisionLog.created_at.desc(), DecisionLog.id.desc())
+                .limit(1)
+            )
+            if latest_reorganization is not None and set(
+                (latest_reorganization.detail_json or {}).get("event_ids") or []
+            ) == set(event_ids):
+                reorganization_detail = latest_reorganization.detail_json or {}
         payload = build_report(
             session,
             event_ids,
@@ -576,6 +592,8 @@ def create_report(request: ReportRequest, session: Session = Depends(get_session
                 or investigation.id == DEMO_INVESTIGATION_ID
                 or contains_demo_material
             ),
+            current_answer_override=reorganization_detail.get("current_answer"),
+            information_gaps_override=reorganization_detail.get("information_gaps") or [],
         )
         if investigation is not None:
             record_action(

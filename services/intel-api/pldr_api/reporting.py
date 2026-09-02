@@ -23,6 +23,8 @@ def build_report(
     title: str | None = None,
     *,
     demo_notice: bool = True,
+    current_answer_override: str | None = None,
+    information_gaps_override: list[str] | None = None,
 ) -> dict[str, Any]:
     events=[]
     for event_id in event_ids:
@@ -33,6 +35,7 @@ def build_report(
     evidence_index=1
     claim_count=0
     unresolved_claim_count=0
+    single_source_claim_count=0
     claims_without_evidence=0
     source_ids=set()
     source_documents=[]
@@ -53,8 +56,13 @@ def build_report(
             if cleaned and cleaned not in information_gaps: information_gaps.append(cleaned)
         for claim in event["claims"]:
             claim_count+=1
-            if claim.get("status") in {"unverified", "contested"}:
+            public_status=(claim.get("source_verification") or {}).get("status") or claim.get("status") or "unverified"
+            claim["raw_status"]=claim.get("status")
+            claim["status"]=public_status
+            if public_status in {"unverified", "contested"}:
                 unresolved_claim_count+=1
+            if public_status == "single_source":
+                single_source_claim_count+=1
             if not claim.get("evidence"):
                 claims_without_evidence+=1
             for evidence in claim["evidence"]:
@@ -62,14 +70,22 @@ def build_report(
             if claim.get("text") and len(key_findings) < 8:
                 key_findings.append({
                     "text": claim["text"],
-                    "status": claim.get("status") or "unverified",
+                    "status": public_status,
+                    "origin": claim.get("origin") or "unknown",
                     "event_title": event.get("title") or "未知事件",
                     "evidence_count": len(claim.get("evidence") or []),
+                    "independent_source_count": (claim.get("source_verification") or {}).get("independent_source_count", 0),
+                    "evidence": claim.get("evidence") or [],
                 })
     if unresolved_claim_count:
         information_gaps.append(f"{unresolved_claim_count} 条关键信息需要补充来源或处理冲突。")
+    if single_source_claim_count:
+        information_gaps.append(f"{single_source_claim_count} 条关键信息目前只有一个独立来源。")
     if claims_without_evidence:
         information_gaps.append(f"{claims_without_evidence} 条关键信息尚未连接可定位的原文依据。")
+    for gap in information_gaps_override or []:
+        cleaned=str(gap).strip()
+        if cleaned and cleaned not in information_gaps: information_gaps.append(cleaned)
     # Keep the frozen report's headline aligned with the live outcome page:
     # prefer the newest known event time, then the most recently linked event.
     latest_event=max(
@@ -82,7 +98,7 @@ def build_report(
     )[1]
     latest_assessment=latest_event.get("assessment") or {}
     supported_findings=[item["text"] for item in key_findings if item["status"] in {"confirmed", "supported"}]
-    current_answer=latest_assessment.get("judgement") or ("；".join(supported_findings[:3]) if supported_findings else "现有材料还不足以形成专题结论，请先补充来源或处理冲突。")
+    current_answer=(current_answer_override or "").strip() or latest_assessment.get("judgement") or ("；".join(supported_findings[:3]) if supported_findings else "现有材料还不足以形成专题结论，请先补充来源或处理冲突。")
     html=env.get_template("report.html").render(
         title=report_title,
         generated_at=generated_at.isoformat().replace("+00:00","Z"),
@@ -96,7 +112,7 @@ def build_report(
         information_gaps=information_gaps,
         key_findings=key_findings,
         source_documents=source_documents,
-        claim_status_labels={"confirmed":"人工核实","supported":"有原文支持","contested":"来源有冲突","unverified":"需要补充来源","refuted":"已有反证"},
+        claim_status_labels={"confirmed":"人工确认","supported":"多源印证","single_source":"单一来源","contested":"存在冲突","unverified":"缺少依据","refuted":"已有反证"},
         stance_labels={"supports":"支持","contradicts":"冲突","context":"背景"},
     )
     stamp=generated_at.strftime("%Y%m%dT%H%M%SZ"); filename=f"{safe_slug(report_title)}-{stamp}.html"; REPORT_DIR.mkdir(parents=True,exist_ok=True); (REPORT_DIR/filename).write_text(html,encoding="utf-8")

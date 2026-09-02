@@ -95,6 +95,25 @@ TASK_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
             }
         ],
     },
+    "synthesize_investigation": {
+        "current_answer": "a concise Simplified Chinese topic-level answer",
+        "groups": [
+            {
+                "title": "concise Simplified Chinese real-world event title",
+                "summary": "one concise Simplified Chinese event summary",
+                "event_time": "one exact event_time supplied by a source event, or null",
+                "location_name": "one exact location_name supplied by a source event, or null",
+                "source_event_ids": ["one or more supplied source_event_id values"],
+                "findings": [
+                    {
+                        "text": "concise Simplified Chinese proposition, not a copied quote",
+                        "evidence_ids": ["one or more supplied evidence_id values"],
+                    }
+                ],
+            }
+        ],
+        "information_gaps": ["concise Simplified Chinese unanswered question"],
+    },
 }
 
 
@@ -189,6 +208,12 @@ async def run_model_task(task: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"mode":"fallback","task":task,"result":deterministic_fallback(task,payload),"warning":"No model API configured; deterministic fallback was used."}
     endpoint = f"{config.base_url}/chat/completions"
     body={"model":config.model,"temperature":0.1,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":json.dumps(model_request_payload(task,payload),ensure_ascii=False)}]}
+    if task == "synthesize_investigation":
+        body["max_tokens"] = int(os.getenv("LLM_SYNTHESIS_MAX_TOKENS", "2048"))
+        # GLM 5.3 always reasons.  Asking its OpenAI-compatible endpoint for a
+        # low reasoning budget avoids a 90-second timeout on small topic sets.
+        if "glm-5.3" in config.model.lower():
+            body["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT", "low")
     headers={"Authorization":f"Bearer {config.api_key}","Content-Type":"application/json"}
     try:
         async with asyncio.timeout(config.timeout_seconds):

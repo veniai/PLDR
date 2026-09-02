@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -27,11 +28,13 @@ from .intake import (
     lock_intake_for_status_sync,
 )
 from .models import (
+    Assessment,
     Claim,
     CollectionRun,
     CollectionTarget,
     DecisionLog,
     Entity,
+    Evidence,
     Event,
     EventDocument,
     EventEntity,
@@ -52,6 +55,7 @@ from .schemas import (
     IntakeConfirmationRequest,
     InvestigationCreate,
     InvestigationLinkRequest,
+    InvestigationReorganizationConfirmRequest,
     InvestigationUpdate,
     ReviewTaskRetryRequest,
 )
@@ -65,6 +69,7 @@ UNCLASSIFIED_INVESTIGATION_ID = "inv_unclassified"
 ACTIVE_TASK_STATUSES = {"queued", "fetching", "generating"}
 TERMINAL_TASK_STATUSES = {"ready", "failed", "confirmed", "rejected"}
 DEFAULT_TASK_LEASE_SECONDS = 180
+SOURCE_EVENT_LINK_ROLE = "source_event"
 
 
 def _task_has_current_intake_link():
@@ -599,6 +604,8 @@ def serialize_investigation(
             run = session.get(SearchQueryRun, link.object_id)
             if run is None or run.archived_at is not None:
                 continue
+        elif link.object_type == "event" and link.role == SOURCE_EVENT_LINK_ROLE:
+            continue
         visible_links.append(link)
     counts: dict[str, int] = {
         "search_queries": 0,
@@ -809,9 +816,13 @@ def serialize_investigation_outcome(
                 information_gaps.append(cleaned)
         for claim in event.get("claims", []):
             evidence_items = claim.get("evidence") or []
+            source_verification = claim.get("source_verification") or {}
+            display_status = source_verification.get("status") or claim.get("status")
             claims.append(
                 {
                     **claim,
+                    "raw_status": claim.get("status"),
+                    "status": display_status,
                     "event_id": event["id"],
                     "event_title": event["title"],
                     "evidence_count": len(evidence_items),
@@ -845,6 +856,25 @@ def serialize_investigation_outcome(
         > baseline_time
     ]
 
+    latest_reorganization = session.scalar(
+        select(DecisionLog)
+        .where(
+            DecisionLog.investigation_id == investigation.id,
+            DecisionLog.action == "reorganization.confirmed",
+        )
+        .order_by(DecisionLog.created_at.desc(), DecisionLog.id.desc())
+        .limit(1)
+    )
+    reorganization_detail = (latest_reorganization.detail_json or {}) if latest_reorganization else {}
+    reorganization_is_current = bool(latest_reorganization) and set(
+        reorganization_detail.get("event_ids") or []
+    ) == set(linked_event_ids)
+    if reorganization_is_current:
+        for gap in reorganization_detail.get("information_gaps") or []:
+            cleaned = str(gap).strip()
+            if cleaned and cleaned not in information_gaps:
+                information_gaps.append(cleaned)
+
     latest_event = events[0] if events else None
     latest_assessment = (latest_event or {}).get("assessment") or {}
     if latest_event:
@@ -854,14 +884,25 @@ def serialize_investigation_outcome(
             if claim.get("status") in {"confirmed", "supported"}
             and str(claim.get("text") or "").strip()
         ]
-        answer_text = str(latest_assessment.get("judgement") or "").strip()
+        answer_text = str(
+            (
+                reorganization_detail.get("current_answer")
+                if reorganization_is_current
+                else latest_assessment.get("judgement")
+            )
+            or ""
+        ).strip()
         if not answer_text:
             answer_text = "；".join(supported_claims[:3])
         current_answer = {
             "status": "available",
-            "headline": f"已确认 {len(events)} 个事件，当前最新进展：{latest_event['title']}",
+            "headline": (
+                f"已将 {len(reorganization_detail.get('source_event_ids') or [])} 份资料整理为 {len(events)} 个真实事件"
+                if reorganization_is_current
+                else f"已确认 {len(events)} 个事件，当前最新进展：{latest_event['title']}"
+            ),
             "text": answer_text or "现有材料还不足以形成专题结论，请先补充来源或处理冲突。",
-            "basis": "formal_assessment" if latest_assessment.get("judgement") else ("supported_claims" if supported_claims else "insufficient_evidence"),
+            "basis": "confirmed_topic_synthesis" if reorganization_is_current else ("formal_assessment" if latest_assessment.get("judgement") else ("supported_claims" if supported_claims else "insufficient_evidence")),
             "event_id": latest_event["id"],
             "notice": "仅汇总本专题已人工确认的正式对象；未确认候选不会进入成果。",
         }
@@ -877,6 +918,9 @@ def serialize_investigation_outcome(
 
     unresolved_claims = [
         claim for claim in claims if claim.get("status") in {"contested", "unverified"}
+    ]
+    single_source_claims = [
+        claim for claim in claims if claim.get("status") == "single_source"
     ]
     task_status = detail.get("task_status") or {}
     return {
@@ -906,6 +950,8 @@ def serialize_investigation_outcome(
             "sources": len(source_index),
             "entities": len(entity_index),
             "unresolved_claims": len(unresolved_claims),
+            "single_source_claims": len(single_source_claims),
+            "multi_source_claims": sum(1 for claim in claims if claim.get("status") == "supported"),
             "claims_without_evidence": len(missing_evidence_claim_ids),
             "waiting_for_review": int(task_status.get("ready") or 0),
             "processing": sum(int(task_status.get(status_value) or 0) for status_value in ("queued", "fetching", "generating")),
@@ -2931,6 +2977,7 @@ def investigation_event_ids(session: Session, investigation_id: str) -> list[str
             .where(
                 InvestigationLink.investigation_id == investigation_id,
                 InvestigationLink.object_type == "event",
+                InvestigationLink.role != SOURCE_EVENT_LINK_ROLE,
             )
             .order_by(InvestigationLink.created_at.asc(), InvestigationLink.id.asc())
         )
@@ -2987,8 +3034,7 @@ def _object_in_investigation(
 def _object_memberships(
     session: Session, object_type: str, object_id: str
 ) -> list[dict[str, Any]]:
-    investigations = list(
-        session.scalars(
+    query = (
             select(Investigation)
             .join(
                 InvestigationLink,
@@ -2999,8 +3045,10 @@ def _object_memberships(
                 InvestigationLink.object_id == object_id,
             )
             .order_by(Investigation.title.asc(), Investigation.id.asc())
-        ).unique()
     )
+    if object_type == "event":
+        query = query.where(InvestigationLink.role != SOURCE_EVENT_LINK_ROLE)
+    investigations = list(session.scalars(query).unique())
     return [_membership_summary(investigation) for investigation in investigations]
 
 
@@ -3019,6 +3067,7 @@ def _entity_memberships(session: Session, entity_id: str) -> list[dict[str, Any]
             )
             .where(
                 InvestigationLink.object_type == "event",
+                InvestigationLink.role != SOURCE_EVENT_LINK_ROLE,
                 EventEntity.entity_id == entity_id,
             )
             .order_by(Investigation.title.asc(), Investigation.id.asc())
@@ -3033,6 +3082,7 @@ def _topic_event_ids(session: Session, investigation_id: str) -> list[str]:
             select(InvestigationLink.object_id).where(
                 InvestigationLink.investigation_id == investigation_id,
                 InvestigationLink.object_type == "event",
+                InvestigationLink.role != SOURCE_EVENT_LINK_ROLE,
             )
         )
     )
@@ -3051,6 +3101,475 @@ def _topic_entity_ids(session: Session, investigation_id: str) -> list[str]:
             )
         )
     )
+
+
+def _active_topic_event_models(session: Session, investigation_id: str) -> list[Event]:
+    event_ids = investigation_event_ids(session, investigation_id)
+    if not event_ids:
+        return []
+    models = list(
+        session.scalars(event_query().where(Event.id.in_(event_ids))).unique()
+    )
+    by_id = {event.id: event for event in models}
+    return [by_id[event_id] for event_id in event_ids if event_id in by_id]
+
+
+def _reorganization_fingerprint(events: list[Event]) -> str:
+    state = []
+    for event in events:
+        state.append(
+            {
+                "id": event.id,
+                "updated_at": iso(event.updated_at),
+                "documents": sorted(link.document_id for link in event.document_links),
+                "claims": [
+                    {
+                        "id": claim.id,
+                        "text": claim.text,
+                        "status": claim.status,
+                        "evidence": sorted(evidence.id for evidence in claim.evidence_items),
+                    }
+                    for claim in sorted(event.claims, key=lambda item: item.id)
+                ],
+            }
+        )
+    encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _reorganization_model_payload(
+    investigation: Investigation,
+    events: list[Event],
+) -> tuple[dict[str, Any], dict[str, Evidence]]:
+    source_events: list[dict[str, Any]] = []
+    evidence_by_id: dict[str, Evidence] = {}
+    for event in events:
+        event_metadata = event.metadata_json or {}
+        evidence_entries: list[dict[str, Any]] = []
+        for claim in sorted(event.claims, key=lambda item: item.id):
+            for evidence in sorted(claim.evidence_items, key=lambda item: item.id):
+                evidence_by_id[evidence.id] = evidence
+                evidence_entries.append(
+                    {
+                        "evidence_id": evidence.id,
+                        "claim_id": claim.id,
+                        "source_name": evidence.document.source.name,
+                        "source_group": evidence.document.source.independence_group,
+                        "stance": evidence.stance,
+                        "published_at": iso(evidence.document.published_at),
+                        "snippet": evidence.snippet[:1200],
+                    }
+                )
+        source_events.append(
+            {
+                "source_event_id": event.id,
+                "title": event.title[:500],
+                "summary": event.summary[:900],
+                "event_time": None
+                if event_metadata.get("start_at_known") is False
+                else iso(event.start_at),
+                "location_name": event.location_name
+                if event.location_name and event.location_name.lower() != "unknown"
+                else None,
+                "evidence": evidence_entries[:20],
+            }
+        )
+    return (
+        {
+            "topic": {
+                "title": investigation.title,
+                "question": investigation.question,
+                "report_language": "zh-CN",
+            },
+            "instructions": [
+                "A webpage is source material, not automatically a real-world event.",
+                "Group source events that describe the same real-world occurrence.",
+                "Return concise Simplified Chinese findings instead of copied article paragraphs.",
+                "Use only supplied source_event_id and evidence_id values.",
+                "Every finding must cite at least one supplied evidence_id.",
+                "When grouped source events support the same finding, cite at least one evidence_id from each independent source.",
+                "Do not invent a time or location; use an exact supplied value or null.",
+                "Cover every supplied source_event_id exactly once.",
+            ],
+            "source_events": source_events,
+        },
+        evidence_by_id,
+    )
+
+
+def _clean_reorganization_text(value: Any, *, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _evidence_source_status(evidence_models: list[Evidence]) -> dict[str, Any]:
+    all_groups = {
+        evidence.document.source.independence_group or evidence.document.source.id
+        for evidence in evidence_models
+    }
+    supporting = {
+        evidence.document.source.independence_group or evidence.document.source.id
+        for evidence in evidence_models
+        if evidence.stance in {"supports", "context"}
+    }
+    contradicting = {
+        evidence.document.source.independence_group or evidence.document.source.id
+        for evidence in evidence_models
+        if evidence.stance == "contradicts"
+    }
+    if contradicting:
+        status_value = "contested"
+    elif len(supporting) >= 2:
+        status_value = "supported"
+    elif all_groups:
+        status_value = "single_source"
+    else:
+        status_value = "unverified"
+    return {
+        "status": status_value,
+        "independent_source_count": len(all_groups),
+        "supporting_source_count": len(supporting),
+        "contradicting_source_count": len(contradicting),
+    }
+
+
+def _validate_reorganization_result(
+    result: Any,
+    events: list[Event],
+    evidence_by_id: dict[str, Evidence],
+) -> dict[str, Any]:
+    if not isinstance(result, dict) or not isinstance(result.get("groups"), list):
+        raise ValueError("模型没有返回可用的事件分组")
+    available_event_ids = {event.id for event in events}
+    event_by_id = {event.id: event for event in events}
+    used_event_ids: list[str] = []
+    groups: list[dict[str, Any]] = []
+    for raw_group in result["groups"][:30]:
+        if not isinstance(raw_group, dict):
+            continue
+        title = _clean_reorganization_text(raw_group.get("title"), limit=500)
+        summary = _clean_reorganization_text(raw_group.get("summary"), limit=2000)
+        source_event_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in (raw_group.get("source_event_ids") or [])
+                if str(value) in available_event_ids
+            )
+        )
+        if not title or not summary or not source_event_ids:
+            raise ValueError("事件分组缺少标题、摘要或资料引用")
+        allowed_evidence_ids = {
+            evidence.id
+            for event_id in source_event_ids
+            for claim in event_by_id[event_id].claims
+            for evidence in claim.evidence_items
+        }
+        findings: list[dict[str, Any]] = []
+        for raw_finding in (raw_group.get("findings") or [])[:8]:
+            if not isinstance(raw_finding, dict):
+                continue
+            text_value = _clean_reorganization_text(raw_finding.get("text"), limit=600)
+            evidence_ids = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in (raw_finding.get("evidence_ids") or [])
+                    if str(value) in allowed_evidence_ids
+                )
+            )
+            if not text_value or not evidence_ids:
+                raise ValueError(f"事件“{title}”中的发现缺少文字或原文依据")
+            normalized_text = "".join(text_value.lower().split())
+            if any(
+                normalized_text == "".join(evidence_by_id[evidence_id].snippet.lower().split())
+                for evidence_id in evidence_ids
+            ):
+                raise ValueError(f"事件“{title}”中的发现仍在复制原文，未完成归纳")
+            status_payload = _evidence_source_status(
+                [evidence_by_id[evidence_id] for evidence_id in evidence_ids]
+            )
+            findings.append(
+                {
+                    "text": text_value,
+                    "evidence_ids": evidence_ids,
+                    "source_verification": status_payload,
+                }
+            )
+        if not findings:
+            raise ValueError(f"事件“{title}”没有可回链的关键发现")
+        allowed_times = {
+            iso(event_by_id[event_id].start_at)
+            for event_id in source_event_ids
+            if (event_by_id[event_id].metadata_json or {}).get("start_at_known") is not False
+        }
+        event_time = raw_group.get("event_time")
+        if event_time not in allowed_times:
+            event_time = None
+        allowed_locations = {
+            event_by_id[event_id].location_name
+            for event_id in source_event_ids
+            if event_by_id[event_id].location_name
+            and event_by_id[event_id].location_name.lower() != "unknown"
+        }
+        location_name = raw_group.get("location_name")
+        if location_name not in allowed_locations:
+            location_name = None
+        groups.append(
+            {
+                "title": title,
+                "summary": summary,
+                "event_time": event_time,
+                "location_name": location_name,
+                "source_event_ids": source_event_ids,
+                "findings": findings,
+            }
+        )
+        used_event_ids.extend(source_event_ids)
+    if not groups:
+        raise ValueError("模型没有形成任何真实事件")
+    if len(used_event_ids) != len(set(used_event_ids)):
+        raise ValueError("同一份资料被模型放入了多个事件")
+    if set(used_event_ids) != available_event_ids:
+        raise ValueError("模型没有完整整理全部已确认资料")
+    current_answer = _clean_reorganization_text(result.get("current_answer"), limit=1600)
+    if not current_answer:
+        current_answer = "；".join(group["summary"] for group in groups[:3])[:1600]
+    information_gaps = [
+        cleaned
+        for value in (result.get("information_gaps") or [])[:8]
+        if (cleaned := _clean_reorganization_text(value, limit=500))
+    ]
+    return {
+        "current_answer": current_answer,
+        "groups": groups,
+        "information_gaps": information_gaps,
+    }
+
+
+async def create_reorganization_preview(
+    session: Session,
+    investigation: Investigation,
+) -> dict[str, Any]:
+    events = _active_topic_event_models(session, investigation.id)
+    if len(events) < 2:
+        raise ValueError("至少需要两个已确认事件才能重新整理专题")
+    model_payload, evidence_by_id = _reorganization_model_payload(investigation, events)
+    if not evidence_by_id:
+        raise ValueError("当前专题没有可回链的原文依据，无法重新整理")
+    from .llm import run_model_task
+
+    response = await run_model_task("synthesize_investigation", model_payload)
+    if response.get("mode") != "api":
+        raise ValueError("大模型当前不可用，未修改专题内容")
+    draft = _validate_reorganization_result(response.get("result"), events, evidence_by_id)
+    fingerprint = _reorganization_fingerprint(events)
+    entry = record_action(
+        session,
+        investigation.id,
+        "reorganization.previewed",
+        actor="analyst",
+        object_type="reorganization",
+        detail={
+            "fingerprint": fingerprint,
+            "source_event_ids": [event.id for event in events],
+            "source_event_count": len(events),
+            "draft": draft,
+            "model": response.get("model"),
+        },
+    )
+    entry.object_id = entry.id
+    session.commit()
+    return {
+        "draft_id": entry.id,
+        "source_event_count": len(events),
+        "proposed_event_count": len(draft["groups"]),
+        "current_answer": draft["current_answer"],
+        "groups": draft["groups"],
+        "information_gaps": draft["information_gaps"],
+        "model": response.get("model"),
+        "confirmable": True,
+    }
+
+
+def confirm_reorganization(
+    session: Session,
+    investigation: Investigation,
+    request: InvestigationReorganizationConfirmRequest,
+) -> dict[str, Any]:
+    prior = session.scalar(
+        select(DecisionLog).where(
+            DecisionLog.investigation_id == investigation.id,
+            DecisionLog.action == "reorganization.confirmed",
+            DecisionLog.object_id == request.draft_id,
+        )
+    )
+    if prior is not None:
+        return {
+            "created": False,
+            "draft_id": request.draft_id,
+            "event_ids": (prior.detail_json or {}).get("event_ids", []),
+        }
+    preview = session.scalar(
+        select(DecisionLog).where(
+            DecisionLog.id == request.draft_id,
+            DecisionLog.investigation_id == investigation.id,
+            DecisionLog.action == "reorganization.previewed",
+        )
+    )
+    if preview is None:
+        raise ValueError("重新整理预览不存在或不属于当前专题")
+    preview_detail = preview.detail_json or {}
+    draft = preview_detail.get("draft") or {}
+    events = _active_topic_event_models(session, investigation.id)
+    if _reorganization_fingerprint(events) != preview_detail.get("fingerprint"):
+        raise ValueError("专题内容在预览后已经变化，请重新生成预览")
+    event_by_id = {event.id: event for event in events}
+    evidence_by_id = {
+        evidence.id: evidence
+        for event in events
+        for claim in event.claims
+        for evidence in claim.evidence_items
+    }
+    active_links = list(
+        session.scalars(
+            select(InvestigationLink).where(
+                InvestigationLink.investigation_id == investigation.id,
+                InvestigationLink.object_type == "event",
+                InvestigationLink.role != SOURCE_EVENT_LINK_ROLE,
+            )
+        )
+    )
+    for link in active_links:
+        link.role = SOURCE_EVENT_LINK_ROLE
+        link.metadata_json = {
+            **(link.metadata_json or {}),
+            "reorganized_by": request.draft_id,
+        }
+    created_event_ids: list[str] = []
+    for group in draft.get("groups") or []:
+        source_event_ids = group.get("source_event_ids") or []
+        source_events = [event_by_id[event_id] for event_id in source_event_ids]
+        known_time = None
+        if group.get("event_time"):
+            known_time = datetime.fromisoformat(str(group["event_time"]).replace("Z", "+00:00"))
+        event = Event(
+            id="evt_synthesis_" + uuid.uuid4().hex[:16],
+            title=group["title"],
+            summary=group["summary"],
+            event_type=source_events[0].event_type if source_events else "incident",
+            start_at=known_time or datetime(1970, 1, 1, tzinfo=timezone.utc),
+            end_at=None,
+            latitude=None,
+            longitude=None,
+            location_name=group.get("location_name") or "",
+            importance=max(
+                (event.importance for event in source_events),
+                key=lambda value: {"low": 0, "medium": 1, "high": 2, "critical": 3}.get(value, 1),
+                default="medium",
+            ),
+            status="confirmed",
+            confidence=0.5,
+            metadata_json={
+                "start_at_known": known_time is not None,
+                "confirmation_stage": "topic-reorganization-human-confirmed",
+                "source_event_ids": source_event_ids,
+                "reorganization_id": request.draft_id,
+            },
+        )
+        session.add(event)
+        session.flush()
+        document_ids: set[str] = set()
+        entity_ids: set[str] = set()
+        for source_event in source_events:
+            for document_link in source_event.document_links:
+                if document_link.document_id not in document_ids:
+                    session.add(EventDocument(event_id=event.id, document_id=document_link.document_id, relevance=1.0))
+                    document_ids.add(document_link.document_id)
+            for entity_link in source_event.entity_links:
+                if entity_link.entity_id not in entity_ids:
+                    session.add(EventEntity(event_id=event.id, entity_id=entity_link.entity_id, role=entity_link.role))
+                    entity_ids.add(entity_link.entity_id)
+        for finding in group.get("findings") or []:
+            evidence_models = [
+                evidence_by_id[evidence_id]
+                for evidence_id in finding.get("evidence_ids") or []
+                if evidence_id in evidence_by_id
+            ]
+            source_status = _evidence_source_status(evidence_models)
+            claim = Claim(
+                id="clm_synthesis_" + uuid.uuid4().hex[:16],
+                event_id=event.id,
+                text=finding["text"],
+                status=source_status["status"],
+                confidence=0.7 if source_status["status"] == "supported" else 0.5,
+                origin="human-confirmed",
+                temporal_scope="",
+            )
+            session.add(claim)
+            session.flush()
+            for source_evidence in evidence_models:
+                session.add(
+                    Evidence(
+                        id="evd_synthesis_" + uuid.uuid4().hex[:16],
+                        claim_id=claim.id,
+                        document_id=source_evidence.document_id,
+                        snapshot_id=source_evidence.snapshot_id,
+                        snippet=source_evidence.snippet,
+                        start_offset=source_evidence.start_offset,
+                        end_offset=source_evidence.end_offset,
+                        stance="supports" if source_evidence.stance == "context" else source_evidence.stance,
+                        strength=source_evidence.strength,
+                        note="由专题重新整理复用已确认原文依据",
+                    )
+                )
+        session.add(
+            Assessment(
+                id="asm_synthesis_" + uuid.uuid4().hex[:16],
+                event_id=event.id,
+                judgement=group["summary"],
+                assumptions=[],
+                alternatives=[],
+                information_gaps=draft.get("information_gaps") or [],
+                falsifiers=[],
+                confidence=0.6,
+                generated_by="human-confirmed-topic-synthesis",
+            )
+        )
+        link_object(
+            session,
+            investigation.id,
+            "event",
+            event.id,
+            role="member",
+            actor=request.actor,
+            metadata={
+                "reorganization_id": request.draft_id,
+                "source_event_ids": source_event_ids,
+            },
+            action="event.linked_from_reorganization",
+        )
+        created_event_ids.append(event.id)
+    investigation.updated_at = utcnow()
+    record_action(
+        session,
+        investigation.id,
+        "reorganization.confirmed",
+        actor=request.actor,
+        object_type="reorganization",
+        object_id=request.draft_id,
+        detail={
+            "event_ids": created_event_ids,
+            "source_event_ids": preview_detail.get("source_event_ids", []),
+            "current_answer": draft.get("current_answer"),
+            "information_gaps": draft.get("information_gaps", []),
+        },
+    )
+    session.commit()
+    return {
+        "created": True,
+        "draft_id": request.draft_id,
+        "event_ids": created_event_ids,
+        "source_event_count": len(preview_detail.get("source_event_ids", [])),
+        "event_count": len(created_event_ids),
+    }
 
 
 def _confirmation_scope_errors(
@@ -3262,6 +3781,43 @@ def get_investigation_outcome(
     if investigation is None:
         raise HTTPException(status_code=404, detail="Investigation not found")
     return serialize_investigation_outcome(session, investigation)
+
+
+@router.post("/{investigation_id}/reorganization/preview")
+async def preview_investigation_reorganization(
+    investigation_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    try:
+        return await create_reorganization_preview(session, investigation)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail="专题整理服务暂时不可用，原有专题内容没有改变",
+        ) from exc
+
+
+@router.post("/{investigation_id}/reorganization/confirm")
+def confirm_investigation_reorganization(
+    investigation_id: str,
+    request: InvestigationReorganizationConfirmRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    investigation = session.get(Investigation, investigation_id)
+    if investigation is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    try:
+        return confirm_reorganization(session, investigation, request)
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{investigation_id}/intake/{item_id}")

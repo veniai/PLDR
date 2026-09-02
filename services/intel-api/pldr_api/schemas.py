@@ -96,6 +96,11 @@ class ReportRequest(BaseModel):
             raise ValueError("event_ids or investigation_id is required")
         return self
 
+
+class InvestigationReorganizationConfirmRequest(BaseModel):
+    draft_id: str = Field(min_length=1, max_length=96)
+    actor: str = Field(default="analyst", min_length=1, max_length=160)
+
 class ImportUrlRequest(BaseModel):
     url:HttpUrl
     source_name:str|None=Field(default=None,max_length=160)
