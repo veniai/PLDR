@@ -38,7 +38,7 @@
   <main class="page">
     <header>
       <h1>{{ title }}</h1>
-      <p>PLDR 证据化开源情报简报 · 生成时间 {{ generated_at }}</p>
+      <p>PLDR 证据化开源情报简报 · 生成时间 {{ generated_at|public_datetime }}</p>
     </header>
 
     {% if demo_notice %}
@@ -71,7 +71,7 @@
         <div class="evidence {{ evidence.stance }}">
           <div class="evidence-top"><strong>原文 E{{ evidence.index }}</strong><span>{{ stance_labels.get(evidence.stance, evidence.stance) }}</span></div>
           <blockquote>{{ evidence.snippet }}</blockquote>
-          <footer><span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span><a href="{{ evidence.snapshot_url }}">查看保存的原文</a></footer>
+          <footer><span>{{ evidence.document.source.name }} · {{ evidence.document.published_at|public_date("发布时间未知") }}</span><a href="{{ evidence.snapshot_url }}">查看保存的原文</a></footer>
         </div>
         {% endfor %}
       </article>
@@ -86,7 +86,7 @@
       <article class="event">
         <h3>{{ event.title }}</h3>
         <p class="summary">{{ event.summary }}</p>
-        <p class="meta">{{ event.start_at or "时间待补充" }} · {{ event.document_count }} 份资料 · {{ event.independent_source_count }} 个独立来源</p>
+        <p class="meta">{{ event.start_at|public_date("时间待补充") }} · {{ event.document_count }} 份资料 · {{ event.independent_source_count }} 个独立来源</p>
       </article>
       {% endfor %}
     </section>
@@ -95,7 +95,7 @@
         <h2>来源附录</h2>
         {% for document in source_documents %}
         <div class="source-row">
-          <span>{{ document.source.name }} · {{ document.title or "未知标题" }} · {{ document.published_at or "发布时间未知" }}</span>
+          <span>{{ document.source.name }} · {{ document.title or "未知标题" }} · {{ document.published_at|public_date("发布时间未知") }}</span>
           <span><a href="{{ document.snapshot_url }}">查看保存的原文</a>{% if document.canonical_url %} · <a href="{{ document.canonical_url }}" target="_blank" rel="noopener">来源网页</a>{% endif %}</span>
         </div>
         {% else %}

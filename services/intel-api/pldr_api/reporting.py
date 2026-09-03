@@ -1,18 +1,62 @@
 from __future__ import annotations
 
-import re
-from datetime import datetime,timezone
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from jinja2 import Environment,FileSystemLoader,select_autoescape
-from sqlalchemy.orm import Session
-from .database import REPO_ROOT
-from .repository import get_event,serialize_event_detail
 
-TEMPLATE_DIR=Path(__file__).resolve().parent/"templates"
-REPORT_DIR=Path(os.getenv("PLDR_REPORT_DIR",str(REPO_ROOT/"reports"))).expanduser().resolve(); REPORT_DIR.mkdir(parents=True,exist_ok=True)
-env=Environment(loader=FileSystemLoader(TEMPLATE_DIR),autoescape=select_autoescape(["html","xml"]),trim_blocks=True,lstrip_blocks=True)
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from sqlalchemy.orm import Session
+
+from .database import REPO_ROOT
+from .repository import get_event, serialize_event_detail
+
+TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+REPORT_DIR = Path(
+    os.getenv("PLDR_REPORT_DIR", str(REPO_ROOT / "reports"))
+).expanduser().resolve()
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def public_date(value: Any, unknown: str = "未知") -> str:
+    if value is None or str(value).strip() == "":
+        return unknown
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    return parsed.strftime("%Y-%m-%d")
+
+
+def public_datetime(value: Any, unknown: str = "未知") -> str:
+    if value is None or str(value).strip() == "":
+        return unknown
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+env = Environment(
+    loader=FileSystemLoader(TEMPLATE_DIR),
+    autoescape=select_autoescape(["html", "xml"]),
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+env.filters["public_date"] = public_date
+env.filters["public_datetime"] = public_datetime
 
 
 def compose_current_answer(
