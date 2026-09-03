@@ -393,6 +393,42 @@ class SearchWorkspaceTest(unittest.TestCase):
         )
         self.assertIsNone(invalid_dateline.published_at)
 
+        dated_url = _normalize_hit(
+            {
+                "url": "https://news.example.org/2026-08-12/article.html",
+                "title": "红海商船遇袭",
+                "content": "正文摘要只描述事件，没有发布日期。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertEqual(dated_url.published_at.isoformat(), "2026-08-12T00:00:00+00:00")
+
+        compact_dated_url = _normalize_hit(
+            {
+                "url": "https://news.example.org/a/20260812A03A6L00?date=20260901",
+                "title": "红海商船遇袭",
+                "content": "正文摘要只描述事件，没有发布日期。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertEqual(
+            compact_dated_url.published_at.isoformat(),
+            "2026-08-12T00:00:00+00:00",
+        )
+
+        query_date_only = _normalize_hit(
+            {
+                "url": "https://news.example.org/article?date=20260812",
+                "title": "红海商船遇袭",
+                "content": "正文摘要只描述事件，没有发布日期。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertIsNone(query_date_only.published_at)
+
     def test_search_error_is_structured_and_persisted(self):
         investigation_id = self.create_investigation("Failure topic")
         controlled = ExternalSearchError(

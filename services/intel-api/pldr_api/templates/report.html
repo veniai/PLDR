@@ -71,7 +71,7 @@
         <div class="evidence {{ evidence.stance }}">
           <div class="evidence-top"><strong>原文 E{{ evidence.index }}</strong><span>{{ stance_labels.get(evidence.stance, evidence.stance) }}</span></div>
           <blockquote>{{ evidence.snippet }}</blockquote>
-          <footer><span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span><a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">查看保存的原文</a></footer>
+          <footer><span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span><a href="{{ evidence.snapshot_url }}">查看保存的原文</a></footer>
         </div>
         {% endfor %}
       </article>
@@ -96,7 +96,7 @@
         {% for document in source_documents %}
         <div class="source-row">
           <span>{{ document.source.name }} · {{ document.title or "未知标题" }} · {{ document.published_at or "发布时间未知" }}</span>
-          <span><a href="{{ document.snapshot_url }}" target="_blank" rel="noopener">查看保存的原文</a>{% if document.canonical_url %} · <a href="{{ document.canonical_url }}" target="_blank" rel="noopener">来源网页</a>{% endif %}</span>
+          <span><a href="{{ document.snapshot_url }}">查看保存的原文</a>{% if document.canonical_url %} · <a href="{{ document.canonical_url }}" target="_blank" rel="noopener">来源网页</a>{% endif %}</span>
         </div>
         {% else %}
         <p class="meta">暂无关联资料。</p>
