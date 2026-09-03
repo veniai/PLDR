@@ -673,9 +673,11 @@ def _latest_version_run(
 
 
 def classify_collection_error(exc: Exception) -> str:
-    from .importers import ReaderFallbackError
+    from .importers import ReaderFallbackError, RedirectLimitError
     if isinstance(exc, ReaderFallbackError):
         return classify_collection_error(exc.direct_error)
+    if isinstance(exc, RedirectLimitError):
+        return "redirect_limit"
     if isinstance(exc, UnsafeUrlError):
         return "unsafe_url"
     if isinstance(exc, ResponseTooLargeError):

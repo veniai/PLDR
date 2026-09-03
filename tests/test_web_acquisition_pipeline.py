@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -15,11 +16,16 @@ from pldr_api.extraction import (
 )
 from pldr_api.importers import (
     FetchedPublicText,
+    RedirectLimitError,
     ReaderFallbackError,
+    UnsafeRedirectUrlError,
     _pinned_public_destination,
+    _validate_reader_target,
+    _validated_doh_addresses,
     fetch_public_text_response,
 )
 from pldr_api.security import UnsafeUrlError
+from pldr_api.collection import classify_collection_error
 
 
 class AcquisitionPipelineTest(unittest.TestCase):
@@ -38,6 +44,64 @@ class AcquisitionPipelineTest(unittest.TestCase):
             with self.assertRaises(UnsafeUrlError):
                 _pinned_public_destination("https://example.org/path")
 
+    def test_trusted_doh_reader_validation_rejects_any_non_public_answer(self):
+        public = {"Status": 0, "Answer": [{"data": "93.184.216.34"}]}
+        private = {"Status": 0, "Answer": [{"data": "127.0.0.1"}]}
+        self.assertEqual(
+            _validated_doh_addresses([public, {"Status": 0}], "example.org"),
+            ["93.184.216.34"],
+        )
+        with self.assertRaises(UnsafeUrlError):
+            _validated_doh_addresses([public, private], "example.org")
+        with self.assertRaises(UnsafeUrlError):
+            _validated_doh_addresses([public, {"Status": 2}], "example.org")
+        self.assertEqual(classify_collection_error(RedirectLimitError("loop")), "redirect_limit")
+
+    def test_reader_validation_uses_configured_https_doh_through_proxy(self):
+        request = httpx.Request("GET", "https://dns.example/query")
+        a = httpx.Response(
+            200,
+            json={"Status": 0, "Answer": [{"data": "93.184.216.34"}]},
+            request=request,
+        )
+        aaaa = httpx.Response(200, json={"Status": 0}, request=request)
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=None)
+        client.get = AsyncMock(side_effect=[a, aaaa])
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_VALIDATION_DOH_URL": "https://dns.example/query",
+                "PLDR_READER_PROXY_URL": "http://127.0.0.1:7897",
+            },
+        ), patch("pldr_api.importers.httpx.AsyncClient", return_value=client) as factory:
+            asyncio.run(
+                _validate_reader_target(
+                    "https://public.example/article", timeout_seconds=20
+                )
+            )
+        self.assertEqual(client.get.await_count, 2)
+        self.assertEqual(factory.call_args.kwargs["proxy"], "http://127.0.0.1:7897")
+        self.assertFalse(factory.call_args.kwargs["trust_env"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_VALIDATION_DOH_URL": (
+                    "https://dns.example/query?token=redaction-check-value"
+                )
+            },
+        ), patch("pldr_api.importers.httpx.AsyncClient") as forbidden_client:
+            with self.assertRaises(ValueError) as context:
+                asyncio.run(
+                    _validate_reader_target(
+                        "https://public.example/article", timeout_seconds=20
+                    )
+                )
+        self.assertNotIn("redaction-check-value", str(context.exception))
+        forbidden_client.assert_not_called()
+
     def test_article_extraction_preserves_paragraphs_and_metadata(self):
         html = """
         <html><head><title>航运通告</title>
@@ -55,6 +119,56 @@ class AcquisitionPipelineTest(unittest.TestCase):
         self.assertGreaterEqual(len(paragraph_spans(page.body)), 3)
         self.assertEqual(assess_extraction(page).status, "usable")
 
+    def test_total_deadline_includes_non_blocking_dns_resolution(self):
+        def slow_resolution(_url: str):
+            time.sleep(0.05)
+            return "https://93.184.216.34/", "example.org", "example.org"
+
+        with patch.dict(os.environ, {"PLDR_READER_FALLBACK_ENABLED": "false"}), patch(
+            "pldr_api.importers._pinned_public_destination", side_effect=slow_resolution
+        ):
+            with self.assertRaises(httpx.ReadTimeout):
+                asyncio.run(
+                    fetch_public_text_response(
+                        "https://example.org/", total_timeout_seconds=0.01
+                    )
+                )
+
+    def test_direct_wall_clock_budget_leaves_time_for_reader(self):
+        rendered = FetchedPublicText(
+            "https://public.example/article",
+            "<article>" + "正文" * 100 + "</article>",
+            200,
+            "text/html",
+            219,
+            "jina_reader",
+            {},
+        )
+
+        async def slow_direct(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            raise AssertionError("direct fetch should have been cancelled")
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_FALLBACK_ENABLED": "true",
+                "PLDR_DIRECT_FETCH_TIMEOUT_SECONDS": "0.01",
+            },
+        ), patch(
+            "pldr_api.importers._fetch_public_text_response", side_effect=slow_direct
+        ), patch(
+            "pldr_api.importers._fetch_reader_html_response",
+            new=AsyncMock(return_value=rendered),
+        ) as reader:
+            result = asyncio.run(
+                fetch_public_text_response(
+                    "https://public.example/article", total_timeout_seconds=0.5
+                )
+            )
+        self.assertEqual(result.fetch_method, "jina_reader")
+        reader.assert_awaited_once()
+
     def test_near_duplicate_detection_is_conservative(self):
         original = "这是一篇关于海上无人作战系统测试的公开报道。" * 30
         repost = original + "转载编辑补充了一句来源说明。"
@@ -70,6 +184,17 @@ class AcquisitionPipelineTest(unittest.TestCase):
         with patch.dict(os.environ, {"PLDR_READER_FALLBACK_ENABLED": "true"}), patch(
             "pldr_api.importers._fetch_public_text_response",
             new=AsyncMock(side_effect=httpx.ReadTimeout("direct timeout")),
+        ) as direct, patch(
+            "pldr_api.importers._fetch_reader_html_response", new=AsyncMock(return_value=rendered)
+        ) as reader:
+            result = asyncio.run(fetch_public_text_response("https://public.example/article"))
+        self.assertEqual(result.fetch_method, "jina_reader")
+        self.assertEqual(direct.await_args.kwargs["timeout_seconds"], 12)
+        reader.assert_awaited_once()
+
+        with patch.dict(os.environ, {"PLDR_READER_FALLBACK_ENABLED": "true"}), patch(
+            "pldr_api.importers._fetch_public_text_response",
+            new=AsyncMock(side_effect=RedirectLimitError("redirect loop")),
         ), patch(
             "pldr_api.importers._fetch_reader_html_response", new=AsyncMock(return_value=rendered)
         ) as reader:
@@ -84,6 +209,38 @@ class AcquisitionPipelineTest(unittest.TestCase):
             "pldr_api.importers._fetch_reader_html_response", new=AsyncMock()
         ) as reader:
             with self.assertRaises(UnsafeUrlError):
+                asyncio.run(fetch_public_text_response("https://public.example/article"))
+        reader.assert_not_awaited()
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_FALLBACK_ENABLED": "true",
+                "PLDR_READER_VALIDATION_DOH_URL": "https://dns.example/query",
+            },
+        ), patch(
+            "pldr_api.importers._fetch_public_text_response",
+            new=AsyncMock(side_effect=UnsafeUrlError("synthetic local DNS answer")),
+        ), patch(
+            "pldr_api.importers._fetch_reader_html_response", new=AsyncMock(return_value=rendered)
+        ) as reader:
+            result = asyncio.run(fetch_public_text_response("https://public.example/article"))
+        self.assertEqual(result.fetch_method, "jina_reader")
+        reader.assert_awaited_once()
+
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_FALLBACK_ENABLED": "true",
+                "PLDR_READER_VALIDATION_DOH_URL": "https://dns.example/query",
+            },
+        ), patch(
+            "pldr_api.importers._fetch_public_text_response",
+            new=AsyncMock(side_effect=UnsafeRedirectUrlError("private redirect")),
+        ), patch(
+            "pldr_api.importers._fetch_reader_html_response", new=AsyncMock()
+        ) as reader:
+            with self.assertRaises(UnsafeRedirectUrlError):
                 asyncio.run(fetch_public_text_response("https://public.example/article"))
         reader.assert_not_awaited()
 

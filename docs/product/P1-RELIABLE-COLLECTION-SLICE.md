@@ -74,17 +74,26 @@ PYTHONPATH=services/intel-api .venv/bin/python -m pldr_api.collector --once
 docker compose up --build
 ```
 
-Compose 会在 API 健康后启动一个 collector；两者共享持久化数据库目录。当前只支持一个 collector worker。
+Compose 会在 API 健康后启动 collector；两者共享持久化数据库目录。collector 默认启动 4 个受控工作槽，可通过 `PLDR_COLLECTOR_CONCURRENCY` 在 1–32 范围调整。
 
 ### 可配置项
 
 ```env
 PLDR_MAX_FETCH_BYTES=5242880
 PLDR_FETCH_TOTAL_TIMEOUT_SECONDS=30
+PLDR_DIRECT_FETCH_TIMEOUT_SECONDS=12
 PLDR_COLLECTION_POLL_SECONDS=2
+PLDR_READER_FALLBACK_ENABLED=false
+PLDR_READER_BASE_URL=https://r.jina.ai
+PLDR_READER_PROXY_URL=
+PLDR_READER_VALIDATION_DOH_URL=
 ```
 
-`PLDR_MAX_FETCH_BYTES` 同时约束手动 URL 导入和固定网页采集的响应正文；`PLDR_FETCH_TOTAL_TIMEOUT_SECONDS` 是异步 HTTP 请求、重定向和流读取阶段的总墙钟上限。每个重定向地址仍须通过公共 HTTP(S) 地址检查；同步 DNS 公共地址校验的极端解析卡顿不在这一上限的强保证内。为避免解压炸弹在大小检查前占用内存，首切片请求 `Accept-Encoding: identity` 并拒绝仍返回压缩 `Content-Encoding` 的站点。
+`PLDR_MAX_FETCH_BYTES` 同时约束手动 URL 导入和固定网页采集的响应正文；`PLDR_FETCH_TOTAL_TIMEOUT_SECONDS` 是 DNS、直抓、重定向和 Reader 兜底共享的总墙钟上限。DNS 解析放在线程中等待，避免一个慢解析阻塞其他并发任务。直抓默认最多占用 12 秒，为 Reader 的浏览器渲染保留时间。每个直抓及重定向地址仍须解析到公网地址并固定连接，绝不因提高成功率而放行内网地址。
+
+部署网络存在 DNS 污染或代理出口时，可同时配置 `PLDR_READER_PROXY_URL` 和可信 HTTPS `PLDR_READER_VALIDATION_DOH_URL`。这两个配置只接受不含用户名、密码、查询串和片段的 URL，密钥不得拼入地址。系统先用 DoH 校验目标解析结果全部为公网地址，再让远程 Reader 抓取；任一非公网结果、DoH 异常或 Reader 异常都失败关闭。代理和 DoH 均为空时沿用系统 DNS。
+
+Jina Reader 会把公开目标 URL 发送给第三方服务，因此默认关闭，启用前应确认数据、使用条款以及 Reader 自身的 SSRF 防护。PLDR 能保证本机不连接未验证的地址，并会复核 Reader 返回的最终 URL；但无法把 DoH 结果绑定到第三方实际连接，也看不到第三方内部的中间跳转。需要登录、携带内部凭据或不能交给第三方处理的网页不允许走该路径。
 
 ## API 契约
 

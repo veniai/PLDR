@@ -162,8 +162,8 @@ LLM_EXTRACTION_MAX_TOKENS=1400
 LLM_REASONING_EFFORT=
 ```
 
-业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。网页正文使用 Trafilatura 清理；可选 Jina Reader 只在安全直抓失败或正文质量不足后启用。模型失败保留原文并允许只重试分析，不再生成容易误解的伪成功草稿。
+业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。网页正文使用 Trafilatura 清理；可选 Jina Reader 只在安全直抓失败或正文质量不足后启用。代理网络可配置 HTTPS DoH 独立验证公开目标后再走 Reader，不能通过 Reader 绕过非公网地址保护。模型失败保留原文并允许只重试分析，不再生成容易误解的伪成功草稿。
 
 ## 当前边界
 
-P1 关键词发现和固定网页/RSS 可靠采集切片已经形成可运行闭环，但**完整 P1 尚未退出**。首个真实专题包及其“今天”输出、API/必要的受控浏览器来源、RSS 条目原文追抓、30–50 个真实来源、连续 72 小时、安全与性能基准、PostgreSQL/PostGIS、模型调用成本与最终验收报告仍待完成；任何未确认候选都不会进入正式档案或报告。详见 `STATUS.md`、`docs/product/FUNCTIONAL-PERFORMANCE-REQUIREMENTS.md`、`docs/product/P1-EXTERNAL-KEYWORD-DISCOVERY.md`、`docs/product/P1-RELIABLE-COLLECTION-SLICE.md` 与 `docs/product/ROADMAP.md`。
+P1 关键词发现和固定网页/RSS 可靠采集切片已经形成可运行闭环，但**完整 P1 尚未退出**。首个真实专题包及其“今天”输出、需要登录或携带会话的受控浏览器来源、RSS 条目原文追抓、30–50 个真实来源、连续 72 小时、安全与性能基准、PostgreSQL/PostGIS、模型调用成本与最终验收报告仍待完成；任何未确认候选都不会进入正式档案或报告。详见 `STATUS.md`、`docs/product/FUNCTIONAL-PERFORMANCE-REQUIREMENTS.md`、`docs/product/P1-EXTERNAL-KEYWORD-DISCOVERY.md`、`docs/product/P1-RELIABLE-COLLECTION-SLICE.md` 与 `docs/product/ROADMAP.md`。
