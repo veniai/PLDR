@@ -479,7 +479,11 @@ async def _fetch_reader_html_response(
             f"Rendered page exceeds {max_bytes} byte limit ({rendered_size} bytes received)"
         )
     resolved_url = canonicalize_url(str(data.get("url") or target))
-    await _validate_reader_target(resolved_url, timeout_seconds=timeout_seconds)
+    # The original target was validated immediately before the Reader request.
+    # Revalidate only when Reader reports a different final URL; repeating DoH
+    # for the same URL adds a new transient failure after content already arrived.
+    if resolved_url != target:
+        await _validate_reader_target(resolved_url, timeout_seconds=timeout_seconds)
     upstream_status = data.get("httpStatus")
     if isinstance(upstream_status, int) and upstream_status >= 400:
         raise ValueError(f"Reader upstream returned HTTP {upstream_status}")
