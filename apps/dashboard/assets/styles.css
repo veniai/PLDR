@@ -843,6 +843,7 @@ a:hover { color: #a6edff; }
 .investigation-today-grid, .investigation-events-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(290px, 0.72fr); gap: 12px; align-items: start; }
 .workbench-surface { min-width: 0; overflow: hidden; border: 1px solid var(--line-soft); border-radius: 10px; background: rgba(9, 22, 29, 0.86); }
 .workbench-surface-head { min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 13px; border-bottom: 1px solid var(--line-soft); }
+.workbench-surface-head-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .workbench-surface-head h3 { margin: 0; color: #dcecf2; font-size: 13px; }
 .workbench-surface-head p { margin: 3px 0 0; color: var(--muted); font-size: 10px; }
 .workbench-surface-body { padding: 12px; }
@@ -971,6 +972,9 @@ a:hover { color: #a6edff; }
 .error-trace code { color: #bdd0d7; }
 .operational-error.compact { margin-top: 9px; padding: 10px; gap: 7px; }
 .operational-error-summary { margin: 0; color: #c6d6dc; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.operational-error-guidance { display: grid; gap: 5px; }
+.operational-error-guidance p { display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; margin: 0; color: #b8cbd3; font-size: 12px; line-height: 1.5; }
+.operational-error-guidance strong { color: #ed9da2; font-weight: 700; }
 .operational-error.compact dl { grid-template-columns: 1fr; gap: 4px; }
 .operational-error.compact dl > div { display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 7px; padding: 6px 8px; }
 .operational-error.compact dd { margin: 0; font-size: 12px; }
@@ -1358,6 +1362,7 @@ body { font-size: 14px; }
   .search-actions { align-items: stretch; flex-direction: column; padding: 9px 12px calc(9px + env(safe-area-inset-bottom)); }
   .search-actions > div, .search-actions .btn-primary { width: 100%; }
   .operational-error.compact dl > div { grid-template-columns: 1fr; }
+  .operational-error-guidance p { grid-template-columns: 1fr; gap: 2px; }
   .operational-error-action .btn { width: 100%; }
 }
 

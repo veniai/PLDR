@@ -819,6 +819,20 @@ class TopicUxContractTest(unittest.TestCase):
         )
         self.assertIn('task?.waiting_for_model_retry ? "等待 AI 重试"', source)
         self.assertIn("后台会继续处理，无需手动操作", source)
+        self.assertIn('class="operational-error-guidance"', source)
+        self.assertIn("<strong>影响</strong>", source)
+        self.assertIn("<strong>下一步</strong>", source)
+        self.assertIn("查看技术诊断", source)
+        self.assertNotIn("data-expand-error", source)
+
+        batch_start = source.index("async function handleIntakeBatch(")
+        batch_end = source.index("\nfunction renderReadonlyCandidate", batch_start)
+        batch_handler = source[batch_start:batch_end]
+        self.assertIn(
+            '`/pldr-api/v1/intake/${encodeURIComponent(id)}/reject`',
+            batch_handler,
+        )
+        self.assertNotIn('intakeReviewRoute(id, "reject")', batch_handler)
 
     def test_topic_onboarding_presents_one_clear_human_confirmation_flow(self):
         page = self.client.get("/")
@@ -896,6 +910,7 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn('const actionable = items.find', manual_import)
         self.assertIn('if (actionable)', manual_import)
         self.assertIn("function renderOutcomeHero", source)
+        self.assertIn('data-investigation-action="review">批量处理</button>', source)
         self.assertIn("function renderOutcomeFindings", source)
         self.assertIn("function formatEventDate", source)
         outcome_timeline = source[

@@ -516,8 +516,12 @@ function renderOperationalError(input, { stage = "unknown", compact = false, act
         <strong>${escapeHtml(error.title)}</strong>
       </div>
       <p class="operational-error-summary">${escapeHtml(error.message)}</p>
+      <div class="operational-error-guidance">
+        <p><strong>影响</strong><span>${escapeHtml(error.impact)}</span></p>
+        <p><strong>下一步</strong><span>${escapeHtml(error.nextAction)}</span></p>
+      </div>
       ${actionHtml ? `<div class="operational-error-action">${actionHtml}</div>` : ""}
-      <details><summary>查看原因、影响与诊断</summary>${detailRows}${technical}</details>
+      <details><summary>查看技术诊断${error.code ? ` · ${escapeHtml(error.code)}` : ""}</summary>${technical}</details>
     </article>` : `
     <article class="operational-error" role="alert">
       <div class="operational-error-heading">
@@ -1937,8 +1941,6 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
       primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">重新分析</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.search?.result_id) {
       primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取</button>`;
-    } else if (stage === "failed") {
-      primaryAction = '<button class="btn btn-ghost" type="button" data-expand-error>查看解决办法</button>';
     }
     const canRemoveFromInvestigation = stage === "failed"
       && intakeId
@@ -2070,7 +2072,7 @@ function renderInvestigationToday(investigation) {
       <div class="investigation-stat"><span>本轮待办</span><strong>${attention}</strong><small>${attention ? "处理完即可离开" : "当前无需人工操作"}</small></div>
     </div>
     <div class="attention-queue-stack">
-      <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>等待确认</h3><p>可打开单条查看，也可在待处理窗口中多选处理</p></div><span class="count-badge warning">${readyTasks.length}</span></div>${renderTaskRows(readyTasks, "本轮没有需要确认的内容。")}</section>
+      <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>等待确认</h3><p>普通材料可以集中多选；需要修改时再打开单条</p></div><div class="workbench-surface-head-actions"><span class="count-badge warning">${readyTasks.length}</span>${readyTasks.length ? '<button class="btn btn-primary" type="button" data-investigation-action="review">批量处理</button>' : ""}</div></div>${renderTaskRows(readyTasks, "本轮没有需要确认的内容。")}</section>
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>需要处理</h3><p>失败原因、影响和解决办法会直接显示</p></div><span class="count-badge warning">${failedTasks.length}</span></div>${renderTaskRows(failedTasks, "当前没有处理失败的内容。")}</section>
       <details class="processing-queue" ${processingTasks.length ? "" : "open"}><summary><span>系统正在处理</span><strong>${processingTasks.length}</strong><small>无需操作</small></summary>${renderTaskRows(processingTasks, "系统当前没有后台处理任务。")}</details>
       ${heldForDiscovery.length ? `<section class="workbench-surface discovery-hold-note"><div><strong>${heldForDiscovery.length} 条线索未进入待处理</strong><p>系统认为这些内容相关性存疑或可能无关，已放在“资料与来源 → 发现资料”中，不要求你逐条清理。</p></div><button class="btn btn-ghost" type="button" data-investigation-action="open-discovery">查看候选线索</button></section>` : ""}
@@ -4767,7 +4769,7 @@ async function handleIntakeBatch(action) {
         let item = state.intakeItems.find((candidate) => candidate.id === id);
         if (!item?.material || !Array.isArray(item.candidates)) item = await loadIntakeDetail(id);
         if (action === "reject") {
-          await api(intakeReviewRoute(id, "reject"), { method: "POST", body: JSON.stringify({ analyst: "analyst", reason: "批量忽略：用户确认无需纳入专题成果" }) });
+          await api(`/pldr-api/v1/intake/${encodeURIComponent(id)}/reject`, { method: "POST", body: JSON.stringify({ analyst: "analyst", reason: "批量忽略：用户确认无需纳入专题成果" }) });
         } else {
           const payload = defaultConfirmationForItem(item);
           const eventKey = String(payload.event.title || "").trim().toLocaleLowerCase();
@@ -6641,15 +6643,6 @@ function bindEvents() {
   $("#intake-modal").addEventListener("change", invalidateReviewForm);
 
   document.addEventListener("click", async (event) => {
-    const errorExpander = event.target.closest("[data-expand-error]");
-    if (errorExpander) {
-      const details = errorExpander.closest(".operational-error")?.querySelector("details");
-      if (details) {
-        details.open = true;
-        details.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      }
-      return;
-    }
     if (event.target.closest("[data-retry-selected-event]")) {
       await selectEvent(state.selectedId, { open: true, tab: state.drawerTab, syncUrl: false });
       return;
