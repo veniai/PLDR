@@ -229,6 +229,106 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(selected.status_code, 202, selected.text)
         self.assertEqual(selected.json()["batch"]["requested_count"], 25)
         self.assertEqual(len(selected.json()["tasks"]), 25)
+        self.assertEqual(
+            {task["selection_origin"] for task in selected.json()["tasks"]},
+            {"manual"},
+        )
+
+    def test_topic_relevance_prescreen_keeps_broad_hits_out_of_automatic_queue(self):
+        investigation = self.client.post(
+            "/pldr-api/v1/investigations",
+            json={
+                "title": "霍尔木兹海峡商船安全动态",
+                "question": "霍尔木兹海峡发生了哪些商船袭击？",
+            },
+        )
+        self.assertEqual(investigation.status_code, 201, investigation.text)
+        investigation_id = investigation.json()["id"]
+
+        def hit(url: str, title: str, snippet: str):
+            return _normalize_hit(
+                {
+                    "url": url,
+                    "title": title,
+                    "content": snippet,
+                    "engine": "unit",
+                },
+                provider="searxng",
+            )
+
+        async def backend(_, request):
+            return BackendSearchResponse(
+                "searxng",
+                "searxng:news",
+                [
+                    hit(
+                        "https://source.example.org/direct",
+                        "霍尔木兹海峡油轮遭袭",
+                        "商船通行受到影响。",
+                    ),
+                    hit(
+                        "https://source.example.org/roundup",
+                        "今日财经要闻",
+                        "其中一则消息涉及霍尔木兹海峡油轮袭击。",
+                    ),
+                    hit(
+                        "https://source.example.org/sports",
+                        "今日体育动态",
+                        "本轮联赛已经结束。",
+                    ),
+                ],
+                False,
+            )
+
+        with patch("pldr_api.search.request_search", new=backend):
+            response = self.client.post(
+                "/pldr-api/v1/search",
+                json={
+                    "keyword": "霍尔木兹海峡 油轮 袭击",
+                    "scope": "news",
+                    "investigation_id": investigation_id,
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        levels = [item["topic_relevance"]["level"] for item in payload["results"]]
+        self.assertEqual(levels, ["likely", "uncertain", "unlikely"])
+        self.assertEqual(
+            payload["relevance_summary"],
+            {"likely": 1, "uncertain": 1, "unlikely": 1, "unknown": 0},
+        )
+        self.assertIn("默认不进入待处理", payload["results"][2]["topic_relevance"]["reason"])
+
+        reopened = self.client.get(
+            f"/pldr-api/v1/search/runs/{payload['query_run_id']}",
+            params={"investigation_id": investigation_id},
+        )
+        self.assertEqual(reopened.status_code, 200, reopened.text)
+        self.assertEqual(
+            [item["topic_relevance"]["level"] for item in reopened.json()["results"]],
+            levels,
+        )
+        selected = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={
+                "result_ids": [item["id"] for item in payload["results"]],
+                "request_id": "topic-onboarding-relevance-task-serialization",
+                "investigation_id": investigation_id,
+            },
+        )
+        self.assertEqual(selected.status_code, 202, selected.text)
+        tasks = self.client.get(
+            f"/pldr-api/v1/investigations/{investigation_id}/tasks",
+        )
+        self.assertEqual(tasks.status_code, 200, tasks.text)
+        self.assertEqual(
+            sorted(item["topic_relevance"]["level"] for item in tasks.json()["items"]),
+            ["likely", "uncertain", "unlikely"],
+        )
+        self.assertEqual(
+            {item["selection_origin"] for item in tasks.json()["items"]},
+            {"topic_onboarding"},
+        )
 
     def test_search_error_is_structured_and_persisted(self):
         investigation_id = self.create_investigation("Failure topic")

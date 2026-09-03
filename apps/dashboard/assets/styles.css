@@ -458,8 +458,14 @@ a:hover { color: #a6edff; }
 .search-result-body { min-width: 0; padding: 14px 15px; }
 .search-result-meta { display: flex; flex-wrap: wrap; gap: 7px 12px; color: #6e8d9b; font-size: 11px; }
 .search-result-meta .clue-completeness { color: var(--amber); }
+.search-relevance { padding: 1px 7px; border-radius: 999px; font-weight: 700; }
+.search-relevance.likely { background: rgba(74, 190, 145, 0.14); color: #7ed9b2; }
+.search-relevance.uncertain { background: rgba(243, 189, 100, 0.14); color: var(--amber); }
+.search-relevance.unlikely { background: rgba(149, 161, 170, 0.12); color: #91a4ad; }
+.search-relevance.unknown { background: rgba(100, 217, 251, 0.1); color: #83bed2; }
 .search-result h3 { margin: 7px 0; color: #e0eef3; font-size: 15px; font-weight: 650; line-height: 1.48; }
 .search-result p { margin: 0 0 9px; color: #9bb2bd; font-size: 13px; line-height: 1.65; }
+.search-result .search-relevance-reason { color: #7895a2; font-size: 12px; }
 .search-result > .search-result-body > a { display: block; overflow-wrap: anywhere; color: var(--cyan); font-size: 12px; }
 .search-result-technical { margin-top: 10px; border-top: 1px solid var(--line-soft); color: #688694; font-size: 11px; }
 .search-result-technical > summary { min-height: 34px; display: flex; align-items: center; cursor: pointer; }

@@ -41,6 +41,121 @@ from .schemas import ExternalSearchRequest, ExternalSearchSelectionRequest
 MAX_LOADED_RESULTS = 100
 
 
+_TOPIC_RELEVANCE_STOP_TERMS = {
+    "about",
+    "and",
+    "from",
+    "latest",
+    "news",
+    "the",
+    "with",
+    "事件",
+    "什么",
+    "公开",
+    "关于",
+    "哪些",
+    "当前",
+    "是否",
+    "材料",
+    "相关",
+    "资料",
+}
+
+
+def _relevance_chunks(value: str) -> list[str]:
+    """Return visible query/topic chunks without pretending to do NLP."""
+    normalized = normalize_text(value or "").casefold()
+    return [
+        chunk
+        for chunk in re.split(r"[^\w\u3400-\u9fff]+", normalized)
+        if len(chunk) >= 2 and chunk not in _TOPIC_RELEVANCE_STOP_TERMS
+    ]
+
+
+def _relevance_terms(*values: str) -> tuple[list[str], list[str]]:
+    anchors: list[str] = []
+    concepts: list[str] = []
+    for value in values:
+        for chunk in _relevance_chunks(value):
+            if chunk not in anchors:
+                anchors.append(chunk)
+            for han_run in re.findall(r"[\u3400-\u9fff]{2,16}", chunk):
+                for index in range(len(han_run) - 1):
+                    term = han_run[index : index + 2]
+                    if term not in _TOPIC_RELEVANCE_STOP_TERMS and term not in concepts:
+                        concepts.append(term)
+            for term in re.findall(r"[a-z][a-z0-9_-]{2,}", chunk):
+                if term not in _TOPIC_RELEVANCE_STOP_TERMS and term not in concepts:
+                    concepts.append(term)
+    return anchors, concepts
+
+
+def assess_topic_relevance(
+    result: SearchResult,
+    investigation: Investigation | None,
+) -> dict[str, Any]:
+    """Explain a conservative title/snippet relevance pre-screen.
+
+    This is intentionally not a truth or source-quality score.  It only keeps
+    broad search hits out of the human pending queue until an analyst selects
+    them explicitly.
+    """
+    if investigation is None:
+        return {
+            "level": "unknown",
+            "label": "尚未初筛",
+            "matched_terms": [],
+            "reason": "查询没有专题上下文，需人工判断是否相关。",
+        }
+    anchors, _ = _relevance_terms(result.query_run.keyword, investigation.title)
+    _, concepts = _relevance_terms(
+        result.query_run.keyword,
+        investigation.title,
+        getattr(investigation, "question", ""),
+    )
+    title = normalize_text(result.title or "").casefold()
+    context = normalize_text(f"{result.title or ''} {result.snippet or ''}").casefold()
+    title_anchor_hits = [term for term in anchors if term in title]
+    context_anchor_hits = [term for term in anchors if term in context]
+    title_concept_hits = [term for term in concepts if term in title]
+    context_concept_hits = [term for term in concepts if term in context]
+    single_anchor_query = len(_relevance_chunks(result.query_run.keyword)) == 1
+    strong_title_match = (
+        any(len(term) >= 4 for term in title_anchor_hits)
+        or len(title_concept_hits) >= 3
+        or (single_anchor_query and bool(title_anchor_hits))
+    )
+    matched = list(
+        dict.fromkeys(
+            title_anchor_hits
+            + title_concept_hits
+            + context_anchor_hits
+            + context_concept_hits
+        )
+    )[:6]
+    if strong_title_match:
+        title_matched = list(dict.fromkeys(title_anchor_hits + title_concept_hits))[:4]
+        return {
+            "level": "likely",
+            "label": "与专题相关",
+            "matched_terms": matched,
+            "reason": f"标题命中专题词：{'、'.join(title_matched)}。",
+        }
+    if context_anchor_hits or len(context_concept_hits) >= 2:
+        return {
+            "level": "uncertain",
+            "label": "相关性存疑",
+            "matched_terms": matched,
+            "reason": "摘要涉及专题，但标题不足以确认；保留在线索列表，由用户决定是否处理。",
+        }
+    return {
+        "level": "unlikely",
+        "label": "可能无关",
+        "matched_terms": [],
+        "reason": "标题和摘要未命中专题词；保留在线索列表，默认不进入待处理。",
+    }
+
+
 ERROR_PRESENTATION: dict[str, dict[str, Any]] = {
     "not_configured": {
         "code": "search.not_configured",
@@ -627,7 +742,12 @@ def serialize_selection(
     }
 
 
-def serialize_search_result(result: SearchResult, selection: SearchSelection | None = None) -> dict[str, Any]:
+def serialize_search_result(
+    result: SearchResult,
+    selection: SearchSelection | None = None,
+    *,
+    investigation: Investigation | None = None,
+) -> dict[str, Any]:
     run = result.query_run
     return {
         "id": result.id,
@@ -645,6 +765,7 @@ def serialize_search_result(result: SearchResult, selection: SearchSelection | N
         "rank": result.rank,
         "source_page": result.source_page,
         "engine": result.engine,
+        "topic_relevance": assess_topic_relevance(result, investigation),
         "selection": serialize_selection(selection, current_result=result),
     }
 
@@ -653,11 +774,17 @@ def serialize_query_run(
     run: SearchQueryRun,
     results: list[SearchResult] | None = None,
     selections_by_fingerprint: dict[str, SearchSelection] | None = None,
+    *,
+    investigation: Investigation | None = None,
 ) -> dict[str, Any]:
     selections = selections_by_fingerprint or {}
     items = results if results is not None else list(run.results)
     serialized_results = [
-        serialize_search_result(result, selections.get(result.result_fingerprint))
+        serialize_search_result(
+            result,
+            selections.get(result.result_fingerprint),
+            investigation=investigation,
+        )
         for result in items
     ]
     loaded_count = int(run.result_count or 0)
@@ -706,6 +833,15 @@ def serialize_query_run(
         "results": serialized_results,
         "items": serialized_results,
     }
+    if serialized_results:
+        payload["relevance_summary"] = {
+            level: sum(
+                1
+                for item in serialized_results
+                if item["topic_relevance"]["level"] == level
+            )
+            for level in ("likely", "uncertain", "unlikely", "unknown")
+        }
     return payload
 
 
@@ -869,6 +1005,7 @@ def get_query_run_payload(
         _selections_for_results(
             session, results, investigation_id=investigation.id
         ),
+        investigation=investigation,
     )
     payload["investigation_id"] = investigation.id
     payload["investigation"] = {

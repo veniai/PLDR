@@ -1146,6 +1146,28 @@ def serialize_task(
         "created_at": iso(task.created_at),
         "updated_at": iso(task.updated_at),
     }
+    if session is not None and task.task_type == "search_result_intake":
+        batch = session.get(ProcessingBatch, task.batch_id) if task.batch_id else None
+        payload["selection_origin"] = (
+            "topic_onboarding"
+            if (batch is not None and (batch.request_id or "").startswith("topic-onboarding-"))
+            else "manual"
+        )
+    if session is not None and task.selection_id:
+        selection = session.get(SearchSelection, task.selection_id)
+        result = (
+            session.get(SearchResult, selection.result_id)
+            if selection is not None
+            else None
+        )
+        investigation = session.get(Investigation, task.investigation_id)
+        if result is not None and investigation is not None:
+            from .search import assess_topic_relevance
+
+            payload["topic_relevance"] = assess_topic_relevance(
+                result,
+                investigation,
+            )
     if session is not None and task.intake_item_id:
         item = session.scalar(
             select(IntakeItem)

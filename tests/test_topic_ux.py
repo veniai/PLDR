@@ -717,6 +717,9 @@ class TopicUxContractTest(unittest.TestCase):
         html = page.text
         for label in ("专题成果", "待处理", "资料与来源"):
             self.assertIn(label, html)
+        self.assertIn("全部专题待处理", html)
+        self.assertIn("进入专题后只显示该专题内容", html)
+        self.assertIn("全局待确认", html)
         self.assertLess(
             html.index('data-investigation-tab="outcomes"'),
             html.index('data-investigation-tab="overview"'),
@@ -774,6 +777,22 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertNotIn("MY ACTIONS", source)
         self.assertNotIn("预览入档", source)
         self.assertIn("searchPayloadResults(searchPayload)", source)
+        self.assertIn('result.topic_relevance?.level === "likely"', source)
+        self.assertIn("function searchResultRelevance", source)
+        self.assertIn("function taskBelongsInPending", source)
+        self.assertIn('task?.selection_origin !== "topic_onboarding"', source)
+        self.assertIn("taskIsActive(task) && taskBelongsInPending(task)", source)
+        self.assertIn("taskBelongsInPending(task) || taskIntakeId(task) === preferredItemId", source)
+        home_queue = source[
+            source.index("function allHomeAssignments()") : source.index("function renderDestinationPickers", source.index("function allHomeAssignments()"))
+        ]
+        self.assertLess(
+            home_queue.index("seenIntake.add(intakeId)"),
+            home_queue.index("if (!taskBelongsInPending(task)) return"),
+        )
+        self.assertIn("相关性存疑", source)
+        self.assertIn("未通过相关性初筛的结果仍保留在这里", source)
+        self.assertIn('data-investigation-action="open-search-run"', source)
         self.assertIn("await api(API_ROUTES.searchSelect", source)
         self.assertIn('`${feed ? "/pldr-api/v1/import/rss" : "/pldr-api/v1/import/url"}?defer_candidates=true`', source)
         self.assertIn('await api("/pldr-api/v1/intake/text?defer_candidates=true"', source)
