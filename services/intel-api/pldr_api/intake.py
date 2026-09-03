@@ -7,7 +7,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -117,6 +117,64 @@ def parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def normalize_source_event_time(
+    value: Any,
+    snapshot: str,
+    published_at: datetime | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Normalize only dates grounded in source text.
+
+    A partial Chinese month/day can use the document year as context, but the
+    publication timestamp itself is never copied into the event.  Every
+    accepted source fragment must remain an exact snapshot substring.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, None, None
+    raw = value.strip()
+    if raw in snapshot:
+        try:
+            return iso(parse_datetime(raw)), raw, "source_explicit"
+        except ValueError:
+            pass
+    if re.search(r"至今|以来|截至|日\s*(?:至|到)|\d\s*至\s*\d", raw):
+        return None, None, None
+
+    match = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})日", raw)
+    if match is None:
+        match = re.search(r"(?<!\d)(?:\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d)", raw)
+    if match is None or published_at is None:
+        return None, None, None
+    month, day = (int(part) for part in match.groups())
+    source_fragment = next(
+        (
+            candidate
+            for candidate in (
+                f"{month}月{day}日",
+                f"{month:02d}月{day:02d}日",
+                f"{month:02d}月{day}日",
+                f"{month}月{day:02d}日",
+            )
+            if candidate in snapshot
+        ),
+        None,
+    )
+    if source_fragment is None:
+        return None, None, None
+    publication = published_at
+    if publication.tzinfo is None:
+        publication = publication.replace(tzinfo=timezone.utc)
+    publication = publication.astimezone(timezone.utc)
+    try:
+        parsed = datetime(publication.year, month, day, tzinfo=timezone.utc)
+        # A December event reported in early January belongs to the previous
+        # year. More distant future dates are not treated as occurrences.
+        if parsed > publication + timedelta(days=7):
+            parsed = parsed.replace(year=parsed.year - 1)
+    except ValueError:
+        return None, None, None
+    return iso(parsed), source_fragment, "source_partial_date_with_document_year"
 
 
 def extracted_material_metadata(
@@ -525,20 +583,17 @@ def _store_candidates(
             event_time = event.get("occurred_at") or event.get("start_at")
         for alias in ("occurred_at", "start_at", "published_at"):
             event.pop(alias, None)
-        if (
-            event_time is not None
-            and (not isinstance(event_time, str) or event_time not in item.extracted_snapshot)
-        ):
-            event_time = None
-        elif event_time is not None:
-            try:
-                event_time = iso(parse_datetime(event_time))
-            except ValueError:
-                # Keep unambiguous time normalization separate from the raw
-                # source wording. Natural-language ranges remain in the saved
-                # snapshot but must not prefill an invalid confirmation value.
-                event_time = None
-        event["event_time"] = event_time
+        normalized_time, source_time_text, time_basis = normalize_source_event_time(
+            event_time,
+            item.extracted_snapshot,
+            item.published_at,
+        )
+        # Natural-language ranges and ungrounded model dates remain in the
+        # snapshot but must not prefill a formal occurrence time.
+        event["event_time"] = normalized_time
+        if source_time_text:
+            event["event_time_source_text"] = source_time_text
+            event["event_time_basis"] = time_basis
     event_key = "event"
     session.add(
         IntakeCandidate(

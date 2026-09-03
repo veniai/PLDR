@@ -382,6 +382,47 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(payload["event_url"], f"/pldr-api/v1/events/{payload['final_event_id']}")
         self.assertEqual(payload["next_task"]["intake_item"]["id"], second["id"])
 
+    def test_topic_event_time_window_blocks_out_of_scope_confirmation(self):
+        topic_response = self.client.post(
+            "/pldr-api/v1/investigations",
+            json={
+                "title": "August incident window",
+                "question": "Which incidents occurred in the selected period?",
+                "tracking_mode": "one_time",
+                "event_start_at": "2026-08-15T00:00:00Z",
+                "event_end_at": "2026-08-31T23:59:59Z",
+            },
+        )
+        self.assertEqual(topic_response.status_code, 201, topic_response.text)
+        topic = topic_response.json()["id"]
+        item = self.create_intake("time-window")
+        self.link(topic, "intake", item["id"])
+        request = self.confirmation(item)
+
+        request["event"]["start_at"] = "2026-08-11T00:00:00Z"
+        before = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/intake/{item['id']}/preview",
+            json=request,
+        )
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertFalse(before.json()["confirmable"])
+        self.assertIn("earlier than investigation start", " ".join(before.json()["errors"]))
+
+        request["event"]["start_at"] = "2026-09-01T00:00:00Z"
+        after = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/intake/{item['id']}/preview",
+            json=request,
+        )
+        self.assertFalse(after.json()["confirmable"])
+        self.assertIn("later than investigation end", " ".join(after.json()["errors"]))
+
+        request["event"]["start_at"] = "2026-08-20T00:00:00Z"
+        within = self.client.post(
+            f"/pldr-api/v1/investigations/{topic}/intake/{item['id']}/preview",
+            json=request,
+        )
+        self.assertTrue(within.json()["confirmable"], within.text)
+
     def test_topic_outcome_contains_only_confirmed_results_and_tracks_report_changes(self):
         topic = self.create_topic("User-facing outcome")
         first = self.create_intake("outcome-one")
@@ -411,6 +452,9 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(payload["counts"]["evidence"], 1)
         self.assertEqual(payload["claims"][0]["event_id"], first_event_id)
         self.assertTrue(payload["claims"][0]["evidence"][0]["snapshot_url"])
+        self.assertEqual(payload["current_answer"]["basis"], "single_source_claims")
+        self.assertIn("据当前仅有一个独立来源支持的材料", payload["current_answer"]["text"])
+        self.assertIn(payload["claims"][0]["text"], payload["current_answer"]["text"])
 
         report = self.client.post(
             "/pldr-api/v1/reports",
@@ -423,6 +467,8 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("1 条关键信息目前只有一个独立来源", report_page.text)
         self.assertIn("关键发现", report_page.text)
         self.assertIn("来源附录", report_page.text)
+        self.assertIn("据当前仅有一个独立来源支持的材料", report_page.text)
+        self.assertIn("The public dispatch outcome-one states", report_page.text)
         self.assertNotIn("SHA-256", report_page.text)
         baseline = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
         self.assertEqual(baseline["changes"]["basis"], "latest_report")
@@ -509,8 +555,11 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("两份独立公开资料均显示", page)
         self.assertIn("多源印证", page)
         self.assertIn("按真实事件归并资料，不按网页逐篇复述", page)
-        self.assertNotIn("The public dispatch source-one states", page)
-        self.assertNotIn("The public dispatch source-two states", page)
+        # Source pages appear only as exact evidence excerpts, never as one
+        # report section per article.
+        self.assertEqual(page.count("The public dispatch source-one states"), 1)
+        self.assertEqual(page.count("The public dispatch source-two states"), 1)
+        self.assertIn('<div class="evidence supports">', page)
 
         repeated = self.client.post(
             f"/pldr-api/v1/investigations/{topic}/reorganization/confirm",
@@ -785,6 +834,8 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn('action: defaults.evidenceKeys.has(candidate.candidate_key) ? "include" : "exclude"', source)
         self.assertIn("已自动避开无法回到原文的内容", source)
         self.assertIn("其余有效内容仍可直接加入专题", source)
+        self.assertIn("该事件发生在专题设定的开始时间之前", source)
+        self.assertIn("系统结合材料年份补全", source)
         self.assertIn('data-investigation-action="archive-topic"', source)
         self.assertIn('data-investigation-action="restore-topic"', source)
         self.assertIn('ACTIVE_INTAKE_STATUSES.has(item.status)', source)

@@ -240,18 +240,20 @@ class SearchWorkspaceTest(unittest.TestCase):
             json={
                 "title": "霍尔木兹海峡商船安全动态",
                 "question": "霍尔木兹海峡发生了哪些商船袭击？",
+                "event_start_at": "2026-08-15T00:00:00Z",
             },
         )
         self.assertEqual(investigation.status_code, 201, investigation.text)
         investigation_id = investigation.json()["id"]
 
-        def hit(url: str, title: str, snippet: str):
+        def hit(url: str, title: str, snippet: str, published_at: str | None = None):
             return _normalize_hit(
                 {
                     "url": url,
                     "title": title,
                     "content": snippet,
                     "engine": "unit",
+                    "publishedDate": published_at,
                 },
                 provider="searxng",
             )
@@ -276,6 +278,12 @@ class SearchWorkspaceTest(unittest.TestCase):
                         "今日体育动态",
                         "本轮联赛已经结束。",
                     ),
+                    hit(
+                        "https://source.example.org/old-direct",
+                        "霍尔木兹海峡油轮遭袭旧闻",
+                        "商船通行受到影响。",
+                        "2026-08-12T00:00:00Z",
+                    ),
                 ],
                 False,
             )
@@ -292,12 +300,16 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         levels = [item["topic_relevance"]["level"] for item in payload["results"]]
-        self.assertEqual(levels, ["likely", "uncertain", "unlikely"])
+        self.assertEqual(levels, ["likely", "uncertain", "unlikely", "uncertain"])
         self.assertEqual(
             payload["relevance_summary"],
-            {"likely": 1, "uncertain": 1, "unlikely": 1, "unknown": 0},
+            {"likely": 1, "uncertain": 2, "unlikely": 1, "unknown": 0},
         )
         self.assertIn("默认不进入待处理", payload["results"][2]["topic_relevance"]["reason"])
+        old = payload["results"][3]["topic_relevance"]
+        self.assertEqual(old["label"], "时间范围待核对")
+        self.assertEqual(old["time_scope"]["status"], "published_before_event_start")
+        self.assertIn("不自动进入待处理", old["reason"])
 
         reopened = self.client.get(
             f"/pldr-api/v1/search/runs/{payload['query_run_id']}",
@@ -323,7 +335,7 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(tasks.status_code, 200, tasks.text)
         self.assertEqual(
             sorted(item["topic_relevance"]["level"] for item in tasks.json()["items"]),
-            ["likely", "uncertain", "unlikely"],
+            ["likely", "uncertain", "uncertain", "unlikely"],
         )
         self.assertEqual(
             {item["selection_origin"] for item in tasks.json()["items"]},

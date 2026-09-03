@@ -29,6 +29,7 @@ from .intake import (
     generate_candidates,
     lock_intake_for_mutation,
     lock_intake_for_status_sync,
+    parse_datetime,
 )
 from .models import (
     Assessment,
@@ -53,6 +54,7 @@ from .models import (
     SearchSelectionEvent,
 )
 from .repository import event_query, serialize_event_card, serialize_event_detail
+from .reporting import compose_current_answer
 from .schemas import (
     ArchiveRequest,
     IntakeConfirmationRequest,
@@ -934,12 +936,6 @@ def serialize_investigation_outcome(
     latest_event = events[0] if events else None
     latest_assessment = (latest_event or {}).get("assessment") or {}
     if latest_event:
-        supported_claims = [
-            str(claim.get("text") or "").strip()
-            for claim in claims
-            if claim.get("status") in {"confirmed", "supported"}
-            and str(claim.get("text") or "").strip()
-        ]
         answer_text = str(
             (
                 reorganization_detail.get("current_answer")
@@ -948,8 +944,11 @@ def serialize_investigation_outcome(
             )
             or ""
         ).strip()
-        if not answer_text:
-            answer_text = "；".join(supported_claims[:3])
+        answer_text, answer_basis = compose_current_answer(
+            claims,
+            assessment=answer_text,
+            fallback_summary=latest_event.get("summary"),
+        )
         current_answer = {
             "status": "available",
             "headline": (
@@ -957,8 +956,8 @@ def serialize_investigation_outcome(
                 if reorganization_is_current
                 else f"已确认 {len(events)} 个事件，当前最新进展：{latest_event['title']}"
             ),
-            "text": answer_text or "现有材料还不足以形成专题结论，请先补充来源或处理冲突。",
-            "basis": "confirmed_topic_synthesis" if reorganization_is_current else ("formal_assessment" if latest_assessment.get("judgement") else ("supported_claims" if supported_claims else "insufficient_evidence")),
+            "text": answer_text,
+            "basis": "confirmed_topic_synthesis" if reorganization_is_current else answer_basis,
             "event_id": latest_event["id"],
             "notice": "仅汇总本专题已人工确认的正式对象；未确认候选不会进入成果。",
         }
@@ -3847,25 +3846,58 @@ def _confirmation_scope_errors(
     *,
     allow_cross_investigation: bool,
 ) -> list[str]:
-    if allow_cross_investigation:
-        return []
     errors: list[str] = []
-    if request.merge_event_id and not _object_in_investigation(
-        session, investigation_id, "event", request.merge_event_id
-    ):
-        errors.append(
-            "Selected merge event is outside this investigation; explicitly enable cross-investigation reuse to continue"
-        )
-    topic_entity_ids = set(_topic_entity_ids(session, investigation_id))
-    for decision in request.entities:
-        if (
-            decision.action == "merge"
-            and decision.merge_entity_id
-            and decision.merge_entity_id not in topic_entity_ids
+    if not allow_cross_investigation:
+        if request.merge_event_id and not _object_in_investigation(
+            session, investigation_id, "event", request.merge_event_id
         ):
             errors.append(
-                f"Entity merge target {decision.merge_entity_id} is outside this investigation; explicitly enable cross-investigation reuse to continue"
+                "Selected merge event is outside this investigation; explicitly enable cross-investigation reuse to continue"
             )
+        topic_entity_ids = set(_topic_entity_ids(session, investigation_id))
+        for decision in request.entities:
+            if (
+                decision.action == "merge"
+                and decision.merge_entity_id
+                and decision.merge_entity_id not in topic_entity_ids
+            ):
+                errors.append(
+                    f"Entity merge target {decision.merge_entity_id} is outside this investigation; explicitly enable cross-investigation reuse to continue"
+                )
+
+    investigation = session.get(Investigation, investigation_id)
+    event_time: datetime | None = None
+    if request.disposition == "merge" and request.merge_event_id:
+        target = session.get(Event, request.merge_event_id)
+        if target is not None and (target.metadata_json or {}).get("start_at_known") is not False:
+            event_time = target.start_at
+    elif request.event.start_at:
+        try:
+            event_time = parse_datetime(request.event.start_at)
+        except ValueError:
+            event_time = None
+    if investigation is not None and event_time is not None:
+        if event_time.tzinfo is None:
+            event_time = event_time.replace(tzinfo=timezone.utc)
+        event_time = event_time.astimezone(timezone.utc)
+        event_start = investigation.event_start_at
+        event_end = investigation.event_end_at
+        if event_start is not None:
+            if event_start.tzinfo is None:
+                event_start = event_start.replace(tzinfo=timezone.utc)
+            event_start = event_start.astimezone(timezone.utc)
+            if event_time < event_start:
+                errors.append(
+                    f"Event time {iso(event_time)} is earlier than investigation start {iso(event_start)}"
+                )
+        if event_end is not None:
+            if event_end.tzinfo is None:
+                event_end = event_end.replace(tzinfo=timezone.utc)
+            event_end = event_end.astimezone(timezone.utc)
+            if event_time > event_end:
+                errors.append(
+                    f"Event time {iso(event_time)} is later than investigation end {iso(event_end)}"
+                )
     return errors
 
 
@@ -4281,9 +4313,9 @@ def confirm_investigation_intake(
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "The review selection contains targets outside this investigation",
+                "message": "The review selection conflicts with this investigation scope",
                 "errors": scope_errors,
-                "next_action": "Enable cross-investigation reuse explicitly and review target ownership before confirming.",
+                "next_action": "Review the merge ownership and event time range before confirming.",
             },
         )
     from .intake import confirm_intake, serialize_intake
