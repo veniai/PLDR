@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 
@@ -20,6 +20,7 @@ from pldr_api.importers import (
     ReaderFallbackError,
     UnsafeRedirectUrlError,
     _pinned_public_destination,
+    _fetch_reader_html_response,
     _validate_reader_target,
     _validated_doh_addresses,
     fetch_public_text_response,
@@ -101,6 +102,85 @@ class AcquisitionPipelineTest(unittest.TestCase):
                 )
         self.assertNotIn("redaction-check-value", str(context.exception))
         forbidden_client.assert_not_called()
+
+    def test_reader_does_not_repeat_validation_for_unchanged_final_url(self):
+        target = "https://public.example/article"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "data": {
+                        "url": target,
+                        "httpStatus": 200,
+                        "html": "<article>" + "正文" * 100 + "</article>",
+                    }
+                },
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        validate = AsyncMock(return_value=None)
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_BASE_URL": "https://reader.example",
+                "PLDR_READER_PROXY_URL": "",
+            },
+        ), patch(
+            "pldr_api.importers._validate_reader_target", new=validate
+        ), patch(
+            "pldr_api.importers.httpx.AsyncClient", return_value=client
+        ):
+            result = asyncio.run(
+                _fetch_reader_html_response(target, timeout_seconds=20, max_bytes=4096)
+            )
+        self.assertEqual(result.fetch_method, "jina_reader")
+        validate.assert_awaited_once_with(target, timeout_seconds=20)
+
+    def test_reader_revalidates_a_changed_final_url(self):
+        target = "https://public.example/article"
+        final_url = "https://cdn.example/rendered"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={
+                    "data": {
+                        "url": final_url,
+                        "httpStatus": 200,
+                        "html": "<article>" + "正文" * 100 + "</article>",
+                    }
+                },
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        validate = AsyncMock(return_value=None)
+        with patch.dict(
+            os.environ,
+            {
+                "PLDR_READER_BASE_URL": "https://reader.example",
+                "PLDR_READER_PROXY_URL": "",
+            },
+        ), patch(
+            "pldr_api.importers._validate_reader_target", new=validate
+        ), patch(
+            "pldr_api.importers.httpx.AsyncClient", return_value=client
+        ):
+            result = asyncio.run(
+                _fetch_reader_html_response(target, timeout_seconds=20, max_bytes=4096)
+            )
+        self.assertEqual(result.resolved_url, final_url)
+        self.assertEqual(
+            validate.await_args_list,
+            [
+                call(target, timeout_seconds=20),
+                call(final_url, timeout_seconds=20),
+            ],
+        )
 
     def test_article_extraction_preserves_paragraphs_and_metadata(self):
         html = """
