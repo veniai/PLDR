@@ -726,8 +726,9 @@ class TopicUxContractTest(unittest.TestCase):
         html = page.text
         for label in ("专题成果", "待处理", "资料与来源"):
             self.assertIn(label, html)
-        self.assertIn("全部专题待处理", html)
-        self.assertIn("进入专题后只显示该专题内容", html)
+        self.assertIn("进行中专题待处理", html)
+        self.assertIn("已删除专题和系统待归类不会混入", html)
+        self.assertIn("只汇总当前专题", html)
         self.assertIn("全局待确认", html)
         self.assertLess(
             html.index('data-investigation-tab="outcomes"'),
@@ -801,6 +802,7 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("const hasServerBackedDirectory", home_queue)
         self.assertIn("if (!hasServerBackedDirectory)", home_queue)
         self.assertIn('if (investigation.status === "archived") return', home_queue)
+        self.assertIn('["demo", "system"].includes(investigation.sync_mode)', home_queue)
         self.assertLess(
             home_queue.index("seenIntake.add(intakeId)"),
             home_queue.index("if (!taskBelongsInPending(task)) return"),

@@ -1030,7 +1030,7 @@ function allHomeAssignments() {
   ));
   state.investigations.forEach((investigation) => {
     if (investigation.status === "archived") return;
-    if (investigation.sync_mode === "demo") return;
+    if (["demo", "system"].includes(investigation.sync_mode)) return;
     if (investigation.sync_mode === "compatibility" && state.investigations.length > 1) return;
     tasksForInvestigation(investigation).filter(taskIsActive).forEach((task) => {
       const intakeId = taskIntakeId(task);
