@@ -569,7 +569,7 @@ def bootstrap_legacy_investigations(session: Session) -> dict[str, int]:
             error_class=(
                 fallback_class
                 if fallback_class
-                else "legacy_intake_failed"
+                else _task_failure_class_for_item(item)
                 if status_value == "failed"
                 else None
             ),
@@ -1068,9 +1068,13 @@ def _structured_task_error(
     elif error_class == "timeout":
         code = "fetch_timeout"
     elif error_class in {"legacy_intake_failed", "intake_failed"} and (
-        "model" in normalized or "generation" in normalized
+        "model" in normalized
+        or "generation" in normalized
+        or "claim text" in normalized
+        or "evidence snippet" in normalized
+        or "candidate" in normalized
     ):
-        code = "legacy_model_error"
+        code = "model_error"
 
     # stage, title, display_message, why, impact, next_action, retryable, degraded
     specs = {
@@ -1393,6 +1397,11 @@ def _candidate_fallback_class(item: IntakeItem) -> str | None:
     return None
 
 
+def _task_failure_class_for_item(item: IntakeItem) -> str:
+    """Keep saved-snapshot model failures distinct from fetch/parse failures."""
+    return "model_error" if item.status == "generation_failed" else "intake_failed"
+
+
 def _task_state_for_intake(
     item: IntakeItem,
 ) -> tuple[str, str | None, str | None, str]:
@@ -1402,7 +1411,7 @@ def _task_state_for_intake(
         error_message = item.candidate_error if error_class else None
         selection_status = "candidate_ready"
     elif task_status == "failed":
-        error_class = "intake_failed"
+        error_class = _task_failure_class_for_item(item)
         error_message = item.error or item.candidate_error
         selection_status = item.status
     elif task_status == "queued":
@@ -1851,7 +1860,7 @@ def enqueue_search_result_tasks(session: Session, request: Any) -> dict[str, Any
             completed_at=now if terminal_status is not None else None,
             error_class=(
                 _candidate_fallback_class(item)
-                or ("intake_failed" if terminal_status == "failed" else None)
+                or (_task_failure_class_for_item(item) if terminal_status == "failed" else None)
             ),
             error_message=(item.error or item.candidate_error) if terminal_status else None,
             intake_item_id=item.id,
@@ -1977,7 +1986,7 @@ def ensure_review_task_for_intake(
         error_class=(
             fallback_class
             if fallback_class
-            else "intake_failed"
+            else _task_failure_class_for_item(item)
             if task_status == "failed"
             else None
         ),

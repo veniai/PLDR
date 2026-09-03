@@ -689,6 +689,11 @@ class TopicUxContractTest(unittest.TestCase):
             ("model_fallback", "Model request exceeded 90 second total deadline", "model_timeout_fallback"),
             ("model_fallback", "Model returned invalid output", "model_error_fallback"),
             ("rule_fallback", None, "rule_fallback"),
+            (
+                "intake_failed",
+                "Claim text must summarize the information and must not duplicate an evidence quote",
+                "model_error",
+            ),
         ]
         for error_class, message, code in cases:
             with self.subTest(code=code):
@@ -699,6 +704,26 @@ class TopicUxContractTest(unittest.TestCase):
                 self.assertTrue(error["next_action"])
                 if code == "dns_policy_blocked":
                     self.assertFalse(error["retryable"])
+
+        failed_topic = self.create_topic("Saved snapshot model failure")
+        failed_item = self.create_intake("saved-model-failure")
+        with SessionLocal() as session:
+            stored = session.get(IntakeItem, failed_item["id"])
+            stored.status = "generation_failed"
+            stored.candidate_mode = "failed"
+            stored.candidate_error = (
+                "Claim text must summarize the information and must not duplicate an evidence quote"
+            )
+            session.commit()
+        linked_failure = self.client.post(
+            f"/pldr-api/v1/investigations/{failed_topic}/links",
+            json={"object_type": "intake", "object_id": failed_item["id"]},
+        )
+        self.assertEqual(linked_failure.status_code, 201, linked_failure.text)
+        failed_task = linked_failure.json()["review_task"]["task"]
+        self.assertEqual(failed_task["error_class"], "model_error")
+        self.assertEqual(failed_task["error"]["code"], "model_error")
+        self.assertEqual(failed_task["error"]["stage"], "generate")
 
         topic = self.create_topic("Legacy recovery")
         item = self.create_intake("legacy")
@@ -802,6 +827,8 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("指事件发生时间，不是新闻发布时间", html)
         self.assertIn("四种方式可以同时使用", html)
         self.assertIn("只有你确认采用后，内容才会进入专题成果和报告", html)
+        self.assertIn("已知发布时间（可选）", html)
+        self.assertNotIn("已知发布时间（ISO-8601", html)
         self.assertNotIn("原始/提取快照与指纹", html)
         self.assertIn('id="investigation-create-source-urls"', html)
         self.assertIn('id="investigation-create-text"', html)
@@ -830,6 +857,20 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("系统无法可靠识别候选时间，已留空", source)
         self.assertIn("事件时间格式无法识别。请填写 YYYY-MM-DD", source)
         self.assertIn("async function startInitialTopicCollection", source)
+        manual_import = source[
+            source.index("async function submitImport"):
+            source.index("function intakeStatusClass", source.index("async function submitImport"))
+        ]
+        for endpoint in (
+            "/pldr-api/v1/import/url?defer_candidates=true",
+            "/pldr-api/v1/import/rss?defer_candidates=true",
+            "/pldr-api/v1/intake/text?defer_candidates=true",
+            "/pldr-api/v1/intake/files?defer_candidates=true",
+        ):
+            self.assertIn(endpoint, manual_import)
+        self.assertIn('系统会在后台整理，完成后出现在“等待确认”', manual_import)
+        self.assertIn('const actionable = items.find', manual_import)
+        self.assertIn('if (actionable)', manual_import)
         self.assertIn("function renderOutcomeHero", source)
         self.assertIn("function renderOutcomeFindings", source)
         self.assertIn("function formatEventDate", source)
