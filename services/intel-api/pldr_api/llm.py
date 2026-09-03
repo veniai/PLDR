@@ -30,6 +30,8 @@ class ModelConfig:
 SYSTEM_PROMPT = """You are the structured extraction component of an evidence-centered OSINT system.
 Return valid JSON only. Separate observed facts from inference. Never invent citations or evidence.
 Every evidence snippet must be an exact substring of the supplied document text.
+Keep the result concise and within the limits stated in output_contract; never add extra candidates
+when the strongest supported candidates are enough.
 Follow required_output exactly: keep its field names, do not substitute synonyms, and do not add
 wrapper fields such as answer, task, or result. Its values describe expected types and constraints;
 fill them from the payload instead of copying the descriptive strings literally."""
@@ -219,6 +221,52 @@ def _normalize_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def parse_model_response(task: str, data: Any) -> dict[str, Any]:
+    """Validate the provider envelope before trusting structured model output."""
+    try:
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Model response is missing the first message choice") from exc
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "length":
+        raise ValueError(
+            "Model output was truncated before the JSON result completed; "
+            "the task will be retried"
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Model response content is empty")
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Model response content is not valid JSON") from exc
+    return normalize_model_result(task, parsed)
+
+
+def model_http_error(response: httpx.Response) -> RuntimeError:
+    """Return a bounded diagnostic without exposing request headers or input."""
+    detail = ""
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            code = error.get("code") or error.get("type")
+            if isinstance(message, str):
+                detail = message.strip()
+            if code:
+                detail = f"{code}: {detail}" if detail else str(code)
+        elif isinstance(error, str):
+            detail = error.strip()
+        elif isinstance(payload.get("message"), str):
+            detail = payload["message"].strip()
+    suffix = f": {detail[:500]}" if detail else ""
+    return RuntimeError(f"Model API returned HTTP {response.status_code}{suffix}")
+
+
 async def run_model_task(task: str, payload: dict[str, Any]) -> dict[str, Any]:
     config = ModelConfig.from_env()
     if config is None:
@@ -238,13 +286,17 @@ async def run_model_task(task: str, payload: dict[str, Any]) -> dict[str, Any]:
         async with _model_limiter():
             async with asyncio.timeout(config.timeout_seconds):
                 async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
-                    response=await client.post(endpoint,headers=headers,json=body); response.raise_for_status(); data=response.json()
+                    response=await client.post(endpoint,headers=headers,json=body)
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise model_http_error(response) from exc
+                    data=response.json()
     except TimeoutError as exc:
         raise httpx.ReadTimeout(
             f"Model request exceeded {config.timeout_seconds:g} second total deadline"
         ) from exc
-    content=data["choices"][0]["message"]["content"]
-    return {"mode":"api","task":task,"model":config.model,"result":normalize_model_result(task,json.loads(content))}
+    return {"mode":"api","task":task,"model":config.model,"result":parse_model_response(task,data)}
 
 
 def deterministic_fallback(task: str, payload: dict[str, Any]) -> dict[str, Any]:

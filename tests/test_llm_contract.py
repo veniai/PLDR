@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from pldr_api.llm import model_request_payload, normalize_model_result
+import httpx
+
+from pldr_api.llm import (
+    model_http_error,
+    model_request_payload,
+    normalize_model_result,
+    parse_model_response,
+)
 
 
 class ModelContractTest(unittest.TestCase):
@@ -84,6 +91,47 @@ class ModelContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "JSON object"):
             normalize_model_result("normalize_event_title", ["not", "an", "object"])
 
+    def test_provider_envelope_fails_clearly_when_json_is_truncated(self):
+        with self.assertRaisesRegex(ValueError, "truncated.*retried"):
+            parse_model_response(
+                "extract_intake_candidates",
+                {
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {"content": '{"event":'},
+                    }]
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            parse_model_response(
+                "extract_intake_candidates",
+                {
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "not-json"},
+                    }]
+                },
+            )
+
+    def test_http_error_reports_provider_reason_without_request_secrets(self):
+        request = httpx.Request(
+            "POST",
+            "https://model.example.test/v1/chat/completions",
+            headers={"Authorization": "Bearer secret-value"},
+            content=b"private source material",
+        )
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"code": "invalid_parameter", "message": "max_tokens is too small"}},
+        )
+        message = str(model_http_error(response))
+        self.assertEqual(
+            message,
+            "Model API returned HTTP 400: invalid_parameter: max_tokens is too small",
+        )
+        self.assertNotIn("secret-value", message)
+        self.assertNotIn("private source material", message)
 
 if __name__ == "__main__":
     unittest.main()
