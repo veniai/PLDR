@@ -311,6 +311,15 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(old["time_scope"]["status"], "published_before_event_start")
         self.assertIn("不自动进入待处理", old["reason"])
 
+        # Older saved results can lack a provider timestamp. Reopening one must
+        # still recognise a clearly labelled publisher dateline in its snippet.
+        from pldr_api.models import SearchResult
+
+        with SessionLocal.begin() as session:
+            legacy = session.get(SearchResult, payload["results"][3]["id"])
+            legacy.published_at = None
+            legacy.snippet = "【示例媒体2026年08月12日讯】商船通行受到影响。"
+
         reopened = self.client.get(
             f"/pldr-api/v1/search/runs/{payload['query_run_id']}",
             params={"investigation_id": investigation_id},
@@ -319,6 +328,14 @@ class SearchWorkspaceTest(unittest.TestCase):
         self.assertEqual(
             [item["topic_relevance"]["level"] for item in reopened.json()["results"]],
             levels,
+        )
+        self.assertEqual(
+            reopened.json()["results"][3]["published_at"],
+            "2026-08-12T00:00:00Z",
+        )
+        self.assertEqual(
+            reopened.json()["results"][3]["topic_relevance"]["label"],
+            "时间范围待核对",
         )
         selected = self.client.post(
             "/pldr-api/v1/search/select",
@@ -341,6 +358,40 @@ class SearchWorkspaceTest(unittest.TestCase):
             {item["selection_origin"] for item in tasks.json()["items"]},
             {"topic_onboarding"},
         )
+
+    def test_search_result_uses_only_explicit_snippet_publication_dateline(self):
+        datelined = _normalize_hit(
+            {
+                "url": "https://source.example.org/datelined",
+                "title": "红海商船遇袭",
+                "content": "【示例媒体2026年08月12日讯】红海一艘商船于8月11日遇袭。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertEqual(datelined.published_at.isoformat(), "2026-08-12T00:00:00+00:00")
+
+        event_date_only = _normalize_hit(
+            {
+                "url": "https://source.example.org/event-date-only",
+                "title": "红海商船遇袭",
+                "content": "2026年08月11日红海一艘商船遇袭，调查仍在继续。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertIsNone(event_date_only.published_at)
+
+        invalid_dateline = _normalize_hit(
+            {
+                "url": "https://source.example.org/invalid-datelined",
+                "title": "红海商船遇袭",
+                "content": "发布于：2026-02-30。",
+                "engine": "unit",
+            },
+            provider="searxng",
+        )
+        self.assertIsNone(invalid_dateline.published_at)
 
     def test_search_error_is_structured_and_persisted(self):
         investigation_id = self.create_investigation("Failure topic")

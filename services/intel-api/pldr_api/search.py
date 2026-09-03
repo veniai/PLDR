@@ -133,7 +133,10 @@ def assess_topic_relevance(
             + context_concept_hits
         )
     )[:6]
-    publication_time = result.published_at
+    publication_time = result.published_at or _explicit_result_publication_time(
+        result.title,
+        result.snippet,
+    )
     event_start = investigation.event_start_at
     if publication_time is not None and event_start is not None:
         if publication_time.tzinfo is None:
@@ -413,6 +416,48 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+_EXPLICIT_RESULT_DATE_PATTERNS = (
+    # Search backends sometimes omit their date field even though the result
+    # snippet starts with a publisher dateline, for example
+    # ``【某媒体2026年08月12日讯】``.  Only accept an explicit publication
+    # marker; a bare date in an article summary may be the event date instead.
+    re.compile(
+        r"(?P<year>20\d{2})\s*年\s*(?P<month>\d{1,2})\s*月\s*"
+        r"(?P<day>\d{1,2})\s*日\s*(?:讯|消息|报道|发布|更新)"
+    ),
+    re.compile(
+        r"(?:发布(?:日期|时间)?|发布于|更新(?:日期|时间)?|更新于)\s*[:：]?\s*"
+        r"(?P<year>20\d{2})[-/.年]\s*(?P<month>\d{1,2})[-/.月]\s*"
+        r"(?P<day>\d{1,2})(?:日)?"
+    ),
+    re.compile(
+        r"(?:published|updated|posted)\s*(?:on)?\s*[:：]?\s*"
+        r"(?P<year>20\d{2})[-/.]\s*(?P<month>\d{1,2})[-/.]\s*"
+        r"(?P<day>\d{1,2})",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _explicit_result_publication_time(*values: str) -> datetime | None:
+    """Read only clearly labelled publication datelines from result text."""
+    text = normalize_text(" ".join(value for value in values if value))[:600]
+    for pattern in _EXPLICIT_RESULT_DATE_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        try:
+            return datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            continue
+    return None
+
+
 def _normalize_hit(raw: dict[str, Any], *, provider: str, engine: str | None = None) -> SearchHit:
     original_url, canonical_url, fingerprint, host = _parse_public_result_url(raw.get("url"))
     meta_url = raw.get("meta_url") if isinstance(raw.get("meta_url"), dict) else {}
@@ -420,14 +465,19 @@ def _normalize_hit(raw: dict[str, Any], *, provider: str, engine: str | None = N
         raw.get("source") or meta_url.get("hostname") or host,
         200,
     ) or host
+    title = _safe_text(raw.get("title"), 500) or "Untitled search result"
+    snippet = _safe_text(raw.get("description") or raw.get("content"), 2000)
+    published_at = _parse_datetime(
+        raw.get("publishedDate") or raw.get("page_age") or raw.get("timestamp")
+    ) or _explicit_result_publication_time(title, snippet)
     return SearchHit(
         original_url=original_url,
         canonical_url=canonical_url,
         fingerprint=fingerprint,
         site_name=site_name,
-        title=_safe_text(raw.get("title"), 500) or "Untitled search result",
-        snippet=_safe_text(raw.get("description") or raw.get("content"), 2000),
-        published_at=_parse_datetime(raw.get("publishedDate") or raw.get("page_age") or raw.get("timestamp")),
+        title=title,
+        snippet=snippet,
+        published_at=published_at,
         engine=_safe_text(engine or raw.get("engine") or provider, 120),
         raw_result=raw,
     )
@@ -771,6 +821,10 @@ def serialize_search_result(
     investigation: Investigation | None = None,
 ) -> dict[str, Any]:
     run = result.query_run
+    publication_time = result.published_at or _explicit_result_publication_time(
+        result.title,
+        result.snippet,
+    )
     return {
         "id": result.id,
         "query_run_id": result.query_run_id,
@@ -783,7 +837,7 @@ def serialize_search_result(
         "site": result.site_name,
         "title": result.title,
         "snippet": result.snippet,
-        "published_at": iso(result.published_at),
+        "published_at": iso(publication_time),
         "rank": result.rank,
         "source_page": result.source_page,
         "engine": result.engine,
