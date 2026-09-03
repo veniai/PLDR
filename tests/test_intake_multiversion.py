@@ -442,7 +442,7 @@ class IntakeMultiVersionTest(unittest.TestCase):
             )
             rendered_old = render_snapshot(older_snapshot_id, event_id, session)
             self.assertIn("Terminal status: collection V1", rendered_old)
-            self.assertIn(older_snapshot.content_hash, rendered_old)
+            self.assertNotIn("正文 SHA-256", rendered_old)
             self.assertNotIn("Terminal status: collection V2", rendered_old)
             self.assertIn("name='viewport'", rendered_old)
             self.assertIn("overflow-wrap:anywhere", rendered_old)

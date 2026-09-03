@@ -56,7 +56,7 @@ from .models import (
     Snapshot,
     Source,
 )
-from .reporting import REPORT_DIR, build_report
+from .reporting import REPORT_DIR, build_report, public_date, public_datetime
 from .repository import (
     get_event,
     get_events,
@@ -1109,7 +1109,7 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
                 "未知标题" if document_metadata.get("title_known") is False else document.title
             )
             published_display = (
-                document.published_at.isoformat().replace("+00:00", "Z")
+                public_date(document.published_at)
                 if document.published_at
                 and document_metadata.get("published_at_known", True) is not False
                 else "未知"
@@ -1123,7 +1123,7 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
             )
             snapshot_published = snapshot_metadata.get("published_at")
             published_display = (
-                str(snapshot_published)
+                public_date(snapshot_published)
                 if snapshot_metadata.get("published_at_known") is True and snapshot_published
                 else "未知"
             )
@@ -1133,7 +1133,7 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
         )
         published_known = document_metadata.get("published_at_known", True) is not False
         published_display = (
-            document.published_at.isoformat().replace("+00:00", "Z")
+            public_date(document.published_at)
             if document.published_at and published_known
             else "未知"
         )
@@ -1143,14 +1143,10 @@ def snapshot(document_id: str, event_id: str | None = None, session: Session = D
         if source_url
         else "未知"
     )
-    captured_at = (
+    captured_at = public_datetime(
         selected_snapshot.captured_at if selected_snapshot is not None else document.fetched_at
-    ).isoformat()
-    snapshot_hash = (
-        selected_snapshot.content_hash if selected_snapshot is not None else document.content_hash
     )
-    snapshot_id_display = selected_snapshot.id if selected_snapshot is not None else "未知"
-    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}h1,.meta,article{{overflow-wrap:anywhere}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}@media(max-width:580px){{main{{padding:24px 16px}}article{{padding:18px}}}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 类型：{html_lib.escape(document.source.source_type)} · 发布时间：{published_display}<br>抓取时间：{captured_at} · 正文 SHA-256：{snapshot_hash}<br>Snapshot：{html_lib.escape(snapshot_id_display)}<br>独立来源组：{html_lib.escape(document.source.independence_group)}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
+    return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{html_lib.escape(title_display)}</title><style>body{{font-family:Inter,'Noto Sans SC',system-ui,sans-serif;background:#071018;color:#d7e5ef;margin:0}}main{{max-width:900px;margin:0 auto;padding:42px 28px}}a{{color:#5bd6ff}}h1,.meta,article{{overflow-wrap:anywhere}}.meta{{color:#7894a7;font-size:13px;line-height:1.8}}article{{background:#0e1b25;border:1px solid #244052;border-radius:12px;padding:24px;line-height:1.85;margin-top:20px}}mark{{padding:2px 4px;border-radius:4px}}mark.supports{{background:#174f36;color:#d9ffe8}}mark.contradicts{{background:#6a3527;color:#ffe5dc}}mark.context{{background:#544b20;color:#fff5bc}}@media(max-width:580px){{main{{padding:24px 16px}}article{{padding:18px}}}}</style></head><body><main><a href='{back_link}'>← 返回 PLDR</a><h1>{html_lib.escape(title_display)}</h1><div class='meta'>来源：{html_lib.escape(document.source.name)} · 发布时间：{published_display}<br>抓取时间：{captured_at}<br>原始地址：{source_url_display}</div><article>{body}</article></main></body></html>"""
 
 
 @app.get("/api/v1/timeline", include_in_schema=False)

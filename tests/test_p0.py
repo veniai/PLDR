@@ -1815,7 +1815,9 @@ class P0Test(unittest.TestCase):
             self.assertEqual(snapshot.status_code, 200)
             self.assertIn("<mark", snapshot.text)
             self.assertIn("来源：", snapshot.text)
-            self.assertIn(f"Snapshot：{evidence['snapshot_id']}", snapshot.text)
+            self.assertNotIn("正文 SHA-256", snapshot.text)
+            self.assertNotIn("Snapshot：", snapshot.text)
+            self.assertNotIn("独立来源组：", snapshot.text)
             self.assertNotIn("1970-01-01", snapshot.text)
             if event_id == created_event_id:
                 self.assertIn("https://", snapshot.text)
@@ -1832,6 +1834,7 @@ class P0Test(unittest.TestCase):
         self.assertIn("human-confirmed", report_text)
         self.assertIn("打开证据快照", report_text)
         self.assertIn("发布时间未知", report_text)
+        self.assertNotRegex(report_text, r"\d{4}-\d{2}-\d{2}T\d{2}:")
         self.assertNotIn(rejected_text, report_text)
 
         modified_report = self.client.post(

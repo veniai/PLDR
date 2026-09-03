@@ -324,6 +324,15 @@ function formatDate(value, withTime = false) {
   }).format(date);
 }
 
+function formatEventDate(value) {
+  const dateOnly = String(value || "").match(
+    /^(\d{4})-(\d{2})-(\d{2})T00:00:00(?:\.000)?Z$/i,
+  );
+  return dateOnly
+    ? `${dateOnly[1]}/${dateOnly[2]}/${dateOnly[3]}`
+    : formatDate(value, true);
+}
+
 function percent(value) {
   return `${Math.round(clamp(Number(value) || 0, 0, 1) * 100)}%`;
 }
@@ -1814,7 +1823,7 @@ function renderOutcomeTimeline(outcome) {
   const untimedEvents = events.filter((event) => !event.start_at);
   return `<section class="workbench-surface outcome-timeline">
     <div class="workbench-surface-head"><div><h3>事件时间线</h3><p>只包含本专题已经人工确认的事件</p></div><span class="count-badge">${events.length}</span></div>
-    ${timedEvents.length ? `<div class="outcome-timeline-list">${timedEvents.map((event) => `<article><time>${formatDate(event.start_at, true)}</time><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.summary || "暂无摘要")}</p></div><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">查看依据</button></article>`).join("")}</div>` : '<div class="investigation-empty"><strong>暂无带明确时间的事件</strong></div>'}
+    ${timedEvents.length ? `<div class="outcome-timeline-list">${timedEvents.map((event) => `<article><time>${formatEventDate(event.start_at)}</time><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.summary || "暂无摘要")}</p></div><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">查看依据</button></article>`).join("")}</div>` : '<div class="investigation-empty"><strong>暂无带明确时间的事件</strong></div>'}
     ${untimedEvents.length ? `<details class="untimed-events"><summary>时间待补充（${untimedEvents.length}）</summary><div class="outcome-timeline-list">${untimedEvents.map((event) => `<article><time>时间未识别</time><div><h4>${escapeHtml(event.title)}</h4><p>${escapeHtml(event.summary || "暂无摘要")}</p></div><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">打开并补充</button></article>`).join("")}</div></details>` : ""}
   </section>`;
 }
@@ -4939,7 +4948,7 @@ function renderConfirmationPreview(preview) {
     <div class="preview-object-grid">
       <section><span>来源与文档</span><strong>${escapeHtml(source.name || "来源未知")}</strong><p>${escapeHtml(document.title || "文档标题未知")} · ${document.published_at ? formatDate(document.published_at, true) : "发布时间未知"}</p></section>
       <section><span>原文快照</span><strong>${Number(snapshot.length || 0).toLocaleString("zh-CN")} 字符</strong><p>已保存，可追溯</p></section>
-      <section class="preview-event"><span>事件 · ${escapeHtml(previewActionLabel(event.action))}</span><strong>${escapeHtml(event.title || "事件标题未知")}</strong><p>${escapeHtml(event.summary || "没有事件摘要")}</p><small>${escapeHtml(event.event_type || "类型未知")} · ${event.start_at ? formatDate(event.start_at, true) : "时间未知"} · ${escapeHtml(event.location_name || "地点未知")} · ${escapeHtml(LABELS.importance[event.importance] || event.importance || "重要性未知")}</small></section>
+      <section class="preview-event"><span>事件 · ${escapeHtml(previewActionLabel(event.action))}</span><strong>${escapeHtml(event.title || "事件标题未知")}</strong><p>${escapeHtml(event.summary || "没有事件摘要")}</p><small>${escapeHtml(event.event_type || "类型未知")} · ${event.start_at ? formatEventDate(event.start_at) : "时间未知"} · ${escapeHtml(event.location_name || "地点未知")} · ${escapeHtml(LABELS.importance[event.importance] || event.importance || "重要性未知")}</small></section>
     </div>
     <div class="preview-change-lists">
       <section><h4>实体 ${formal.entities?.length || 0}</h4>${formal.entities?.length ? `<ul>${formal.entities.map((entity) => `<li><span>${escapeHtml(previewActionLabel(entity.action))}</span>${escapeHtml(entity.name || entity.merge_entity_id || "实体未知")}<small>${escapeHtml(entity.entity_type || "类型未知")} · ${escapeHtml(entity.role || "角色未知")}${entity.aliases?.length ? ` · 别名 ${escapeHtml(entity.aliases.join("、"))}` : ""}</small></li>`).join("")}</ul>` : "<p>不创建或合并实体。</p>"}</section>
@@ -4993,8 +5002,11 @@ function renderIntakeReview(item) {
   const normalizedEventTime = normalizeEventTimeForConfirmation(rawEventTime, { strict: false });
   const eventTimeNotice = rawEventTime && !normalizedEventTime
     ? '<small class="validation-error">系统无法可靠识别候选时间，已留空；原始表述仍保留在上方原文中。</small>'
-    : event.event_time_basis === "source_partial_date_with_document_year" && event.event_time_source_text
-      ? `<small>原文写作“${escapeHtml(event.event_time_source_text)}”，系统结合材料年份补全；加入前可修改。</small>`
+    : event.event_time_source_text && (
+      event.event_time_basis === "source_partial_date_with_document_year"
+      || String(event.event_time_basis || "").startsWith("source_cued_")
+    )
+      ? `<small>原文写作“${escapeHtml(event.event_time_source_text)}”，系统已按这条原文时间提示整理为日期；加入前可修改。</small>`
       : '<small>可填写 YYYY-MM-DD 或完整 ISO 时间；无法确定时留空。</small>';
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">

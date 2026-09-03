@@ -832,6 +832,13 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("async function startInitialTopicCollection", source)
         self.assertIn("function renderOutcomeHero", source)
         self.assertIn("function renderOutcomeFindings", source)
+        self.assertIn("function formatEventDate", source)
+        outcome_timeline = source[
+            source.index("function renderOutcomeTimeline"):
+            source.index("function outcomeSourceSearchSeed")
+        ]
+        self.assertIn("formatEventDate(event.start_at)", outcome_timeline)
+        self.assertNotIn("formatDate(event.start_at, true)", outcome_timeline)
         self.assertIn("function outcomeSourceSearchSeed", source)
         self.assertIn('data-investigation-find-source="${escapeHtml(outcomeSourceSearchSeed', source)
         self.assertIn("if (keyword && autoStart)", source)
@@ -871,7 +878,7 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("已自动避开无法回到原文的内容", source)
         self.assertIn("其余有效内容仍可直接加入专题", source)
         self.assertIn("该事件发生在专题设定的开始时间之前", source)
-        self.assertIn("系统结合材料年份补全", source)
+        self.assertIn("系统已按这条原文时间提示整理为日期", source)
         self.assertIn("window.location.assign(result.url)", source)
         outcome_findings = source[
             source.index("function renderOutcomeFindings"):
