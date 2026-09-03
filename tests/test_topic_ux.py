@@ -849,6 +849,19 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn('data-intake-action="reject-toggle"', source)
         self.assertIn('data-intake-batch="accept"', source)
         self.assertIn('data-intake-batch="reject"', source)
+        batch_review = source[
+            source.index("async function handleIntakeBatch"):
+            source.index("function renderReadonlyCandidate")
+        ]
+        self.assertIn("await loadInvestigationWorkspace(workspaceId, { quiet: true })", batch_review)
+        single_review = source[
+            source.index("async function handleIntakeAction"):
+            source.index("function collectionMetrics")
+        ]
+        self.assertLess(
+            single_review.index("await loadInvestigationWorkspace(actionScope, { quiet: true })"),
+            single_review.index("if (!actionIsCurrent()) return", single_review.index('if (action === "reject")')),
+        )
         self.assertIn("function candidateConfirmationDefaults", source)
         self.assertIn("evidence.filter((candidate) => !candidate.validation_error)", source)
         self.assertIn('action: included ? "create" : "exclude"', source)
