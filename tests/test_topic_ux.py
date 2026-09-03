@@ -801,6 +801,8 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertLess(html.index("2 · 首批资料"), html.index("3 · 更新方式"))
         self.assertIn("指事件发生时间，不是新闻发布时间", html)
         self.assertIn("四种方式可以同时使用", html)
+        self.assertIn("只有你确认采用后，内容才会进入专题成果和报告", html)
+        self.assertNotIn("原始/提取快照与指纹", html)
         self.assertIn('id="investigation-create-source-urls"', html)
         self.assertIn('id="investigation-create-text"', html)
         self.assertIn('id="investigation-create-files"', html)

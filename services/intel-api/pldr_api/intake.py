@@ -661,13 +661,39 @@ def _store_candidates(
             item.extracted_snapshot,
             item.published_at,
         )
-        if normalized_time is None and not (
-            isinstance(event_time, str) and event_time.strip()
-        ):
-            normalized_time, source_time_text, time_basis = infer_cued_source_event_time(
-                item.extracted_snapshot,
-                item.published_at,
+        if normalized_time is None:
+            inferred_time, inferred_source_text, inferred_basis = (
+                infer_cued_source_event_time(
+                    item.extracted_snapshot,
+                    item.published_at,
+                )
             )
+            raw_event_time = event_time.strip() if isinstance(event_time, str) else ""
+            model_time_empty = event_time is None or (
+                isinstance(event_time, str) and not raw_event_time
+            )
+            range_like = bool(
+                re.search(
+                    r"至今|以来|截至|日\s*(?:至|到)|\d\s*至\s*\d",
+                    raw_event_time,
+                )
+            )
+            # A model may return a source fragment plus surrounding words rather
+            # than a datetime (for example ``当地时间11日，...当天上午``).
+            # Accept the independently extracted date only when the model left
+            # time empty or explicitly points at that exact source cue.  Other
+            # invalid, ranged, or ungrounded model values remain unknown.
+            if inferred_time and not range_like and (
+                model_time_empty
+                or bool(
+                    isinstance(event_time, str)
+                    and inferred_source_text
+                    and inferred_source_text in raw_event_time
+                )
+            ):
+                normalized_time = inferred_time
+                source_time_text = inferred_source_text
+                time_basis = inferred_basis
         # Natural-language ranges and ungrounded model dates remain in the
         # snapshot but must not prefill a formal occurrence time.
         event["event_time"] = normalized_time
