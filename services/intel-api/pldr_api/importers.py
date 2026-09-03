@@ -38,6 +38,10 @@ class UnsupportedContentEncodingError(ValueError):
     """Raised before HTTPX can inflate an unbounded compressed response."""
 
 
+class RedirectLimitError(ValueError):
+    """Raised when the safe direct fetch cannot finish a redirect chain."""
+
+
 class ReaderFallbackError(RuntimeError):
     """Raised when both the direct fetch and the optional public reader fail."""
 
@@ -45,6 +49,10 @@ class ReaderFallbackError(RuntimeError):
         self.direct_error = direct_error
         self.reader_error = reader_error
         super().__init__(message)
+
+
+class UnsafeRedirectUrlError(UnsafeUrlError):
+    """An unsafe redirect must never be delegated to a remote reader."""
 
 
 @dataclass(frozen=True)
@@ -67,12 +75,139 @@ def _reader_fallback_enabled() -> bool:
     }
 
 
+def _reader_trusted_dns_enabled() -> bool:
+    return bool(os.getenv("PLDR_READER_VALIDATION_DOH_URL", "").strip())
+
+
 def _reader_fallback_allowed(exc: Exception) -> bool:
+    # A poisoned or synthetic local DNS answer must never weaken direct-fetch
+    # pinning. An explicitly configured HTTPS DNS resolver may, however,
+    # independently validate a public target before a remote Reader fetch.
+    if isinstance(exc, UnsafeRedirectUrlError):
+        return False
+    if isinstance(exc, UnsafeUrlError):
+        return _reader_trusted_dns_enabled()
+    if isinstance(exc, RedirectLimitError):
+        return True
     if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in {403, 408, 425, 429} or exc.response.status_code >= 500
     return False
+
+
+def _configured_https_url(name: str) -> str | None:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            f"{name} must be an HTTPS URL without credentials, query, or fragment"
+        )
+    return value
+
+
+def _configured_reader_proxy() -> str | None:
+    value = os.getenv("PLDR_READER_PROXY_URL", "").strip()
+    if not value:
+        return None
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "PLDR_READER_PROXY_URL must be an HTTP(S) URL without credentials, query, or fragment"
+        )
+    return value
+
+
+def _validated_doh_addresses(payloads: list[object], host: str) -> list[str]:
+    addresses: list[str] = []
+    for payload in payloads:
+        if not isinstance(payload, dict) or payload.get("Status") != 0:
+            raise UnsafeUrlError(f"Trusted DNS could not validate host: {host}")
+        answers = payload.get("Answer")
+        if not isinstance(answers, list):
+            continue
+        for answer in answers:
+            if not isinstance(answer, dict):
+                continue
+            try:
+                address = ipaddress.ip_address(str(answer.get("data", "")).strip())
+            except ValueError:
+                continue
+            if not address.is_global:
+                raise UnsafeUrlError(f"Non-public address is blocked: {address}")
+            rendered = str(address)
+            if rendered not in addresses:
+                addresses.append(rendered)
+    if not addresses:
+        raise UnsafeUrlError(f"Trusted DNS returned no public address for host: {host}")
+    return addresses
+
+
+async def _validate_reader_target(url: str, *, timeout_seconds: float) -> None:
+    validate_public_http_url(url, resolve=False)
+    parsed = urlsplit(url)
+    assert parsed.hostname is not None
+    try:
+        literal = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not literal.is_global:
+            raise UnsafeUrlError(f"Non-public address is blocked: {literal}")
+        return
+
+    resolver_url = _configured_https_url("PLDR_READER_VALIDATION_DOH_URL")
+    if resolver_url is None:
+        validate_public_http_url(url)
+        return
+    proxy = _configured_reader_proxy()
+    async with httpx.AsyncClient(
+        timeout=min(max(timeout_seconds, 1.0), 10.0),
+        follow_redirects=False,
+        trust_env=False,
+        proxy=proxy,
+    ) as client:
+        responses = await asyncio.gather(*(
+            client.get(
+                resolver_url,
+                params={"name": parsed.hostname, "type": record_type},
+                headers={"Accept": "application/dns-json"},
+            )
+            for record_type in ("A", "AAAA")
+        ))
+    payloads: list[object] = []
+    for response in responses:
+        response.raise_for_status()
+        if len(response.content) > 64 * 1024:
+            raise UnsafeUrlError("Trusted DNS response exceeds 65536 byte limit")
+        try:
+            payloads.append(response.json())
+        except json.JSONDecodeError as exc:
+            raise UnsafeUrlError("Trusted DNS returned invalid JSON") from exc
+    _validated_doh_addresses(payloads, parsed.hostname)
+
+
+def _direct_fetch_timeout(requested: float) -> float:
+    configured = float(os.getenv("PLDR_DIRECT_FETCH_TIMEOUT_SECONDS", "12"))
+    if configured <= 0:
+        raise ValueError("PLDR_DIRECT_FETCH_TIMEOUT_SECONDS must be positive")
+    return min(requested, configured)
 
 
 def _is_text_media_type(media_type: str) -> bool:
@@ -210,12 +345,22 @@ async def fetch_public_text_response(
     try:
         async with asyncio.timeout(total_timeout_seconds):
             try:
-                direct = await _fetch_public_text_response(
-                    url,
-                    timeout_seconds=timeout_seconds,
-                    max_redirects=max_redirects,
-                    max_bytes=max_bytes,
+                direct_timeout = min(
+                    _direct_fetch_timeout(timeout_seconds),
+                    max(0.1, total_timeout_seconds / 2),
                 )
+                try:
+                    async with asyncio.timeout(direct_timeout):
+                        direct = await _fetch_public_text_response(
+                            url,
+                            timeout_seconds=direct_timeout,
+                            max_redirects=max_redirects,
+                            max_bytes=max_bytes,
+                        )
+                except TimeoutError as exc:
+                    raise httpx.ReadTimeout(
+                        f"Direct fetch exceeded {direct_timeout:g} second deadline"
+                    ) from exc
                 if (
                     prefer_readable_html
                     and "html" in direct.media_type
@@ -251,6 +396,10 @@ async def fetch_public_text_response(
                         max_bytes=max_bytes,
                     )
                 except Exception as reader_error:
+                    if isinstance(direct_error, UnsafeUrlError) and isinstance(
+                        reader_error, UnsafeUrlError
+                    ):
+                        raise direct_error
                     raise ReaderFallbackError(
                         "Direct fetch and reader fallback both failed: "
                         f"{direct_error}; reader: {reader_error}",
@@ -271,9 +420,22 @@ async def _fetch_reader_html_response(
 ) -> FetchedPublicText:
     """Fetch rendered public HTML through an explicitly enabled Jina Reader adapter."""
     target = canonicalize_url(url)
-    validate_public_http_url(target)
+    await _validate_reader_target(target, timeout_seconds=timeout_seconds)
     base_url = os.getenv("PLDR_READER_BASE_URL", "https://r.jina.ai").strip().rstrip("/")
+    parsed_base = urlsplit(base_url)
+    if (
+        parsed_base.scheme != "https"
+        or not parsed_base.hostname
+        or parsed_base.username
+        or parsed_base.password
+        or parsed_base.query
+        or parsed_base.fragment
+    ):
+        raise ValueError(
+            "PLDR_READER_BASE_URL must be an HTTPS URL without credentials, query, or fragment"
+        )
     api_key = os.getenv("PLDR_READER_API_KEY", "").strip()
+    proxy = _configured_reader_proxy()
     headers = {
         "Accept": "application/json",
         "Accept-Encoding": "identity",
@@ -282,7 +444,12 @@ async def _fetch_reader_html_response(
     }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        trust_env=False,
+        proxy=proxy,
+    ) as client:
         async with client.stream("GET", f"{base_url}/{target}", headers=headers) as response:
             response.raise_for_status()
             _validate_identity_content_encoding(response)
@@ -312,7 +479,7 @@ async def _fetch_reader_html_response(
             f"Rendered page exceeds {max_bytes} byte limit ({rendered_size} bytes received)"
         )
     resolved_url = canonicalize_url(str(data.get("url") or target))
-    validate_public_http_url(resolved_url)
+    await _validate_reader_target(resolved_url, timeout_seconds=timeout_seconds)
     upstream_status = data.get("httpStatus")
     if isinstance(upstream_status, int) and upstream_status >= 400:
         raise ValueError(f"Reader upstream returned HTTP {upstream_status}")
@@ -338,7 +505,8 @@ async def _fetch_public_text_response(
     max_redirects: int,
     max_bytes: int,
 ) -> FetchedPublicText:
-    current = canonicalize_url(url)
+    initial = canonicalize_url(url)
+    current = initial
     async with httpx.AsyncClient(
         timeout=timeout_seconds,
         follow_redirects=False,
@@ -347,7 +515,14 @@ async def _fetch_public_text_response(
         headers={"User-Agent": "PLDR-P0/0.1", "Accept-Encoding": "identity"},
     ) as client:
         for _ in range(max_redirects + 1):
-            pinned_url, host_header, sni_hostname = _pinned_public_destination(current)
+            try:
+                pinned_url, host_header, sni_hostname = await asyncio.to_thread(
+                    _pinned_public_destination, current
+                )
+            except UnsafeUrlError as exc:
+                if current != initial:
+                    raise UnsafeRedirectUrlError(str(exc)) from exc
+                raise
             # Real httpx clients are streamed so the limit is enforced while bytes arrive.
             # The buffered fallback keeps the small test doubles used by the P0 suite compatible.
             if callable(getattr(client, "stream", None)):
@@ -416,7 +591,7 @@ async def _fetch_public_text_response(
                     media_type=media_type,
                     size_bytes=len(content),
                 )
-    raise ValueError(f"Too many redirects (>{max_redirects})")
+    raise RedirectLimitError(f"Too many redirects (>{max_redirects})")
 
 
 async def fetch_public_text(
