@@ -798,10 +798,24 @@ class TopicUxContractTest(unittest.TestCase):
         home_queue = source[
             source.index("function allHomeAssignments()") : source.index("function renderDestinationPickers", source.index("function allHomeAssignments()"))
         ]
+        self.assertIn("const hasServerBackedDirectory", home_queue)
+        self.assertIn("if (!hasServerBackedDirectory)", home_queue)
+        self.assertIn('if (investigation.status === "archived") return', home_queue)
         self.assertLess(
             home_queue.index("seenIntake.add(intakeId)"),
             home_queue.index("if (!taskBelongsInPending(task)) return"),
         )
+        archive_handler = source[
+            source.index('if (action === "archive-topic")') : source.index('if (action === "search")', source.index('if (action === "archive-topic")'))
+        ]
+        self.assertIn('status: "archived"', archive_handler)
+        self.assertIn("state.investigationTasks.delete(investigation.id)", archive_handler)
+        self.assertIn("state.investigationTaskErrors.delete(investigation.id)", archive_handler)
+        self.assertLess(
+            archive_handler.index("state.investigationTasks.delete(investigation.id)"),
+            archive_handler.index("showInvestigationHome()"),
+        )
+        self.assertIn('item.status !== "archived"', source)
         self.assertIn("相关性存疑", source)
         self.assertIn("未通过相关性初筛的结果仍保留在这里", source)
         self.assertIn('data-investigation-action="open-search-run"', source)
