@@ -5735,7 +5735,8 @@ async function handleIntakeAction(action, domEvent = null) {
       }
       if (!actionIsCurrent()) return;
       await refreshIntakeData(null);
-      setIntakeMobileStep(selectedIntakeItem() ? 1 : 0);
+      if (selectedIntakeItem()) setIntakeMobileStep(1);
+      else closeIntakeModal();
       return;
     }
     if (action === "reject") {
@@ -5762,7 +5763,8 @@ async function handleIntakeAction(action, domEvent = null) {
     }
     if (!actionIsCurrent()) return;
     await refreshIntakeData(null);
-    setIntakeMobileStep(selectedIntakeItem() ? 1 : 0);
+    if (selectedIntakeItem()) setIntakeMobileStep(1);
+    else closeIntakeModal();
   } catch (error) {
     if (action === "preview" && actionIsCurrent()) {
       const root = $("#intake-preview");

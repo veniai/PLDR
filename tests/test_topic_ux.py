@@ -936,6 +936,7 @@ class TopicUxContractTest(unittest.TestCase):
             single_review.index("await loadInvestigationWorkspace(actionScope, { quiet: true })"),
             single_review.index("if (!actionIsCurrent()) return", single_review.index('if (action === "reject")')),
         )
+        self.assertGreaterEqual(single_review.count("else closeIntakeModal();"), 2)
         self.assertIn("function candidateConfirmationDefaults", source)
         self.assertIn("evidence.filter((candidate) => !candidate.validation_error)", source)
         self.assertIn('action: included ? "create" : "exclude"', source)
