@@ -333,6 +333,12 @@ function formatEventDate(value) {
     : formatDate(value, true);
 }
 
+function eventTimeInputValue(value) {
+  const raw = String(value || "");
+  const dateOnly = raw.match(/^(\d{4}-\d{2}-\d{2})T00:00:00(?:\.000)?Z$/i);
+  return dateOnly ? dateOnly[1] : raw;
+}
+
 function percent(value) {
   return `${Math.round(clamp(Number(value) || 0, 0, 1) * 100)}%`;
 }
@@ -2377,7 +2383,7 @@ function normalizeEventTimeForConfirmation(value, { strict = true } = {}) {
     if (!Number.isNaN(parsed.getTime())) normalized = parsed.toISOString();
   }
   if (!normalized && strict) {
-    throw new Error("事件时间格式无法识别。请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。");
+    throw new Error("事件时间格式无法识别。请填写日期，例如 2026-08-22；无法确定时请留空。");
   }
   return normalized;
 }
@@ -4917,7 +4923,7 @@ function renderReviewMaterialSummary(item) {
 
 function validationErrorLabel(error) {
   const text = String(error || "");
-  if (/Event start time must be a valid ISO-8601 datetime/i.test(text)) return "事件时间格式无法识别，请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。";
+  if (/Event start time must be a valid ISO-8601 datetime/i.test(text)) return "事件时间格式无法识别，请填写日期，例如 2026-08-22；无法确定时请留空。";
   if (/Event time .* earlier than investigation start/i.test(text)) return "该事件发生在专题设定的开始时间之前，不能直接加入本专题；请核对时间、修改专题范围，或不采用这条材料。";
   if (/Event time .* later than investigation end/i.test(text)) return "该事件发生在专题设定的结束时间之后，不能直接加入本专题；请核对时间、修改专题范围，或不采用这条材料。";
   if (/At least one claim/i.test(text)) return "至少保留一条主张候选。";
@@ -5003,6 +5009,7 @@ function renderIntakeReview(item) {
   const degraded = ["fallback", "fallback-after-error"].includes(generation.mode);
   const rawEventTime = String(event.start_at || event.event_time || "").trim();
   const normalizedEventTime = normalizeEventTimeForConfirmation(rawEventTime, { strict: false });
+  const editableEventTime = eventTimeInputValue(normalizedEventTime);
   const eventTimeNotice = rawEventTime && !normalizedEventTime
     ? '<small class="validation-error">系统无法可靠识别候选时间，已留空；原始表述仍保留在上方原文中。</small>'
     : event.event_time_source_text && (
@@ -5010,7 +5017,7 @@ function renderIntakeReview(item) {
       || String(event.event_time_basis || "").startsWith("source_cued_")
     )
       ? `<small>原文写作“${escapeHtml(event.event_time_source_text)}”，系统已按这条原文时间提示整理为日期；加入前可修改。</small>`
-      : '<small>可填写 YYYY-MM-DD 或完整 ISO 时间；无法确定时留空。</small>';
+      : '<small>填写事件发生日期，例如 2026-08-22；无法确定时留空。</small>';
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">
       <strong>基础草稿 · 需要逐项核对</strong>
@@ -5064,7 +5071,7 @@ function renderIntakeReview(item) {
         <div class="review-grid">
           <label><span>标题（未知必须由人工补实）</span><input id="intake-event-title" value="${escapeHtml(event.title || "")}" maxlength="500"></label>
           <label><span>事件类型</span><input id="intake-event-type" value="${escapeHtml(event.event_type || "incident")}" maxlength="80"></label>
-          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(normalizedEventTime || "")}" placeholder="YYYY-MM-DD">${eventTimeNotice}</label>
+          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(editableEventTime)}" placeholder="例如 2026-08-22">${eventTimeNotice}</label>
           <label><span>地点（未知留空）</span><input id="intake-event-location" value="${escapeHtml(event.location_name || "")}" maxlength="200"></label>
           <label><span>重要性</span><select id="intake-event-importance"><option value="medium" ${event.importance === "medium" || !event.importance ? "selected" : ""}>中</option><option value="high" ${event.importance === "high" ? "selected" : ""}>高</option><option value="critical" ${event.importance === "critical" ? "selected" : ""}>极高</option><option value="low" ${event.importance === "low" ? "selected" : ""}>低</option></select></label>
         </div>
@@ -5388,7 +5395,11 @@ async function updateIntakeRecordVisibility(item, action) {
     if (actionScopeId) await loadInvestigationWorkspace(actionScopeId, { quiet: true });
     else if (state.activeInvestigationId) await loadInvestigationWorkspace(state.activeInvestigationId, { quiet: true });
     await refreshInvestigationDirectory();
+    const shouldCloseAfterRemoval = action !== "restore-record"
+      && state.intakeVisibility === "active"
+      && state.intakeItems.length === 0;
     toast(copy.success, "success", 5600);
+    if (shouldCloseAfterRemoval) closeIntakeModal();
   } catch (error) {
     toast(`${action === "restore-record" ? "恢复" : "删除"}失败：${error.message || "未知错误"}`, "error", 7000);
   } finally {

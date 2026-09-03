@@ -133,6 +133,15 @@ def build_report(
         event=get_event(session,event_id)
         if event is not None: events.append(serialize_event_detail(event))
     if not events: raise ValueError("No valid events selected")
+    events.sort(
+        key=lambda event: (
+            bool(event.get("start_at")),
+            event.get("start_at") or "",
+            event.get("updated_at") or "",
+            event.get("id") or "",
+        ),
+        reverse=True,
+    )
     generated_at=datetime.now(timezone.utc); report_title=title or f"PLDR 专题简报：{events[0]['title']}"
     evidence_index=1
     claim_count=0
@@ -188,22 +197,21 @@ def build_report(
     for gap in information_gaps_override or []:
         cleaned=str(gap).strip()
         if cleaned and cleaned not in information_gaps: information_gaps.append(cleaned)
-    # Keep the frozen report's headline aligned with the live outcome page:
-    # prefer the newest known event time, then the most recently linked event.
-    latest_event=max(
-        enumerate(events),
-        key=lambda pair: (
-            bool(pair[1].get("start_at")),
-            pair[1].get("start_at") or "",
-            pair[0],
-        ),
-    )[1]
+    # Keep the frozen report aligned with the live outcome page: prefer the
+    # newest known event time, then the most recently updated event.
+    latest_event=events[0]
     latest_assessment=latest_event.get("assessment") or {}
+    answer_override=(current_answer_override or "").strip()
     current_answer, _ = compose_current_answer(
         key_findings,
-        assessment=(current_answer_override or "").strip() or latest_assessment.get("judgement"),
+        assessment=answer_override or (latest_assessment.get("judgement") if len(events) == 1 else None),
         fallback_summary=latest_event.get("summary"),
     )
+    if len(events) > 1 and not answer_override:
+        current_answer=(
+            f"截至生成时已确认 {len(events)} 个事件。最新进展是“{latest_event.get('title') or '未命名事件'}”："
+            f"{current_answer}其余已确认事件见下方事件脉络。"
+        )
     html=env.get_template("report.html").render(
         title=report_title,
         generated_at=generated_at.isoformat().replace("+00:00","Z"),
