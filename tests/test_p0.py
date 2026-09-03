@@ -626,6 +626,8 @@ class P0Test(unittest.TestCase):
         async def fake_model_task(task: str, payload: dict):
             self.assertEqual(task, "extract_intake_candidates")
             self.assertIn("warehouse inspection", payload["snapshot"])
+            self.assertIn("at most 5", payload["output_contract"]["entities"])
+            self.assertIn("at most 3", payload["output_contract"]["claims"])
             return {
                 "mode": "api",
                 "model": "test-model",
@@ -703,6 +705,67 @@ class P0Test(unittest.TestCase):
         self.assertIn("must not duplicate", duplicate_item["candidate_generation"]["error"])
         self.assertFalse(duplicate_item["candidates"])
         self.assertEqual(counts(SessionLocal()), baseline)
+
+    def test_evidence_terminal_punctuation_is_repaired_only_to_an_exact_quote(self):
+        source = (
+            "第二枚导弹的袭击目标是试图帮助船员撤离的救援人员，其中两人遇难，"
+            "这两人均来自反胡塞武装的也门组织、也门政府的盟军“国家抵抗力量”"
+            "（National Resistance Forces）。"
+        )
+
+        async def model_task(task: str, payload: dict):
+            self.assertEqual(task, "extract_intake_candidates")
+            return {
+                "mode": "api",
+                "model": "test-model",
+                "result": {
+                    "event": {"title": "红海商船救援人员遇袭", "summary": "救援人员遭到第二枚导弹袭击。"},
+                    "entities": [],
+                    "claims": [{
+                        "text": "第二枚导弹袭击了救援人员，并造成两名国家抵抗力量成员遇难。",
+                        "evidence": [{
+                            "snippet": (
+                                "第二枚导弹的袭击目标是试图帮助船员撤离的救援人员，其中两人遇难，"
+                                "这两人均来自反胡塞武装的也门组织、也门政府的盟军“国家抵抗力量”。"
+                            ),
+                            "paragraph_id": "P999",
+                            "stance": "supports",
+                            "strength": 0.9,
+                        }],
+                    }],
+                },
+            }
+
+        with patch("pldr_api.intake.run_model_task", side_effect=model_task):
+            response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": source,
+                    "source_description": "公开报道",
+                    "title": "红海商船安全动态",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        item = response.json()["intake_item"]
+        candidates = {candidate["candidate_key"]: candidate for candidate in item["candidates"]}
+        evidence = candidates["evidence:1"]
+        repaired = evidence["machine"]["fields"]["snippet"]
+        self.assertEqual(
+            repaired,
+            "第二枚导弹的袭击目标是试图帮助船员撤离的救援人员，其中两人遇难，"
+            "这两人均来自反胡塞武装的也门组织、也门政府的盟军“国家抵抗力量”",
+        )
+        self.assertIn(repaired, item["material"]["extracted_snapshot"])
+        self.assertIsNone(evidence["validation_error"])
+        self.assertNotEqual(evidence["machine"]["fields"]["paragraph_id"], "P999")
+
+        confirmed = self.client.post(
+            f"/pldr-api/v1/intake/{item['id']}/confirm",
+            json=self.confirmation_request(item),
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        self.assertTrue(confirmed.json()["created"])
 
     def test_event_time_is_normalized_or_left_unknown_before_confirmation(self):
         self.assertEqual(

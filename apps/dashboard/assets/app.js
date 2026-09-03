@@ -4662,7 +4662,7 @@ function renderIntakeList() {
 function defaultConfirmationForItem(item) {
   const event = candidateList(item, "event")[0]?.machine?.fields || {};
   const evidence = candidateList(item, "evidence");
-  const hasSupportingEvidence = evidence.some((candidate) => candidate.machine?.fields?.stance === "supports");
+  const defaults = candidateConfirmationDefaults(item);
   const normalizedTitle = String(event.title || "").trim().toLocaleLowerCase();
   const mergeTarget = normalizedTitle
     ? (state.intakeOptions.events || []).find((option) => String(option.title || "").trim().toLocaleLowerCase() === normalizedTitle)
@@ -4685,12 +4685,41 @@ function defaultConfirmationForItem(item) {
     }),
     claims: candidateList(item, "claim").map((candidate) => {
       const fields = candidate.machine?.fields || {};
-      return { candidate_key: candidate.candidate_key, action: "create", text: fields.text || "", status: fields.status === "contested" ? "contested" : (hasSupportingEvidence ? "supported" : "unverified"), confidence: unitIntervalValue(fields.confidence, 0.5), temporal_scope: fields.temporal_scope || "", merge_claim_id: null };
+      const included = defaults.claimKeys.has(candidate.candidate_key);
+      return { candidate_key: candidate.candidate_key, action: included ? "create" : "exclude", text: fields.text || "", status: fields.status === "contested" ? "contested" : (defaults.supportedClaimKeys.has(candidate.candidate_key) ? "supported" : "unverified"), confidence: unitIntervalValue(fields.confidence, 0.5), temporal_scope: fields.temporal_scope || "", merge_claim_id: null };
     }),
     evidence: evidence.map((candidate) => {
       const fields = candidate.machine?.fields || {};
-      return { candidate_key: candidate.candidate_key, action: "include", snippet: fields.snippet || "", stance: fields.stance || "context", strength: unitIntervalValue(fields.strength, 0.7), note: fields.note || "" };
+      return { candidate_key: candidate.candidate_key, action: defaults.evidenceKeys.has(candidate.candidate_key) ? "include" : "exclude", snippet: fields.snippet || "", stance: fields.stance || "context", strength: unitIntervalValue(fields.strength, 0.7), note: fields.note || "" };
     }),
+  };
+}
+
+function candidateConfirmationDefaults(item) {
+  const evidence = candidateList(item, "evidence");
+  const validEvidenceKeys = new Set(
+    evidence.filter((candidate) => !candidate.validation_error).map((candidate) => candidate.candidate_key),
+  );
+  const relations = Array.isArray(item?.candidate_generation?.relations)
+    ? item.candidate_generation.relations
+    : [];
+  const claimEvidence = relations.filter((relation) => relation?.type === "claim_evidence");
+  const evidenceKeys = new Set();
+  const claimKeys = new Set();
+  const supportedClaimKeys = new Set();
+  claimEvidence.forEach((relation) => {
+    if (!validEvidenceKeys.has(relation.from) || relation.valid === false) return;
+    evidenceKeys.add(relation.from);
+    claimKeys.add(relation.to);
+    const candidate = evidence.find((entry) => entry.candidate_key === relation.from);
+    if (candidate?.machine?.fields?.stance === "supports") supportedClaimKeys.add(relation.to);
+  });
+  return {
+    evidenceKeys,
+    claimKeys,
+    supportedClaimKeys,
+    excludedEvidenceCount: evidence.length - evidenceKeys.size,
+    excludedClaimCount: candidateList(item, "claim").filter((candidate) => !claimKeys.has(candidate.candidate_key)).length,
   };
 }
 
@@ -4865,6 +4894,9 @@ function validationErrorLabel(error) {
   if (/Event start time must be a valid ISO-8601 datetime/i.test(text)) return "事件时间格式无法识别，请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。";
   if (/At least one claim/i.test(text)) return "至少保留一条主张候选。";
   if (/At least one evidence/i.test(text)) return "至少纳入一条能够在快照中定位的证据原句。";
+  if (/Evidence snippet is missing/i.test(text)) return "这条原文依据没有内容，已默认不采用。";
+  if (/Evidence snippet is not an exact substring/i.test(text)) return "这条依据无法在保存的原文中精确找到，已默认不采用。";
+  if (/Evidence paragraph_id does not match/i.test(text)) return "原文段落位置不一致，已按保存的原文重新定位。";
   if (/cannot be precisely located/i.test(text)) return "所选证据无法在完整快照中精确定位，请恢复原句或排除它。";
   if (/event title.*required/i.test(text)) return "事件标题不能为空。";
   if (/merge target/i.test(text)) return "所选合并目标无效或不属于当前事件，请重新选择。";
@@ -4926,6 +4958,9 @@ function renderIntakeReview(item) {
   const entities = candidateList(item, "entity");
   const claims = candidateList(item, "claim");
   const evidence = candidateList(item, "evidence");
+  const confirmationDefaults = candidateConfirmationDefaults(item);
+  const includedClaims = claims.filter((candidate) => confirmationDefaults.claimKeys.has(candidate.candidate_key));
+  const canDirectConfirm = confirmationDefaults.evidenceKeys.size > 0 && includedClaims.length > 0;
   const eventOptions = state.intakeOptions.events || [];
   const entityOptions = state.intakeOptions.entities || [];
   const claimOptions = state.intakeOptions.claims || [];
@@ -4949,6 +4984,9 @@ function renderIntakeReview(item) {
       <span>原文已经保存；这份草稿由基础规则整理，可能不完整。请对照固定快照修改或选择不采用，确认前不会进入正式档案。</span>
       ${generation.error ? `<details><summary>为什么使用基础草稿？</summary><small>${escapeHtml(generation.error)}</small></details>` : ""}
     </div>` : "";
+  const excludedCandidateNotice = confirmationDefaults.excludedEvidenceCount || confirmationDefaults.excludedClaimCount
+    ? `<div class="task-degradation review-degradation" role="status"><strong>已自动避开无法回到原文的内容</strong><span>${confirmationDefaults.excludedEvidenceCount ? `${confirmationDefaults.excludedEvidenceCount} 条原文依据无法精确定位，默认不采用。` : ""}${confirmationDefaults.excludedClaimCount ? ` ${confirmationDefaults.excludedClaimCount} 条因此缺少依据的关键信息也不会入档。` : ""}${confirmationDefaults.evidenceKeys.size && confirmationDefaults.claimKeys.size ? "其余有效内容仍可直接加入专题。" : "当前没有剩余的有效内容，请修改后再检查，或选择不采用。"}</span></div>`
+    : "";
   return `
     <section class="intake-review-material">
       <div class="intake-step-heading"><span>查看原文</span><div><h3>这份资料实际说了什么？</h3><p>采用前先确认关键原句确实存在于固定原文中。</p></div></div>
@@ -4960,12 +4998,13 @@ function renderIntakeReview(item) {
     <section class="intake-review-decision">
     <div class="intake-step-heading"><span>作出决定</span><div><h3>把这份整理结果加入专题吗？</h3><p>${readyItems.length ? `本轮第 ${readyIndex + 1} / ${readyItems.length} 条；也可以返回列表多选处理。` : "确认前不会进入专题成果。"}</p></div></div>
     ${degradedWarning}
+    ${excludedCandidateNotice}
     <form class="review-form" data-review-form="${escapeHtml(item.id)}">
       <section class="review-candidate-summary">
-        <div class="review-candidate-summary-head"><span>${suggestedMerge ? "建议合并" : "建议新建事件"}</span><small>${claims.length} 条关键信息 · ${evidence.length} 条原文依据</small></div>
+        <div class="review-candidate-summary-head"><span>${suggestedMerge ? "建议合并" : "建议新建事件"}</span><small>${includedClaims.length} 条关键信息 · ${confirmationDefaults.evidenceKeys.size} 条原文依据将加入</small></div>
         <h3>${escapeHtml(event.title || "事件标题尚未识别")}</h3>
         <p>${escapeHtml(event.summary || "系统没有生成摘要，请查看原文后修改或不采用。")}</p>
-        ${claims.length ? `<ul>${claims.slice(0, 3).map((candidate) => `<li>${escapeHtml(candidate.machine?.fields?.text || "未填写关键信息")}</li>`).join("")}</ul>` : '<p class="outcome-gap-note">没有整理出可确认的关键信息。</p>'}
+        ${includedClaims.length ? `<ul>${includedClaims.slice(0, 3).map((candidate) => `<li>${escapeHtml(candidate.machine?.fields?.text || "未填写关键信息")}</li>`).join("")}</ul>` : '<p class="outcome-gap-note">当前没有带有效原文依据的关键信息，请修改或不采用。</p>'}
         ${suggestedMerge ? `<div class="review-merge-suggestion">发现同名正式事件“${escapeHtml(suggestedMerge.title)}”，默认建议合并；请检查后确认。</div>` : ""}
       </section>
       <details id="intake-editor" class="review-editor-disclosure">
@@ -5016,7 +5055,8 @@ function renderIntakeReview(item) {
       <section class="review-section"><h3>关键信息</h3>${claims.map((candidate) => {
         const fields = candidate.machine?.fields || {};
         const confidence = unitIntervalValue(fields.confidence, 0.5);
-        const status = fields.status || (evidence.some((item) => item.machine?.fields?.stance === "supports") ? "supported" : "unverified");
+        const included = confirmationDefaults.claimKeys.has(candidate.candidate_key);
+        const status = fields.status || (confirmationDefaults.supportedClaimKeys.has(candidate.candidate_key) ? "supported" : "unverified");
         return `
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
           <label><span>简明说法</span><textarea data-claim-field="text" rows="3">${escapeHtml(fields.text || "")}</textarea></label>
@@ -5024,7 +5064,7 @@ function renderIntakeReview(item) {
             <label><span>原文关系</span><select data-claim-field="status"><option value="unverified" ${status === "unverified" ? "selected" : ""}>尚无直接支持</option><option value="supported" ${status === "supported" ? "selected" : ""}>原文支持</option><option value="contested" ${status === "contested" ? "selected" : ""}>原文有冲突</option><option value="confirmed" ${status === "confirmed" ? "selected" : ""}>人工确认</option><option value="refuted" ${status === "refuted" ? "selected" : ""}>已有反证</option></select></label>
             <label><span>置信度（0–1）</span><input type="number" min="0" max="1" step="0.05" data-claim-field="confidence" value="${escapeHtml(confidence)}"></label>
             <label><span>时间范围</span><input data-claim-field="temporal_scope" value="${escapeHtml(fields.temporal_scope || "")}" maxlength="120"></label>
-            <label><span>处置</span><select data-claim-field="action"><option value="create">新建</option><option value="merge">合并</option><option value="exclude">排除</option></select></label>
+            <label><span>处置</span><select data-claim-field="action"><option value="create" ${included ? "selected" : ""}>新建</option><option value="merge">合并</option><option value="exclude" ${included ? "" : "selected"}>排除</option></select></label>
             <label><span>合并目标主张</span><select data-claim-field="merge_claim_id"><option value="">请选择主张</option>${claimOptions.map((option) => `<option value="${escapeHtml(option.id)}">${escapeHtml(option.text || option.title || option.id)}</option>`).join("")}</select></label>
           </div>
         </div>`;
@@ -5033,6 +5073,7 @@ function renderIntakeReview(item) {
         const fields = candidate.machine?.fields || {};
         const strength = unitIntervalValue(fields.strength, 0.7);
         const stance = fields.stance || "context";
+        const included = confirmationDefaults.evidenceKeys.has(candidate.candidate_key);
         return `
         <div class="candidate-editor" data-candidate="${escapeHtml(candidate.candidate_key)}">
           <label><span>原文片段</span><textarea data-evidence-field="snippet" rows="3">${escapeHtml(fields.snippet || "")}</textarea></label>
@@ -5040,9 +5081,9 @@ function renderIntakeReview(item) {
             <label><span>立场</span><select data-evidence-field="stance"><option value="context" ${stance === "context" ? "selected" : ""}>背景</option><option value="supports" ${stance === "supports" ? "selected" : ""}>支持</option><option value="contradicts" ${stance === "contradicts" ? "selected" : ""}>冲突</option></select></label>
             <label><span>证据强度（0–1）</span><input type="number" min="0" max="1" step="0.05" data-evidence-field="strength" value="${escapeHtml(strength)}"></label>
             <label><span>人工备注</span><input data-evidence-field="note" value="${escapeHtml(fields.note || "")}" maxlength="1000"></label>
-            <label><span>处置</span><select data-evidence-field="action"><option value="include">纳入</option><option value="exclude">排除</option></select></label>
+            <label><span>处置</span><select data-evidence-field="action"><option value="include" ${included ? "selected" : ""}>纳入</option><option value="exclude" ${included ? "" : "selected"}>排除</option></select></label>
           </div>
-          ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(candidate.validation_error)}（不可确认）</p>` : `<p class="validation-ok">可定位：${fields.start_offset}-${fields.end_offset}</p>`}
+          ${candidate.validation_error ? `<p class="validation-error">${escapeHtml(validationErrorLabel(candidate.validation_error))}</p>` : `<p class="validation-ok">已在保存的原文中找到</p>`}
         </div>`;
       }).join("")}</section>
       <div class="review-editor-apply"><button class="btn btn-primary" type="button" data-intake-action="preview">检查修改后的内容</button></div>
@@ -5057,7 +5098,7 @@ function renderIntakeReview(item) {
         <p class="review-later-note">关闭窗口即可稍后处理；未确认内容不会进入专题成果。</p>
         <button class="btn btn-ghost" type="button" data-intake-action="reject-toggle" aria-expanded="false" aria-controls="intake-reject-panel">忽略</button>
         <button class="btn btn-ghost" type="button" data-intake-action="modify">修改</button>
-        <button class="btn btn-primary" type="button" data-intake-action="accept">加入专题</button>
+        <button class="btn btn-primary" type="button" data-intake-action="accept" ${canDirectConfirm ? "" : "disabled"} title="${canDirectConfirm ? "校验通过后直接加入专题" : "没有可定位的原文依据，请先修改"}">加入专题</button>
         <button class="btn btn-primary" type="button" data-intake-action="confirm" hidden disabled title="请先检查采用后的变化">确认采用</button>
       </div>
     </form>

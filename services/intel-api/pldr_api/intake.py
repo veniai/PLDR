@@ -359,8 +359,8 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
         "output_contract": {
             "relevance": "relevant, uncertain, or not_relevant to topic_context; use relevant when topic_context is null",
             "event": "at most one main event; use null for unknown fields",
-            "entities": "at most 8 key entities; use [] when unknown",
-            "claims": "at most 5 concise Chinese propositions; each has 1-2 evidence items; claim.text must never copy evidence verbatim",
+            "entities": "at most 5 key entities; use [] when unknown",
+            "claims": "at most 3 concise Chinese propositions; each has 1-2 strongest evidence items; claim.text must never copy evidence verbatim",
             "evidence": "snippet is exact source text without the [Pnnn] marker; paragraph_id is the matching marker",
         },
     }
@@ -564,7 +564,7 @@ def _store_candidates(
     }
     item.review = review
     raw_entities = result.get("entities") if isinstance(result.get("entities"), list) else []
-    raw_entities = raw_entities[:8] if relevance != "not_relevant" else []
+    raw_entities = raw_entities[:5] if relevance != "not_relevant" else []
     for idx, entity in enumerate(raw_entities):
         if not isinstance(entity, dict):
             continue
@@ -588,7 +588,7 @@ def _store_candidates(
     claims = result.get("claims")
     if not isinstance(claims, list):
         claims = []
-    claims = claims[:5] if relevance != "not_relevant" else []
+    claims = claims[:3] if relevance != "not_relevant" else []
     evidence_index = 0
     for claim_idx, claim in enumerate(claims):
         if not isinstance(claim, dict):
@@ -634,14 +634,29 @@ def _store_candidates(
             if not isinstance(snippet, str) or not snippet:
                 validation_error = "Evidence snippet is missing"
             else:
+                # A model occasionally appends punctuation that follows an
+                # omitted parenthetical in the source, for example
+                # `...“组织”。` versus `...“组织”（English name）。`.  Trimming
+                # only terminal punctuation is deterministic and remains
+                # fail-closed: the stored quote must still be an exact source
+                # substring.  No fuzzy matching or invented source text is
+                # accepted here.
+                exact_variants = [snippet.strip()]
+                punctuation_trimmed = exact_variants[0].rstrip(" \t\r\n.,;:!?，。；：！？")
+                if len(punctuation_trimmed) >= 12 and punctuation_trimmed != exact_variants[0]:
+                    exact_variants.append(punctuation_trimmed)
                 occurrences: list[tuple[int, int]] = []
-                cursor = 0
-                while True:
-                    found = item.extracted_snapshot.find(snippet, cursor)
-                    if found < 0:
+                for exact_variant in exact_variants:
+                    cursor = 0
+                    while True:
+                        found = item.extracted_snapshot.find(exact_variant, cursor)
+                        if found < 0:
+                            break
+                        occurrences.append((found, found + len(exact_variant)))
+                        cursor = found + max(1, len(exact_variant))
+                    if occurrences:
+                        snippet = exact_variant
                         break
-                    occurrences.append((found, found + len(snippet)))
-                    cursor = found + max(1, len(snippet))
                 if not occurrences:
                     validation_error = "Evidence snippet is not an exact substring of the complete snapshot"
                 else:
@@ -665,12 +680,6 @@ def _store_candidates(
                 if start_offset >= 0
                 else None
             )
-            if (
-                validation_error is None
-                and supplied_paragraph_id is not None
-                and supplied_paragraph_id != paragraph_id
-            ):
-                validation_error = "Evidence paragraph_id does not match the exact quote location"
             fields = {
                 "snippet": snippet if isinstance(snippet, str) else "",
                 "start_offset": start_offset,
