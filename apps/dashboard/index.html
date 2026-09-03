@@ -59,8 +59,9 @@
           <aside class="investigation-section assignment-section" aria-labelledby="my-assignments-title">
             <div class="investigation-section-head">
               <div>
-                <span class="panel-kicker">PENDING QUEUE</span>
-                <h2 id="my-assignments-title">待处理</h2>
+                <span class="panel-kicker">ALL TOPICS</span>
+                <h2 id="my-assignments-title">全部专题待处理</h2>
+                <p>汇总所有专题；进入专题后只显示该专题内容</p>
               </div>
               <span id="assignment-count" class="count-badge warning">0</span>
             </div>
@@ -109,7 +110,7 @@
           <span aria-hidden="true">⌕</span> 外部关键词发现
         </button>
         <button class="btn btn-ghost intake-button" id="btn-intake" type="button">
-          <span aria-hidden="true">▤</span> 待确认
+          <span aria-hidden="true">▤</span> 全局待确认
           <span id="intake-count" class="count-badge">0</span>
         </button>
         <button class="btn btn-ghost" id="btn-import" type="button">
@@ -341,6 +342,9 @@
                 <option value="available">可选择</option>
                 <option value="selected">已选择</option>
                 <option value="failed">处理失败</option>
+                <option value="likely">与专题相关</option>
+                <option value="uncertain">相关性存疑</option>
+                <option value="unlikely">可能无关</option>
               </select>
             </div>
             <div class="search-selection-tools" role="group" aria-label="批量选择">

@@ -987,19 +987,34 @@ function taskIsActive(task) {
   return ["queued", "fetching", "generating", "ready", "failed"].includes(canonicalTaskStage(task));
 }
 
+function taskBelongsInPending(task) {
+  if (!["search_result", "search_result_intake"].includes(task?.subject_type)
+      && task?.task_type !== "search_result_intake") return true;
+  if (task?.selection_origin !== "topic_onboarding") return true;
+  return !["uncertain", "unlikely"].includes(task?.topic_relevance?.level);
+}
+
 function investigationMetrics(investigation) {
   const raw = investigation?.metrics || investigation?.counts || investigation?.raw?.metrics || investigation?.raw?.counts || {};
   const tasks = tasksForInvestigation(investigation);
+  const pendingTasks = tasks.filter((task) => taskIsActive(task) && taskBelongsInPending(task));
   const taskStatus = investigation?.task_status || investigation?.raw?.task_status || {};
   const statusActive = ["queued", "fetching", "generating", "ready", "failed"].reduce((sum, key) => sum + Number(taskStatus[key] || 0), 0);
   const processing = ["queued", "fetching", "generating"].reduce((sum, key) => sum + Number(taskStatus[key] || 0), 0);
-  const ready = Number(raw.ready ?? raw.review_ready ?? taskStatus.ready ?? tasks.filter((task) => canonicalTaskStage(task) === "ready").length);
-  const failed = Number(raw.failed ?? taskStatus.failed ?? tasks.filter((task) => canonicalTaskStage(task) === "failed").length);
+  const hasLoadedTasks = tasks.length > 0;
+  const ready = hasLoadedTasks
+    ? pendingTasks.filter((task) => canonicalTaskStage(task) === "ready").length
+    : Number(raw.ready ?? raw.review_ready ?? taskStatus.ready ?? 0);
+  const failed = hasLoadedTasks
+    ? pendingTasks.filter((task) => canonicalTaskStage(task) === "failed").length
+    : Number(raw.failed ?? taskStatus.failed ?? 0);
   return {
-    tasks: Number(raw.pending_tasks ?? (Object.keys(taskStatus).length ? statusActive : tasks.filter(taskIsActive).length)),
+    tasks: hasLoadedTasks ? pendingTasks.length : Number(raw.pending_tasks ?? statusActive),
     ready,
     failed,
-    processing: Object.keys(taskStatus).length ? processing : tasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length,
+    processing: hasLoadedTasks
+      ? pendingTasks.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task))).length
+      : processing,
     attention: ready + failed,
     events: Number(raw.events ?? raw.event_count ?? eventsForInvestigation(investigation).length),
     sources: Number(raw.sources ?? raw.collection_targets ?? raw.source_count ?? targetsForInvestigation(investigation).length),
@@ -1016,6 +1031,7 @@ function allHomeAssignments() {
     tasksForInvestigation(investigation).filter(taskIsActive).forEach((task) => {
       const intakeId = taskIntakeId(task);
       if (intakeId) seenIntake.add(intakeId);
+      if (!taskBelongsInPending(task)) return;
       assignments.push({ task, investigation });
     });
   });
@@ -1894,12 +1910,13 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
       ? `<button class="text-btn task-secondary-action" type="button" data-investigation-action="remove-task" data-task-id="${escapeHtml(taskId || "")}" data-intake-id="${escapeHtml(intakeId)}" title="移到本专题已删除，可恢复">删除</button>`
       : "";
     const degradation = task.degradation || (task.degraded && task.error ? task.error : null);
+    const relevance = task.topic_relevance ? searchResultRelevance(task) : null;
     return `
       <article class="topic-task-row">
         <div>
           <h3>${escapeHtml(taskTitle(task))}</h3>
           ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true, actionHtml: primaryAction }) : degradation ? renderTaskDegradation(degradation) : `<p>${escapeHtml(taskProgressText(stage))}</p>`}
-          <div class="topic-task-meta">${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span></div>
+          <div class="topic-task-meta">${relevance ? `<span class="search-relevance ${escapeHtml(relevance.level)}" title="${escapeHtml(relevance.reason)}">${escapeHtml(relevance.label)}</span>` : ""}${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span></div>
         </div>
         <div class="topic-task-actions">
           ${errorPayload ? "" : primaryAction}
@@ -2002,7 +2019,8 @@ function renderSituationAssessment(investigation) {
 
 function renderInvestigationToday(investigation) {
   const tasks = tasksForInvestigation(investigation);
-  const active = tasks.filter(taskIsActive);
+  const active = tasks.filter((task) => taskIsActive(task) && taskBelongsInPending(task));
+  const heldForDiscovery = tasks.filter((task) => taskIsActive(task) && !taskBelongsInPending(task));
   const readyTasks = active.filter((task) => canonicalTaskStage(task) === "ready");
   const failedTasks = active.filter((task) => canonicalTaskStage(task) === "failed");
   const processingTasks = active.filter((task) => ["queued", "fetching", "generating"].includes(canonicalTaskStage(task)));
@@ -2018,15 +2036,21 @@ function renderInvestigationToday(investigation) {
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>等待确认</h3><p>可打开单条查看，也可在待处理窗口中多选处理</p></div><span class="count-badge warning">${readyTasks.length}</span></div>${renderTaskRows(readyTasks, "本轮没有需要确认的内容。")}</section>
       <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>需要处理</h3><p>失败原因、影响和解决办法会直接显示</p></div><span class="count-badge warning">${failedTasks.length}</span></div>${renderTaskRows(failedTasks, "当前没有处理失败的内容。")}</section>
       <details class="processing-queue" ${processingTasks.length ? "" : "open"}><summary><span>系统正在处理</span><strong>${processingTasks.length}</strong><small>无需操作</small></summary>${renderTaskRows(processingTasks, "系统当前没有后台处理任务。")}</details>
+      ${heldForDiscovery.length ? `<section class="workbench-surface discovery-hold-note"><div><strong>${heldForDiscovery.length} 条线索未进入待处理</strong><p>系统认为这些内容相关性存疑或可能无关，已放在“资料与来源 → 发现资料”中，不要求你逐条清理。</p></div><button class="btn btn-ghost" type="button" data-investigation-action="open-discovery">查看候选线索</button></section>` : ""}
     </div>`;
 }
 
 function renderInvestigationDiscovery(investigation) {
+  const detail = state.investigationDetails.get(investigation.id) || {};
+  const queries = Array.isArray(detail.search_queries) ? detail.search_queries : [];
   const tasks = tasksForInvestigation(investigation).filter((task) => {
     const intake = state.intakeItems.find((item) => item.id === taskIntakeId(task));
     return task.subject_type === "search_result" || task.task_type === "search_result_intake" || intake?.input_type === "search";
   });
   return `${investigationPanelHeading("DISCOVERY", "发现资料", "外部搜索只产生候选线索；选中后才抓取原页并进入专题处理队列。", `<button class="btn btn-primary" type="button" data-investigation-action="search">⌕ 发起关键词发现</button>`)}
+    <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>搜索记录与候选线索</h3><p>未通过相关性初筛的结果仍保留在这里，不会自动塞进待处理</p></div><span class="count-badge">${queries.length}</span></div>
+      ${queries.length ? `<div class="topic-task-list">${queries.map((query) => `<article class="topic-task-row"><div><h3>${escapeHtml(query.keyword || "未命名查询")}</h3><p>${Number(query.result_count || 0)} 条候选结果 · ${formatDate(query.created_at, true)}</p></div><div class="topic-task-actions"><button class="btn btn-ghost" type="button" data-investigation-action="open-search-run" data-search-run-id="${escapeHtml(query.id)}">查看全部候选</button></div></article>`).join("")}</div>` : '<div class="investigation-empty"><strong>该专题还没有搜索记录</strong><p>发起关键词发现后，所有候选结果都会保留在这里。</p></div>'}
+    </section>
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>最近发现与处理</h3><p>搜索标题、摘要和排名不是 Evidence</p></div><span class="count-badge">${tasks.length}</span></div>${renderTaskRows(tasks, "该专题还没有关键词发现任务。")}</section>`;
 }
 
@@ -2042,7 +2066,7 @@ function renderInvestigationMonitoring(investigation) {
 }
 
 function renderInvestigationReview(investigation) {
-  const tasks = tasksForInvestigation(investigation).filter(taskIsActive);
+  const tasks = tasksForInvestigation(investigation).filter((task) => taskIsActive(task) && taskBelongsInPending(task));
   return `${investigationPanelHeading("HUMAN REVIEW BOUNDARY", "待审核", "草稿准备好后才能核对；保存到正式档案前必须预览并由你确认。", `<button class="btn btn-ghost" type="button" data-investigation-action="open-intake">查看全部材料</button>`)}
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>处理队列</h3><p>待核对和需要处理的材料优先，处理中材料会自动更新</p></div><span class="count-badge warning">${tasks.length}</span></div>${renderTaskRows(tasks)}</section>`;
 }
@@ -2373,16 +2397,18 @@ async function startInitialTopicCollection(investigation, fields) {
         method: "POST",
         body: JSON.stringify({ keyword, scope: "news", language: detectSearchLanguage(keyword), limit: 10, page_size: 10, page: 1, investigation_id: investigation.id }),
       });
-      const candidates = searchPayloadResults(searchPayload)
+      const results = searchPayloadResults(searchPayload);
+      const candidates = results
+        .filter((result) => result.topic_relevance?.level === "likely")
         .slice(0, fields.settings.auto_select_limit);
       if (candidates.length) {
         await api(API_ROUTES.searchSelect, {
           method: "POST",
           body: JSON.stringify({ result_ids: candidates.map((result) => result.id), request_id: makeClientId("topic-onboarding"), investigation_id: investigation.id, actor: "analyst" }),
         });
-        messages.push(`已搜索“${keyword}”并提交前 ${candidates.length} 条原文处理任务`);
+        messages.push(`已搜索“${keyword}”，${candidates.length} 条明确相关线索已进入处理；其余 ${Math.max(0, results.length - candidates.length)} 条保留在“发现资料”`);
       } else {
-        messages.push(`已完成“${keyword}”搜索，但当前没有符合发布时间偏好的结果`);
+        messages.push(`已完成“${keyword}”搜索；当前没有明确相关线索，结果已保留在“发现资料”，未塞入待处理`);
       }
     } catch (error) {
       errors.push(`关键词搜索未启动：${error.message || "未知错误"}`);
@@ -2644,6 +2670,11 @@ async function handleInvestigationAction(action, node) {
     return;
   }
   if (action === "search") return openExternalSearchModal(investigation?.id);
+  if (action === "open-discovery") return setInvestigationTab("materials", { section: "discovery" });
+  if (action === "open-search-run") {
+    await openExternalSearchModal(investigation?.id);
+    return openSearchHistoryRun(node?.dataset?.searchRunId);
+  }
   if (action === "reorganize") return reorganizeInvestigation();
   if (action === "import") return openImportModal(investigation?.id);
   if (action === "review") return openIntakeModal(null, false, isServerInvestigation(investigation) ? investigation.id : null);
@@ -3856,6 +3887,22 @@ function searchSelectionLabel(result, linked = searchResultLinkedToDestination(r
   return `采集箱已有 · ${status || "可复用"}`;
 }
 
+function searchResultRelevance(result) {
+  const relevance = result?.topic_relevance || {};
+  const level = ["likely", "uncertain", "unlikely"].includes(relevance.level) ? relevance.level : "unknown";
+  const defaults = {
+    likely: ["与专题相关", "标题命中专题词，可优先处理。"],
+    uncertain: ["相关性存疑", "摘要可能涉及专题，请先判断是否值得处理。"],
+    unlikely: ["可能无关", "默认不进入待处理；仍可手动选择。"],
+    unknown: ["尚未初筛", "缺少专题上下文，请人工判断。"],
+  };
+  return {
+    level,
+    label: relevance.label || defaults[level][0],
+    reason: relevance.reason || defaults[level][1],
+  };
+}
+
 function visibleSearchResults() {
   const query = $("#search-result-filter")?.value.trim().toLocaleLowerCase() || "";
   const status = $("#search-result-state")?.value || "all";
@@ -3863,9 +3910,11 @@ function visibleSearchResults() {
     const linked = searchResultLinkedToDestination(result);
     const selected = state.searchSelectedIds.has(result.id);
     const failed = Boolean(result.selection?.last_error || result.selection?.error || result.selection?.intake_status === "failed");
+    const relevance = searchResultRelevance(result);
     if (status === "available" && (linked || result.selection && !failed)) return false;
     if (status === "selected" && !selected) return false;
     if (status === "failed" && !failed) return false;
+    if (["likely", "uncertain", "unlikely"].includes(status) && relevance.level !== status) return false;
     if (!query) return true;
     return [result.title, result.snippet, result.site, result.channel, result.provider, result.original_url]
       .filter(Boolean).join(" ").toLocaleLowerCase().includes(query);
@@ -3885,6 +3934,7 @@ function renderSearchResults() {
   root.innerHTML = visible.length ? visible.map((result) => {
     const linked = searchResultLinkedToDestination(result);
     const checked = state.searchSelectedIds.has(result.id);
+    const relevance = searchResultRelevance(result);
     const selectionError = result.selection?.error || result.selection?.last_error;
     const selectionStage = selectionError ? normalizeOperationalError(selectionError, "fetch").stage : "fetch";
     const retryAction = result.selection?.retryable
@@ -3898,6 +3948,7 @@ function renderSearchResults() {
       </label>
       <div class="search-result-body">
         <div class="search-result-meta">
+          <span class="search-relevance ${escapeHtml(relevance.level)}" title="${escapeHtml(relevance.reason)}">${escapeHtml(relevance.label)}</span>
           <span>检索排名 #${result.rank || "-"}</span>
           <span>${escapeHtml(result.site || "未知站点")}</span>
           <span>${escapeHtml(result.channel || result.provider || "未知渠道")}</span>
@@ -3905,6 +3956,7 @@ function renderSearchResults() {
           <span class="clue-completeness">${searchClueCompleteness(result)} · 不是可信度</span>
         </div>
         <h3>${escapeHtml(result.title || "无标题")}</h3>
+        <p class="search-relevance-reason">${escapeHtml(relevance.reason)}</p>
         ${result.snippet ? `<p>${escapeHtml(result.snippet)}</p>` : '<p class="muted">检索后端未返回摘要。</p>'}
         <a href="${escapeHtml(result.original_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(result.original_url)}</a>
         ${selectionError ? renderOperationalError({ ...(typeof selectionError === "object" ? selectionError : { message: selectionError }), retryable: result.selection?.retryable }, { stage: result.selection?.error_stage || "fetch", compact: true, actionHtml: retryAction }) : ""}
@@ -4988,7 +5040,10 @@ async function refreshIntakeData(preferredItemId = state.selectedIntakeId) {
     if (requestContext.serial !== state.intakeRequestSerial || investigationId !== state.intakeScopeInvestigationId) return { found: false, stale: true };
     if (state.intakeVisibility === "active") state.investigationTasks.set(investigationId, tasks);
     const byId = new Map();
-    tasks.forEach((task) => {
+    const pendingTasks = tasks.filter((task) => (
+      taskBelongsInPending(task) || taskIntakeId(task) === preferredItemId
+    ));
+    pendingTasks.forEach((task) => {
       if (task.intake_item?.id) {
         byId.set(task.intake_item.id, {
           ...task.intake_item,

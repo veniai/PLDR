@@ -6,7 +6,7 @@
 
 ## 目标
 
-在 P0.3 受控采集箱之上增加一个明确独立、归属于专题的公开资料发现入口。分析员输入关键词、选择新闻或一般公开网页范围，由现成外部检索后端返回真实结果；只有被勾选的结果才会异步逐条抓取原始页面，并进入该专题的待处理队列。搜索过程保留关键词、查询运行、检索渠道、结果、人工选择和最终材料之间的追踪关系。
+在 P0.3 受控采集箱之上增加一个明确独立、归属于专题的公开资料发现入口。分析员输入关键词、选择新闻或一般公开网页范围，由现成外部检索后端返回真实结果。普通搜索只有被勾选的结果才会异步抓取；创建专题时，系统会先根据专题词对标题和摘要做可解释的保守初筛，仅自动提交“与专题相关”的首批结果。其他结果保留在发现资料中供人工选择，不会直接进入待处理。搜索过程保留关键词、查询运行、检索渠道、结果、选择和最终材料之间的追踪关系。
 
 这不是工作台左侧的“搜索事件、实体、地点”筛选器。事件筛选器只作用于已入档事件；本入口发起外部检索，且在用户选择前不改变任何正式对象。
 
@@ -38,6 +38,7 @@ PLDR_SEARCH_TIMEOUT_SECONDS=12
 4. 当前 Brave/SearXNG 适配都不承诺可信总数。因此 API 返回 `loaded_count`、`returned_count`、`has_more`、`next_cursor` 和 `total_known=false`；界面只说“已加载 N 条”以及是否还能继续，不拿页大小或当前加载量冒充总结果数。
 5. `language=auto` 根据关键词选择检索语言：当前只要关键词含中文，就在 Brave 使用 `zh-hans`、在 SearXNG 使用 `zh-CN`；不会从字形自动判断繁简。用户手动指定 `zh-TW`、`zh-HK`、`zh-Hant` 等繁体区域或脚本时，Brave 映射为 `zh-hant`，SearXNG 映射为 `zh-TW`。
 6. 提交已选择结果后立即返回 `202 Accepted` 和逐条任务。专题页持续显示 `queued`、`fetching`、`generating`、`ready`、`failed`；一条失败不会取消同批其他结果，也不要求用户等待整批同步完成。
+7. 每条结果带有“与专题相关 / 相关性存疑 / 可能无关”的初筛说明。初筛只读取专题词、标题和搜索摘要，不是事实核验或来源可靠性评分；存疑和可能无关结果仍可查看、筛选和手动提交。
 
 工作台的“今天”页按待审核、处理中、失败和已确认事件组织注意力；“发现资料”保留搜索产生的任务；“待审核”是正式入档前的操作入口。它们读取同一专题的持久状态，不用前端临时成功提示替代服务端结果。
 
@@ -48,7 +49,7 @@ PLDR_SEARCH_TIMEOUT_SECONDS=12
 - `external_search_selections` 用规范化 URL 指纹把一个已识别结果链接到至多一个采集箱条目，并记录尝试次数、状态和错误。
 - `external_search_selection_events` 记录每一次提交、复用和重试所对应的查询运行与结果；采集条目详情显示最新 trace，并保留完整 `search_history`。
 - 检索渠道不是正式 `Source`；搜索标题、摘要、排名、相对时间和模型答案都不是 `Evidence`。
-- 未勾选结果不会发起原始页抓取，也不会产生采集箱条目。
+- 未勾选结果不会发起原始页抓取，也不会产生采集箱条目；唯一例外是创建专题时经过明确提示的“与专题相关”首批结果，它们在保守初筛后自动提交。初筛未通过的结果仍保留在该专题的搜索记录中。
 - 勾选后仍沿用 P0.3：逐条抓取原始 HTML，保存原始/提取快照，生成候选。审核默认只允许合并到当前专题对象；跨专题复用必须显式开启并展示目标归属。人工确认后才创建或关联正式 `Source`、`Document`、`Snapshot`、`Event`、`Entity`、`Claim`、`Evidence`。
 - 确认预览以语义对象展示将写入的 Source、Document、Snapshot、Event、Claim、Evidence、关系和动作，而不是让分析员直接判断原始 JSON。确认响应返回正式事件 ID/档案入口和下一条待审任务。
 - 人工确认结果继续保留 intake 与 external search trace；正式 `Document.metadata` 通过 `intake_item_id` 可回到该采集条目和查询链。
@@ -74,6 +75,7 @@ PLDR_SEARCH_TIMEOUT_SECONDS=12
 | 同一专题查询真实加载三页、跨页 URL 去重、重开历史、未知总数和一次选择 25 条 | `test_three_pages_persist_deduplicate_reopen_and_select_25` |
 | 结构化限流错误持久保存并可按追踪 ID 重开；首次失败可在同一查询运行重试 | `test_search_error_is_structured_and_persisted`、`test_failed_first_page_can_retry_same_run` |
 | 查询和选择状态按专题隔离；降级候选与 DNS 策略拒绝给出正确重试语义 | `test_selection_state_and_result_ids_do_not_cross_topics` |
+| 专题相关性初筛区分标题明确命中、仅摘要命中和无命中；存疑/无关结果不自动进入待处理且可在发现资料重开 | `test_topic_relevance_prescreen_keeps_broad_hits_out_of_automatic_queue`、`test_topic_onboarding_presents_one_clear_human_confirmation_flow` |
 | SearXNG 运营方返回超过页面大小时不被适配层提前截断；旧搜索表增量、幂等迁移 | `test_searxng_operator_page_is_not_truncated_or_stranded`、`test_additive_migration_upgrades_original_search_tables` |
 | 专题审核目标默认隔离、跨专题复用显式授权、语义预览、确认后正式事件与下一任务 | `test_topic_queue_and_merge_targets_are_strict_unless_reuse_is_explicit`、`test_semantic_preview_and_confirmation_return_navigation_and_next_task` |
 | 抓取/模型错误分类、DNS fail-closed 与历史候选失败可恢复 | `test_error_contract_and_legacy_generation_failure_remain_reviewable` |
