@@ -4505,9 +4505,9 @@ async function submitImport(event) {
   const published = $("#import-published").value;
   const submit = $("#import-submit");
   submit.disabled = true;
-  submit.textContent = "正在抓取";
+  submit.textContent = mode === "url" || mode === "rss" ? "正在读取并保存" : "正在保存";
   $("#import-result").className = "import-result";
-  $("#import-result").textContent = "正在保存材料；候选生成状态会在专题队列中单独显示…";
+  $("#import-result").textContent = "正在保存原始资料；保存后由后台继续整理，不需要停在这里等待…";
 
   let persistedCount = 0;
   try {
@@ -4519,7 +4519,7 @@ async function submitImport(event) {
       body.append("file", file);
       body.append("source_description", sourceName);
       body.append("language", language);
-      result = await api("/pldr-api/v1/intake/files", { method: "POST", body });
+      result = await api("/pldr-api/v1/intake/files?defer_candidates=true", { method: "POST", body });
     } else if (mode === "text") {
       const body = {
         text: $("#import-text").value,
@@ -4528,13 +4528,13 @@ async function submitImport(event) {
         published_at: published ? new Date(published).toISOString() : null,
         language,
       };
-      result = await api("/pldr-api/v1/intake/text", { method: "POST", body: JSON.stringify(body) });
+      result = await api("/pldr-api/v1/intake/text?defer_candidates=true", { method: "POST", body: JSON.stringify(body) });
     } else if (mode === "rss") {
       const body = { url, source_name: sourceName || "Imported RSS", language };
-      result = await api("/pldr-api/v1/import/rss", { method: "POST", body: JSON.stringify(body) });
+      result = await api("/pldr-api/v1/import/rss?defer_candidates=true", { method: "POST", body: JSON.stringify(body) });
     } else {
       const body = { url, source_name: sourceName || null, title: title || null, language };
-      result = await api("/pldr-api/v1/import/url", { method: "POST", body: JSON.stringify(body) });
+      result = await api("/pldr-api/v1/import/url?defer_candidates=true", { method: "POST", body: JSON.stringify(body) });
     }
     const items = result.intake_items || [result.intake_item].filter(Boolean);
     const count = items.length;
@@ -4568,9 +4568,12 @@ async function submitImport(event) {
     if (investigation && association.failed === 0) {
       toast(investigation.sync_mode === "local"
         ? `已导入 ${count} 条真实材料；专题归类仅保存在此浏览器。`
-        : `已导入并关联到专题：${count} 条；候选仍需人工审核。`, "success", 7000);
+        : `已保存并加入专题：${count} 条；系统会在后台整理，完成后出现在“等待确认”。`, "success", 7000);
       await openInvestigation(investigation.id, "overview");
-      await openIntakeModal(items[0]?.id || null, false, isServerInvestigation(investigation) ? investigation.id : null);
+      const actionable = items.find((item) => ["candidate_ready", "generation_failed", "failed"].includes(item.status));
+      if (actionable) {
+        await openIntakeModal(actionable.id, false, isServerInvestigation(investigation) ? investigation.id : null);
+      }
     } else {
       toast(association.failed
         ? `材料已真实进入采集箱，但专题关联失败：${association.errors?.[0] || "未知错误"}`
