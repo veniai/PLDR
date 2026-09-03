@@ -435,9 +435,11 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(empty.json()["claims"], [])
         self.assertEqual(empty.json()["counts"]["waiting_for_review"], 1)
 
+        first_confirmation = self.confirmation(first)
+        first_confirmation["event"]["start_at"] = "2026-08-11T00:00:00Z"
         confirmed = self.client.post(
             f"/pldr-api/v1/investigations/{topic}/intake/{first['id']}/confirm",
-            json=self.confirmation(first),
+            json=first_confirmation,
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         first_event_id = confirmed.json()["final_event_id"]
@@ -480,9 +482,11 @@ class TopicUxContractTest(unittest.TestCase):
 
         second = self.create_intake("outcome-two")
         self.link(topic, "intake", second["id"])
+        second_request = self.confirmation(second)
+        second_request["event"]["start_at"] = "2026-08-22T00:00:00Z"
         second_confirmation = self.client.post(
             f"/pldr-api/v1/investigations/{topic}/intake/{second['id']}/confirm",
-            json=self.confirmation(second),
+            json=second_request,
         )
         self.assertEqual(second_confirmation.status_code, 200, second_confirmation.text)
         changed = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
@@ -490,6 +494,24 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(
             changed["changes"]["new_event_ids"],
             [second_confirmation.json()["final_event_id"]],
+        )
+        self.assertEqual(changed["events"][0]["id"], second_confirmation.json()["final_event_id"])
+
+        updated_report = self.client.post(
+            "/pldr-api/v1/reports",
+            json={"investigation_id": topic, "title": "Outcome after update"},
+        )
+        self.assertEqual(updated_report.status_code, 200, updated_report.text)
+        updated_report_page = self.client.get(updated_report.json()["url"])
+        self.assertEqual(updated_report_page.status_code, 200, updated_report_page.text)
+        self.assertIn("截至生成时已确认 2 个事件", updated_report_page.text)
+        self.assertIn(
+            f"最新进展是“{changed['events'][0]['title']}”",
+            updated_report_page.text,
+        )
+        self.assertLess(
+            updated_report_page.text.index("outcome-two"),
+            updated_report_page.text.index("outcome-one"),
         )
 
     def test_topic_reorganization_groups_pages_and_report_does_not_repeat_articles(self):
@@ -855,7 +877,9 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertNotIn("主张和证据", suggestion)
         self.assertIn("function normalizeEventTimeForConfirmation", source)
         self.assertIn("系统无法可靠识别候选时间，已留空", source)
-        self.assertIn("事件时间格式无法识别。请填写 YYYY-MM-DD", source)
+        self.assertIn("事件时间格式无法识别。请填写日期，例如 2026-08-22", source)
+        self.assertIn("function eventTimeInputValue", source)
+        self.assertIn("value=\"${escapeHtml(editableEventTime)}\"", source)
         self.assertIn("async function startInitialTopicCollection", source)
         manual_import = source[
             source.index("async function submitImport"):
@@ -981,6 +1005,7 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn('report_language: "zh-CN"', source)
         self.assertIn('source_language: "auto"', source)
         self.assertIn('if (action === "review") return openIntakeModal', source)
+        self.assertIn('if (shouldCloseAfterRemoval) closeIntakeModal()', source)
         self.assertIn("不会把搜索摘要或 AI 草稿直接写成正式结论", html)
 
 
