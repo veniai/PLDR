@@ -177,6 +177,79 @@ def normalize_source_event_time(
     return iso(parsed), source_fragment, "source_partial_date_with_document_year"
 
 
+_EVENT_DATE_CUE = r"(?:当地时间|事件发生(?:于|在)|事发(?:于|在)|发生(?:于|在)|周[一二三四五六日天]\s*[（(])"
+_CUED_EVENT_FULL_DATE = re.compile(
+    _EVENT_DATE_CUE
+    + r"\s*(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日(?:[）)])?"
+)
+_CUED_EVENT_MONTH_DAY = re.compile(
+    _EVENT_DATE_CUE
+    + r"\s*(?P<month>\d{1,2})月(?P<day>\d{1,2})日(?:[）)])?"
+)
+_CUED_EVENT_DAY = re.compile(r"当地时间\s*(?P<day>\d{1,2})日")
+
+
+def infer_cued_source_event_time(
+    snapshot: str,
+    published_at: datetime | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Infer only a clearly cued lead date when the model leaves time empty.
+
+    News leads often say ``当地时间11日`` while the document metadata carries
+    the month and year.  The inference is restricted to the first 2,400 source
+    characters and retains the exact cue for audit.  A bare day elsewhere in
+    the article is never promoted to an event time.
+    """
+    if published_at is None:
+        return None, None, None
+    publication = published_at
+    if publication.tzinfo is None:
+        publication = publication.replace(tzinfo=timezone.utc)
+    publication = publication.astimezone(timezone.utc)
+    lead = snapshot[:2400]
+
+    full_date = _CUED_EVENT_FULL_DATE.search(lead)
+    if full_date is not None:
+        try:
+            parsed = datetime(
+                int(full_date.group("year")),
+                int(full_date.group("month")),
+                int(full_date.group("day")),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            return None, None, None
+        return iso(parsed), full_date.group(0), "source_cued_explicit_date"
+
+    month_day = _CUED_EVENT_MONTH_DAY.search(lead)
+    if month_day is not None:
+        month = int(month_day.group("month"))
+        day = int(month_day.group("day"))
+        try:
+            parsed = datetime(publication.year, month, day, tzinfo=timezone.utc)
+            if parsed > publication + timedelta(days=7):
+                parsed = parsed.replace(year=parsed.year - 1)
+        except ValueError:
+            return None, None, None
+        return iso(parsed), month_day.group(0), "source_cued_date_with_document_year"
+
+    day_only = _CUED_EVENT_DAY.search(lead)
+    if day_only is None:
+        return None, None, None
+    day = int(day_only.group("day"))
+    try:
+        parsed = datetime(publication.year, publication.month, day, tzinfo=timezone.utc)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed > publication + timedelta(days=7):
+        previous_month = publication.replace(day=1) - timedelta(days=1)
+        try:
+            parsed = datetime(previous_month.year, previous_month.month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None, None, None
+    return iso(parsed), day_only.group(0), "source_cued_day_with_document_month"
+
+
 def extracted_material_metadata(
     page: Any,
     *,
@@ -588,6 +661,13 @@ def _store_candidates(
             item.extracted_snapshot,
             item.published_at,
         )
+        if normalized_time is None and not (
+            isinstance(event_time, str) and event_time.strip()
+        ):
+            normalized_time, source_time_text, time_basis = infer_cued_source_event_time(
+                item.extracted_snapshot,
+                item.published_at,
+            )
         # Natural-language ranges and ungrounded model dates remain in the
         # snapshot but must not prefill a formal occurrence time.
         event["event_time"] = normalized_time
