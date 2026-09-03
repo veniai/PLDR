@@ -1025,6 +1025,9 @@ function investigationMetrics(investigation) {
 function allHomeAssignments() {
   const assignments = [];
   const seenIntake = new Set();
+  const hasServerBackedDirectory = state.investigations.some((investigation) => (
+    ["server", "system", "demo"].includes(investigation.sync_mode)
+  ));
   state.investigations.forEach((investigation) => {
     if (investigation.status === "archived") return;
     if (investigation.sync_mode === "demo") return;
@@ -1036,12 +1039,18 @@ function allHomeAssignments() {
       assignments.push({ task, investigation });
     });
   });
-  state.intakeItems.filter((item) => ["queued", "parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status) && !seenIntake.has(item.id)).forEach((item) => {
-    assignments.push({
-      task: { id: `unassigned:${item.id}`, intake_item_id: item.id, status: taskStageFromIntake(item), title: intakeTitle(item), error_message: item.error, created_at: item.created_at },
-      investigation: null,
+  // A server-backed directory is authoritative for the home queue. Falling
+  // back to every globally active intake here would make material removed
+  // from (or left behind by) an archived topic reappear as "unassigned".
+  // Legacy/local-only deployments still need the global-intake fallback.
+  if (!hasServerBackedDirectory) {
+    state.intakeItems.filter((item) => ["queued", "parsed", "candidate_ready", "generation_failed", "failed"].includes(item.status) && !seenIntake.has(item.id)).forEach((item) => {
+      assignments.push({
+        task: { id: `unassigned:${item.id}`, intake_item_id: item.id, status: taskStageFromIntake(item), title: intakeTitle(item), error_message: item.error, created_at: item.created_at },
+        investigation: null,
+      });
     });
-  });
+  }
   const rank = { failed: 0, ready: 1, fetching: 2, generating: 3, queued: 4 };
   return assignments.sort((a, b) => (rank[canonicalTaskStage(a.task)] ?? 8) - (rank[canonicalTaskStage(b.task)] ?? 8)
     || new Date(b.task.updated_at || b.task.created_at || 0) - new Date(a.task.updated_at || a.task.created_at || 0));
@@ -2715,7 +2724,19 @@ async function handleInvestigationAction(action, node) {
     if (!isServerInvestigation(investigation) || investigation.sync_mode === "system") return;
     if (!window.confirm(`删除专题“${investigation.title}”？\n\n专题会移到“已删除专题”，以后可以恢复；已采集资料和正式档案不会被物理删除。`)) return;
     try {
-      await api(API_ROUTES.investigation(investigation.id), { method: "PATCH", body: JSON.stringify({ status: "archived", actor: "analyst" }) });
+      const payload = await api(API_ROUTES.investigation(investigation.id), { method: "PATCH", body: JSON.stringify({ status: "archived", actor: "analyst" }) });
+      const archived = normalizeInvestigation(payload.investigation || payload, "server");
+      state.investigations = state.investigations.map((item) => item.id === investigation.id
+        ? { ...item, ...archived, status: "archived" }
+        : item);
+      state.investigationTasks.delete(investigation.id);
+      state.investigationTaskErrors.delete(investigation.id);
+      state.investigationDetails.delete(investigation.id);
+      state.investigationLinks.delete(investigation.id);
+      state.investigationActivities.delete(investigation.id);
+      state.investigationActivityErrors.delete(investigation.id);
+      state.investigationOutcomes.delete(investigation.id);
+      state.investigationOutcomeErrors.delete(investigation.id);
       showInvestigationHome();
       await refreshInvestigationDirectory();
       toast("专题已移到“已删除专题”。", "success", 5200);
@@ -2969,7 +2990,7 @@ function renderMetrics() {
     ];
     $("#metrics").setAttribute("aria-label", `${investigation.title} 专题指标`);
   } else {
-    const userInvestigations = state.investigations.filter((item) => !["system", "demo", "compatibility"].includes(item.sync_mode));
+    const userInvestigations = state.investigations.filter((item) => !["system", "demo", "compatibility"].includes(item.sync_mode) && item.status !== "archived");
     const assignments = allHomeAssignments();
     items = [
       ["investigations", userInvestigations.length, "我的专题"],
