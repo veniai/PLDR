@@ -925,6 +925,40 @@ class P0Test(unittest.TestCase):
             "source_cued_day_with_document_month",
         )
 
+        async def verbose_cued_date_model_task(task: str, payload: dict):
+            result = await omitted_date_model_task(task, payload)
+            result["result"]["event"]["event_time"] = "当地时间11日，胡塞武装当天上午"
+            return result
+
+        with patch(
+            "pldr_api.intake.run_model_task",
+            side_effect=verbose_cued_date_model_task,
+        ):
+            verbose_cued_response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": cued_day_sentence,
+                    "source_description": "公开报道",
+                    "title": "模型返回带说明日期测试",
+                    "published_at": "2026-08-12T00:00:00Z",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(
+            verbose_cued_response.status_code,
+            200,
+            verbose_cued_response.text,
+        )
+        verbose_cued_event = self.candidate_map(
+            verbose_cued_response.json()["intake_item"]
+        )["event"]["machine"]["fields"]
+        self.assertEqual(verbose_cued_event["event_time"], "2026-08-11T00:00:00Z")
+        self.assertEqual(verbose_cued_event["event_time_source_text"], "当地时间11日")
+        self.assertEqual(
+            verbose_cued_event["event_time_basis"],
+            "source_cued_day_with_document_month",
+        )
+
         uncued_day_sentence = "公开材料列出11日的值班记录，但没有说明事件发生时间。"
 
         async def uncued_date_model_task(task: str, payload: dict):
