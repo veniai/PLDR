@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .database import SessionLocal
-from .extraction import canonicalize_url, content_hash, extract_page, normalize_text
+from .extraction import assess_extraction, canonicalize_url, content_hash, extract_page, normalize_text
 from .importers import (
     FetchedPublicText,
     ResponseTooLargeError,
@@ -27,7 +27,12 @@ from .importers import (
     UnsupportedContentTypeError,
     fetch_public_text_response,
 )
-from .intake import generate_candidates, lock_intake_for_mutation, submit_web_intake
+from .intake import (
+    extracted_material_metadata,
+    generate_candidates,
+    lock_intake_for_mutation,
+    submit_web_intake,
+)
 from .models import (
     CollectionDiscoveredItem,
     CollectionRun,
@@ -668,6 +673,9 @@ def _latest_version_run(
 
 
 def classify_collection_error(exc: Exception) -> str:
+    from .importers import ReaderFallbackError
+    if isinstance(exc, ReaderFallbackError):
+        return classify_collection_error(exc.direct_error)
     if isinstance(exc, UnsafeUrlError):
         return "unsafe_url"
     if isinstance(exc, ResponseTooLargeError):
@@ -892,7 +900,7 @@ async def _execute_claimed_rss_run(
     started_clock: float,
 ) -> CollectionRun:
     try:
-        fetched = await fetch_public_text_response(target.url)
+        fetched = await fetch_public_text_response(target.url, prefer_readable_html=False)
         parsed = parse_rss_feed(fetched)
         feed_hash = content_hash(
             "\n".join(f"{item.item_key}:{item.raw_hash}" for item in parsed.items)
@@ -1052,16 +1060,24 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                     media_type=run.media_type or recovered_item.media_type or "text/html",
                     size_bytes=len(recovered_raw.encode("utf-8")),
                 )
-                page = extract_page(recovered_raw)
+                page = extract_page(recovered_raw, url=fetched.resolved_url)
+                quality = assess_extraction(page)
+                if quality.status != "usable":
+                    raise ValueError(
+                        "Extracted page body is not usable: " + ", ".join(quality.reasons)
+                    )
                 raw_hash = recovered_item.raw_hash
                 body_hash = recovered_item.extracted_hash
             else:
                 fetched = await fetch_public_text_response(target.url)
                 if not fetched.text.strip():
                     raise ValueError("Fetched page is empty")
-                page = extract_page(fetched.text)
-                if len(page.body) < 40:
-                    raise ValueError("Extracted page body is too short")
+                page = extract_page(fetched.text, url=fetched.resolved_url)
+                quality = assess_extraction(page)
+                if quality.status != "usable":
+                    raise ValueError(
+                        "Extracted page body is not usable: " + ", ".join(quality.reasons)
+                    )
                 raw_hash = hashlib.sha256(fetched.text.encode("utf-8")).hexdigest()
                 body_hash = content_hash(page.body)
                 # Persist the fetched identity before submit_web_intake performs its own
@@ -1143,6 +1159,16 @@ async def execute_claimed_run(run_id: str) -> CollectionRun:
                         fetched.text,
                         target.language,
                         input_type="collection",
+                        review_extra={
+                            "material": extracted_material_metadata(
+                                page,
+                                resolved_url=fetched.resolved_url,
+                                fetched_at=utcnow(),
+                                fetch_method=fetched.fetch_method,
+                                fetch_metadata=fetched.metadata,
+                                http_status=fetched.status_code,
+                            )
+                        },
                     )
                     if item.status == "failed":
                         error = item.error or "Collection intake creation failed"

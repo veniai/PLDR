@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,8 @@ TASK_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
     },
     "draft_report": {"title": "string", "sections": [{"heading": "string", "body": "string"}]},
     "extract_intake_candidates": {
+        "relevance": "relevant, uncertain, or not_relevant",
+        "relevance_reason": "one concise Simplified Chinese sentence",
         "event": {
             "title": "string or null",
             "summary": "string or null",
@@ -88,6 +91,7 @@ TASK_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
                 "evidence": [
                     {
                         "snippet": "exact substring of snapshot",
+                        "paragraph_id": "the [Pnnn] label containing the snippet, or null",
                         "stance": "supports, contradicts, or context",
                         "strength": "number from 0 to 1",
                     }
@@ -115,6 +119,19 @@ TASK_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
         "information_gaps": ["concise Simplified Chinese unanswered question"],
     },
 }
+
+
+_LOOP_LIMITERS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]]" = weakref.WeakKeyDictionary()
+
+
+def _model_limiter() -> asyncio.Semaphore:
+    limit = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
+    loop = asyncio.get_running_loop()
+    current = _LOOP_LIMITERS.get(loop)
+    if current is None or current[0] != limit:
+        current = (limit, asyncio.Semaphore(limit))
+        _LOOP_LIMITERS[loop] = current
+    return current[1]
 
 
 def model_request_payload(task: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -208,17 +225,20 @@ async def run_model_task(task: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {"mode":"fallback","task":task,"result":deterministic_fallback(task,payload),"warning":"No model API configured; deterministic fallback was used."}
     endpoint = f"{config.base_url}/chat/completions"
     body={"model":config.model,"temperature":0.1,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":json.dumps(model_request_payload(task,payload),ensure_ascii=False)}]}
+    if task == "extract_intake_candidates":
+        body["max_tokens"] = int(os.getenv("LLM_EXTRACTION_MAX_TOKENS", "1400"))
     if task == "synthesize_investigation":
         body["max_tokens"] = int(os.getenv("LLM_SYNTHESIS_MAX_TOKENS", "2048"))
-        # GLM 5.3 always reasons.  Asking its OpenAI-compatible endpoint for a
-        # low reasoning budget avoids a 90-second timeout on small topic sets.
-        if "glm-5.3" in config.model.lower():
-            body["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT", "low")
+    # GLM 5.3 always reasons. A low budget is materially faster while retaining
+    # exact-quote validation; providers that do not support it simply omit it.
+    if "glm-5.3" in config.model.lower() or os.getenv("LLM_REASONING_EFFORT"):
+        body["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT", "low")
     headers={"Authorization":f"Bearer {config.api_key}","Content-Type":"application/json"}
     try:
-        async with asyncio.timeout(config.timeout_seconds):
-            async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
-                response=await client.post(endpoint,headers=headers,json=body); response.raise_for_status(); data=response.json()
+        async with _model_limiter():
+            async with asyncio.timeout(config.timeout_seconds):
+                async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
+                    response=await client.post(endpoint,headers=headers,json=body); response.raise_for_status(); data=response.json()
     except TimeoutError as exc:
         raise httpx.ReadTimeout(
             f"Model request exceeded {config.timeout_seconds:g} second total deadline"

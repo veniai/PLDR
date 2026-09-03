@@ -177,8 +177,9 @@ class TopicUxContractTest(unittest.TestCase):
 
         ready = self.client.get(f"/pldr-api/v1/tasks/{task['id']}")
         self.assertEqual(ready.status_code, 200, ready.text)
-        self.assertEqual(ready.json()["status"], "ready")
-        self.assertTrue(ready.json()["fallback_used"])
+        self.assertEqual(ready.json()["status"], "failed")
+        self.assertFalse(ready.json()["fallback_used"])
+        self.assertEqual(ready.json()["error"]["code"], "model_timeout")
 
     def link(self, topic_id: str, object_type: str, object_id: str) -> None:
         response = self.client.post(
@@ -662,14 +663,15 @@ class TopicUxContractTest(unittest.TestCase):
             new=AsyncMock(side_effect=TimeoutError("model timeout")),
         ):
             asyncio.run(run_review_task_once(worker_id="topic-ux-worker"))
-        ready = self.client.get(f"/pldr-api/v1/tasks/{task_id}").json()
-        self.assertEqual(ready["status"], "ready")
-        self.assertTrue(ready["fallback_used"])
-        self.assertTrue(ready["retryable"])
-        self.assertEqual(ready["error"]["code"], "model_timeout_fallback")
-        self.assertEqual(ready["error"]["trace_id"], task_id)
-        self.assertEqual(ready["error_message"], ready["last_error"])
-        self.assertEqual(ready["intake_item"]["candidate_generation"]["mode"], "fallback-after-error")
+        failed = self.client.get(f"/pldr-api/v1/tasks/{task_id}").json()
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["fallback_used"])
+        self.assertTrue(failed["retryable"])
+        self.assertEqual(failed["error"]["code"], "model_timeout")
+        self.assertEqual(failed["error"]["trace_id"], task_id)
+        self.assertEqual(failed["error_message"], failed["last_error"])
+        self.assertEqual(failed["intake_item"]["candidate_generation"]["mode"], "failed")
+        self.assertEqual(failed["intake_item"]["candidates"], [])
 
     def test_topic_review_task_retry_uses_canonical_task_state_machine(self):
         script = self.client.get("/assets/app.js")

@@ -157,9 +157,12 @@ LLM_API_KEY=
 LLM_BASE_URL=
 LLM_MODEL_NAME=
 LLM_TIMEOUT_SECONDS=60
+LLM_MAX_CONCURRENCY=1
+LLM_EXTRACTION_MAX_TOKENS=1400
+LLM_REASONING_EFFORT=
 ```
 
-业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。
+业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。网页正文使用 Trafilatura 清理；可选 Jina Reader 只在安全直抓失败或正文质量不足后启用。模型失败保留原文并允许只重试分析，不再生成容易误解的伪成功草稿。
 
 ## 当前边界
 

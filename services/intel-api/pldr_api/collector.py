@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 
 from .collection import run_once, worker_identity
 from .database import Base, SessionLocal, engine
@@ -26,6 +27,10 @@ async def _worker_loop(*, poll_seconds: float, slot: int) -> None:
 
 
 async def _run_loop(*, poll_seconds: float, concurrency: int) -> None:
+    # Keep lease sizing aligned with the actual worker count selected by the CLI.
+    # This must happen in-process because command-line concurrency can differ from
+    # the inherited environment (for example, after Compose variable expansion).
+    os.environ["PLDR_COLLECTOR_CONCURRENCY"] = str(concurrency)
     await asyncio.gather(*(
         _worker_loop(poll_seconds=poll_seconds, slot=slot)
         for slot in range(1, concurrency + 1)

@@ -17,9 +17,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .errors import ArchivedIntakeError, IntakeMutationConflictError
-from .extraction import canonicalize_url, extract_page, normalize_text
+from .extraction import assess_extraction, canonicalize_url, extract_page, normalize_text
 from .importers import fetch_public_text
 from .intake import (
+    extracted_material_metadata,
     generate_candidates,
     iso,
     lock_intake_for_mutation,
@@ -1426,9 +1427,13 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
     try:
         resolved_url, html = await fetch_public_text(result.original_url)
         resolved_url = canonicalize_url(resolved_url)
-        page = extract_page(html)
-        if len(page.body) < 40:
-            raise ValueError("Fetched page body is too short")
+        page = extract_page(html, fallback_title=item.title or "", url=resolved_url)
+        quality = assess_extraction(page)
+        if quality.status != "usable":
+            raise ValueError(
+                "Extracted page body is too short or not usable: "
+                + ", ".join(quality.reasons)
+            )
         session.rollback()
         item = lock_intake_for_mutation(
             session, item_id, action="retrying this search result"
@@ -1447,7 +1452,8 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item.status = "parsed"
         item.error = None
         item.canonical_url = resolved_url
-        item.title = page.title or None
+        item.title = page.title or item.title or None
+        item.published_at = item.published_at or page.published_at
         item.raw_snapshot = html
         item.raw_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
         item.extracted_snapshot = page.body
@@ -1456,7 +1462,13 @@ async def _retry_failed_fetch(session: Session, selection: SearchSelection) -> I
         item.candidate_relations = []
         item.updated_at = datetime.now(timezone.utc)
         review = dict(item.review or {})
-        review["material"] = {"resolved_url": resolved_url, "fetched_at": iso(fetched_at)}
+        review["material"] = extracted_material_metadata(
+            page,
+            resolved_url=resolved_url,
+            fetched_at=fetched_at,
+            fetch_method="safe_http_or_reader",
+            existing=review.get("material") or {},
+        )
         item.review = review
         session.commit()
         item = await generate_candidates(session, item)

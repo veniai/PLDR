@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,11 +19,13 @@ from .errors import (
     ArchivedIntakeError,
     IntakeMutationConflictError,
     IntakeScopeError,
+    ModelGenerationError,
     UnlinkedReviewTaskError,
 )
-from .extraction import canonicalize_url, content_hash, extract_page
+from .extraction import assess_extraction, canonicalize_url, content_hash, extract_page
 from .importers import fetch_public_text_response
 from .intake import (
+    extracted_material_metadata,
     generate_candidates,
     lock_intake_for_mutation,
     lock_intake_for_status_sync,
@@ -139,6 +142,15 @@ def new_batch_entry_id() -> str:
 
 def review_worker_identity() -> str:
     return f"{socket.gethostname()}:review:{uuid.uuid4().hex[:10]}"
+
+
+def model_task_lease_seconds() -> float:
+    """Cover every active worker's worst-case turn through the model limiter."""
+    model_timeout = max(1.0, float(os.getenv("LLM_TIMEOUT_SECONDS", "60")))
+    worker_slots = max(1, int(os.getenv("PLDR_COLLECTOR_CONCURRENCY", "4")))
+    model_slots = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "1")))
+    model_waves = (worker_slots + model_slots - 1) // model_slots
+    return model_timeout * model_waves + 60
 
 
 def record_action(
@@ -1031,6 +1043,8 @@ def _structured_task_error(
         "empty_or_short_body": ("extract", "没有提取到有效正文", "页面可访问，但正文为空或过短。", "页面可能依赖脚本、只有导航或登录提示。", "原网页未形成可审核候选。", "改用正文页，或直接粘贴/上传原文。", False, False),
         "fetch_timeout": ("fetch", "抓取网页超时", "来源未在限定时间内返回完整正文。", "来源响应过慢或网络暂时不稳定。", "这条资料仍在待处理箱。", "稍后只重试这条资料。", True, False),
         "network": ("fetch", "无法连接来源", "采集器没有建立稳定连接。", "可能是网络、DNS 或来源服务临时故障。", "尚未生成候选。", "稍后重试；持续失败时检查代理/DNS。", True, False),
+        "model_timeout": ("generate", "AI 分析超时", "原文已经保存，但本次 AI 分析没有按时完成。", "模型响应超过本次时限；系统没有用规则内容冒充 AI 结果。", "尚未生成候选，也未进入正式档案。", "点击“重新分析”；系统只重试 AI，不会重复抓取网页。", True, False),
+        "model_error": ("generate", "AI 分析失败", "原文已经保存，但模型没有返回可用的结构化结果。", "模型服务返回错误，或结果未通过格式与原文依据校验。", "尚未生成候选，也未进入正式档案。", "点击“重新分析”；系统只重试 AI，不会重复抓取网页。", True, False),
         "model_timeout_fallback": ("generate", "AI 超时，已生成规则候选", "原文已保存，系统生成了可人工审核的降级候选。", "外部模型超过本次请求时限。", "可以审核入档，但候选字段可能不完整。", "直接人工审核，或选择“只重试 AI”；不会重复抓取。", True, True),
         "model_error_fallback": ("generate", "AI 失败，已生成规则候选", "原文已保存，系统生成了可人工审核的降级候选。", "模型返回错误或结果不符合候选结构。", "可以审核入档，但候选字段可能不完整。", "直接人工审核，或选择“只重试 AI”；不会重复抓取。", True, True),
         "rule_fallback": ("generate", "已使用规则生成候选", "原文已保存，并由确定性规则生成候选。", "当前没有调用可用的外部 AI 模型。", "可以继续审核，但候选字段通常更少。", "继续人工审核；需要时配置模型后重新生成。", False, True),
@@ -1270,7 +1284,7 @@ def _placeholder_intake(result: SearchResult) -> IntakeItem:
         source_description=host,
         source_url=result.original_url,
         canonical_url=result.canonical_url,
-        title=None,
+        title=result.title or None,
         language=result.query_run.language,
         raw_snapshot="",
         raw_hash="",
@@ -2181,6 +2195,11 @@ def claim_next_review_task(
 
 
 def _task_error_class(exc: Exception) -> str:
+    if isinstance(exc, ModelGenerationError):
+        return "model_timeout" if exc.timed_out else "model_error"
+    from .importers import ReaderFallbackError
+    if isinstance(exc, ReaderFallbackError):
+        return _task_error_class(exc.direct_error)
     # Preserve the HTTP status while the exception object is still available;
     # a persisted message alone is not reliable enough for UI decisions.
     try:
@@ -2241,8 +2260,9 @@ def _mark_task_terminal(
 def _populate_intake_from_fetch(item: IntakeItem, fetched: Any) -> None:
     if not fetched.text or not fetched.text.strip():
         raise ValueError("Fetched page is empty")
-    page = extract_page(fetched.text)
-    if len(page.body) < 40:
+    page = extract_page(fetched.text, fallback_title=item.title or "", url=fetched.resolved_url)
+    quality = assess_extraction(page)
+    if quality.status != "usable":
         raise ValueError("Extracted page body is too short")
     item.status = "parsed"
     item.error = None
@@ -2251,7 +2271,8 @@ def _populate_intake_from_fetch(item: IntakeItem, fetched: Any) -> None:
     item.source_description = item.source_description or (
         urlparse(fetched.resolved_url).hostname or "Unknown source"
     )
-    item.title = page.title or None
+    item.title = page.title or item.title or None
+    item.published_at = item.published_at or page.published_at
     item.media_type = fetched.media_type
     item.size_bytes = fetched.size_bytes
     item.raw_snapshot = fetched.text
@@ -2261,12 +2282,15 @@ def _populate_intake_from_fetch(item: IntakeItem, fetched: Any) -> None:
     item.candidate_error = None
     item.candidate_relations = []
     review = dict(item.review or {})
-    review["material"] = {
-        **(review.get("material") or {}),
-        "resolved_url": fetched.resolved_url,
-        "fetched_at": iso(utcnow()),
-        "http_status": fetched.status_code,
-    }
+    review["material"] = extracted_material_metadata(
+        page,
+        resolved_url=fetched.resolved_url,
+        fetched_at=utcnow(),
+        fetch_method=getattr(fetched, "fetch_method", "direct_http"),
+        fetch_metadata=getattr(fetched, "metadata", {}),
+        existing=review.get("material") or {},
+        http_status=fetched.status_code,
+    )
     item.review = review
     item.updated_at = utcnow()
 
@@ -2498,7 +2522,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
                 raise RuntimeError("Review task disappeared during processing")
             _require_actionable_review_task(session, task)
 
-            if result is not None and (
+            if result is not None and not force_ai_retry and (
                 not item.raw_snapshot or item.status in {"queued", "failed"}
             ):
                 fetch_baseline = _review_intake_baseline(item)
@@ -2545,6 +2569,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
 
             task.status = "generating"
             task.updated_at = utcnow()
+            task.lease_expires_at = utcnow() + timedelta(seconds=model_task_lease_seconds())
             item.status = "parsed"
             item.updated_at = utcnow()
             record_action(
@@ -2572,11 +2597,13 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             _require_actionable_review_task(session, task)
 
             item = await generate_candidates(session, item)
-            fallback_error: str | None = None
             if item.status == "generation_failed":
-                fallback_error = item.candidate_error or "Configured model candidate generation failed"
-                from .intake import generate_deterministic_candidates
-                item = generate_deterministic_candidates(session, item, model_error=fallback_error)
+                message = item.candidate_error or "Configured model candidate generation failed"
+                lowered = message.lower()
+                raise ModelGenerationError(
+                    message,
+                    timed_out="timeout" in lowered or "deadline" in lowered or "timed out" in lowered,
+                )
             # Candidate generation commits independently. An analyst may have
             # confirmed/rejected/cancelled the item immediately afterward, so
             # restart and fence before writing the selection trace or terminal
@@ -2618,11 +2645,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
                 return task
             if item.status != "candidate_ready":
                 raise IntakeMutationConflictError("finalizing its review task")
-            fallback_error = (
-                item.candidate_error
-                if item.candidate_mode == "fallback-after-error"
-                else None
-            )
+            fallback_error = None
             task_payload = dict(task.payload_json or {})
             task_payload["candidate_mode"] = item.candidate_mode
             task.payload_json = task_payload
@@ -2787,7 +2810,7 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
                         )
                         session.commit()
                         return task
-                item.status = "failed"
+                item.status = "generation_failed" if isinstance(exc, ModelGenerationError) else "failed"
                 item.error = str(exc)[:4000]
                 item.updated_at = utcnow()
             if selection is not None:
@@ -2858,6 +2881,7 @@ def retry_review_task(
             raise ValueError(
                 "Restore the intake item to this investigation before retrying its review task"
             )
+    failed_model_retry = task.status == "failed" and task.error_class in {"model_timeout", "model_error"}
     fallback_retry = task.status == "ready" and task.error_class == "model_fallback"
     if task.status != "failed" and not fallback_retry:
         raise ValueError("Only failed tasks or model-fallback tasks can be retried")
@@ -2885,7 +2909,7 @@ def retry_review_task(
     task.lease_expires_at = None
     task.error_class = None
     task.error_message = None
-    payload["force_ai_retry"] = fallback_retry
+    payload["force_ai_retry"] = fallback_retry or failed_model_retry
     task.payload_json = payload
     task.updated_at = utcnow()
     record_action(
