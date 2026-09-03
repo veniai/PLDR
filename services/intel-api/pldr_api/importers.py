@@ -3,19 +3,23 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html as html_lib
+import ipaddress
 import os
-from dataclasses import dataclass
+import json
+import socket
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .extraction import canonicalize_url, content_hash, extract_page, normalize_text
+from .extraction import assess_extraction, canonicalize_url, content_hash, extract_page, normalize_text
 from .models import Document, Snapshot, Source
 from .security import validate_public_http_url
+from .security import UnsafeUrlError
 
 
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -34,6 +38,15 @@ class UnsupportedContentEncodingError(ValueError):
     """Raised before HTTPX can inflate an unbounded compressed response."""
 
 
+class ReaderFallbackError(RuntimeError):
+    """Raised when both the direct fetch and the optional public reader fail."""
+
+    def __init__(self, message: str, *, direct_error: Exception, reader_error: Exception) -> None:
+        self.direct_error = direct_error
+        self.reader_error = reader_error
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class FetchedPublicText:
     resolved_url: str
@@ -41,6 +54,25 @@ class FetchedPublicText:
     status_code: int
     media_type: str
     size_bytes: int
+    fetch_method: str = "direct_http"
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+def _reader_fallback_enabled() -> bool:
+    return os.getenv("PLDR_READER_FALLBACK_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _reader_fallback_allowed(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {403, 408, 425, 429} or exc.response.status_code >= 500
+    return False
 
 
 def _is_text_media_type(media_type: str) -> bool:
@@ -95,6 +127,37 @@ def _decode_text(content: bytes, response: object) -> str:
         return content.decode("utf-8", errors="replace")
 
 
+def _pinned_public_destination(url: str) -> tuple[str, str, str]:
+    """Resolve once, validate every answer, and return an IP-pinned request URL."""
+    validate_public_http_url(url, resolve=False)
+    parsed = urlsplit(url)
+    assert parsed.hostname is not None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        answers = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeUrlError(f"Unable to resolve host: {parsed.hostname}") from exc
+    addresses: list[str] = []
+    for answer in answers:
+        address = answer[4][0]
+        literal = ipaddress.ip_address(address)
+        if not literal.is_global:
+            raise UnsafeUrlError(f"Non-public address is blocked: {literal}")
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise UnsafeUrlError(f"Unable to resolve host: {parsed.hostname}")
+    address = addresses[0]
+    pinned_host = f"[{address}]" if ":" in address else address
+    explicit_port = parsed.port is not None
+    pinned_netloc = f"{pinned_host}:{port}" if explicit_port else pinned_host
+    host_header = parsed.hostname
+    if explicit_port:
+        host_header = f"{host_header}:{port}"
+    pinned_url = urlunsplit((parsed.scheme, pinned_netloc, parsed.path, parsed.query, ""))
+    return pinned_url, host_header, parsed.hostname
+
+
 def source_id_for(name: str, host: str) -> str:
     return "src_import_" + hashlib.sha1(f"{name}:{host}".encode("utf-8")).hexdigest()[:12]
 
@@ -133,6 +196,7 @@ async def fetch_public_text_response(
     max_redirects: int = 5,
     max_bytes: int | None = None,
     total_timeout_seconds: float | None = None,
+    prefer_readable_html: bool = True,
 ) -> FetchedPublicText:
     """Fetch bounded public text with redirect checks and one wall-clock deadline."""
     if max_bytes is None:
@@ -145,16 +209,126 @@ async def fetch_public_text_response(
         raise ValueError("total_timeout_seconds must be positive")
     try:
         async with asyncio.timeout(total_timeout_seconds):
-            return await _fetch_public_text_response(
-                url,
-                timeout_seconds=timeout_seconds,
-                max_redirects=max_redirects,
-                max_bytes=max_bytes,
-            )
+            try:
+                direct = await _fetch_public_text_response(
+                    url,
+                    timeout_seconds=timeout_seconds,
+                    max_redirects=max_redirects,
+                    max_bytes=max_bytes,
+                )
+                if (
+                    prefer_readable_html
+                    and "html" in direct.media_type
+                    and _reader_fallback_enabled()
+                ):
+                    quality = assess_extraction(
+                        extract_page(direct.text, url=direct.resolved_url)
+                    )
+                    if quality.status != "usable":
+                        try:
+                            return await _fetch_reader_html_response(
+                                url, timeout_seconds=timeout_seconds, max_bytes=max_bytes
+                            )
+                        except Exception as reader_error:
+                            direct_error = ValueError(
+                                "Extracted page body is not usable: "
+                                + ", ".join(quality.reasons)
+                            )
+                            raise ReaderFallbackError(
+                                "Direct extraction quality check and reader fallback both failed: "
+                                f"{direct_error}; reader: {reader_error}",
+                                direct_error=direct_error,
+                                reader_error=reader_error,
+                            ) from reader_error
+                return direct
+            except Exception as direct_error:
+                if not _reader_fallback_enabled() or not _reader_fallback_allowed(direct_error):
+                    raise
+                try:
+                    return await _fetch_reader_html_response(
+                        url,
+                        timeout_seconds=timeout_seconds,
+                        max_bytes=max_bytes,
+                    )
+                except Exception as reader_error:
+                    raise ReaderFallbackError(
+                        "Direct fetch and reader fallback both failed: "
+                        f"{direct_error}; reader: {reader_error}",
+                        direct_error=direct_error,
+                        reader_error=reader_error,
+                    ) from reader_error
     except TimeoutError as exc:
         raise httpx.ReadTimeout(
             f"Fetch exceeded {total_timeout_seconds:g} second total deadline"
         ) from exc
+
+
+async def _fetch_reader_html_response(
+    url: str,
+    *,
+    timeout_seconds: int,
+    max_bytes: int,
+) -> FetchedPublicText:
+    """Fetch rendered public HTML through an explicitly enabled Jina Reader adapter."""
+    target = canonicalize_url(url)
+    validate_public_http_url(target)
+    base_url = os.getenv("PLDR_READER_BASE_URL", "https://r.jina.ai").strip().rstrip("/")
+    api_key = os.getenv("PLDR_READER_API_KEY", "").strip()
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "X-Respond-With": "html",
+        "User-Agent": "PLDR-P0/0.1 reader-fallback",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False) as client:
+        async with client.stream("GET", f"{base_url}/{target}", headers=headers) as response:
+            response.raise_for_status()
+            _validate_identity_content_encoding(response)
+            _response_media_type(response, max_bytes)
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes(chunk_size=min(64 * 1024, max_bytes + 1)):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ResponseTooLargeError(
+                        f"Reader response exceeds {max_bytes} byte limit ({total} bytes received)"
+                    )
+                chunks.append(chunk)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        data = payload.get("data") if isinstance(payload, dict) else None
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Reader fallback returned invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Reader fallback returned no document data")
+    rendered_html = data.get("html")
+    if not isinstance(rendered_html, str) or not rendered_html.strip():
+        raise ValueError("Reader fallback returned no rendered HTML")
+    rendered_size = len(rendered_html.encode("utf-8"))
+    if rendered_size > max_bytes:
+        raise ResponseTooLargeError(
+            f"Rendered page exceeds {max_bytes} byte limit ({rendered_size} bytes received)"
+        )
+    resolved_url = canonicalize_url(str(data.get("url") or target))
+    validate_public_http_url(resolved_url)
+    upstream_status = data.get("httpStatus")
+    if isinstance(upstream_status, int) and upstream_status >= 400:
+        raise ValueError(f"Reader upstream returned HTTP {upstream_status}")
+    return FetchedPublicText(
+        resolved_url=resolved_url,
+        text=rendered_html,
+        status_code=int(upstream_status) if isinstance(upstream_status, int) else 200,
+        media_type="text/html",
+        size_bytes=rendered_size,
+        fetch_method="jina_reader",
+        metadata={
+            "title": data.get("title"),
+            "published_at": data.get("publishedTime"),
+            "description": data.get("description"),
+        },
+    )
 
 
 async def _fetch_public_text_response(
@@ -168,20 +342,27 @@ async def _fetch_public_text_response(
     async with httpx.AsyncClient(
         timeout=timeout_seconds,
         follow_redirects=False,
+        trust_env=False,
+        limits=httpx.Limits(max_keepalive_connections=0),
         headers={"User-Agent": "PLDR-P0/0.1", "Accept-Encoding": "identity"},
     ) as client:
         for _ in range(max_redirects + 1):
-            validate_public_http_url(current)
+            pinned_url, host_header, sni_hostname = _pinned_public_destination(current)
             # Real httpx clients are streamed so the limit is enforced while bytes arrive.
             # The buffered fallback keeps the small test doubles used by the P0 suite compatible.
             if callable(getattr(client, "stream", None)):
-                async with client.stream("GET", current) as response:
+                async with client.stream(
+                    "GET",
+                    pinned_url,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": sni_hostname},
+                ) as response:
                     if response.status_code in REDIRECT_STATUSES:
                         location = response.headers.get("location")
                         if not location:
                             raise ValueError("Redirect response is missing Location header")
                         current = canonicalize_url(urljoin(current, location))
-                        validate_public_http_url(current)
+                        validate_public_http_url(current, resolve=False)
                         continue
                     response.raise_for_status()
                     _validate_identity_content_encoding(response)
@@ -206,13 +387,17 @@ async def _fetch_public_text_response(
                         size_bytes=total,
                     )
             else:  # pragma: no cover - exercised by compatibility doubles in test_p0
-                response = await client.get(current)
+                response = await client.get(
+                    pinned_url,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": sni_hostname},
+                )
                 if response.status_code in REDIRECT_STATUSES:
                     location = response.headers.get("location")
                     if not location:
                         raise ValueError("Redirect response is missing Location header")
                     current = canonicalize_url(urljoin(current, location))
-                    validate_public_http_url(current)
+                    validate_public_http_url(current, resolve=False)
                     continue
                 response.raise_for_status()
                 _validate_identity_content_encoding(response)
@@ -276,7 +461,7 @@ async def import_url_document(
                 return existing
             canonical_url = resolved_url
 
-    page = extract_page(html, fallback_title=title or "")
+    page = extract_page(html, fallback_title=title or "", url=canonical_url)
     if len(page.body) < 40:
         raise ValueError("Extracted page body is too short")
 
@@ -307,7 +492,7 @@ async def import_url_document(
         canonical_url=canonical_url,
         title=page.title,
         body=page.body,
-        published_at=now,
+        published_at=page.published_at or now,
         fetched_at=now,
         language=language,
         content_hash=digest,

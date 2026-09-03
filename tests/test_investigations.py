@@ -403,11 +403,13 @@ class InvestigationWorkflowTest(unittest.TestCase):
             new=AsyncMock(side_effect=TimeoutError("model timeout")),
         ):
             asyncio.run(run_review_task_once(worker_id="review-worker"))
-        fallback = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
-        self.assertEqual(fallback["status"], "ready")
-        self.assertTrue(fallback["fallback_used"])
-        self.assertTrue(fallback["retryable"])
-        self.assertIn("model timeout", fallback["error"]["message"])
+        failed_analysis = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
+        self.assertEqual(failed_analysis["status"], "failed")
+        self.assertFalse(failed_analysis["fallback_used"])
+        self.assertTrue(failed_analysis["retryable"])
+        self.assertEqual(failed_analysis["error"]["code"], "model_timeout")
+        self.assertIn("model timeout", failed_analysis["error"]["message"])
+        self.assertEqual(failed_analysis["intake_item"]["candidates"], [])
 
         retry_ai = self.client.post(
             f"/pldr-api/v1/tasks/{task_ids[0]}/retry", json={"actor": "tester"}
@@ -774,6 +776,19 @@ class InvestigationWorkflowTest(unittest.TestCase):
             self.assertEqual(task.status, "rejected")
             self.assertEqual(selection.status, "rejected")
             self.assertEqual(selection.outcome, "rejected")
+
+    def test_model_task_lease_covers_every_limited_worker_wave(self):
+        from pldr_api.investigations import model_task_lease_seconds
+
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_TIMEOUT_SECONDS": "60",
+                "PLDR_COLLECTOR_CONCURRENCY": "8",
+                "LLM_MAX_CONCURRENCY": "1",
+            },
+        ):
+            self.assertEqual(model_task_lease_seconds(), 540)
 
     def test_expired_lease_is_recovered_and_logged(self):
         result_id = self.add_search_results(1)[0]

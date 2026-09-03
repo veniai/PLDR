@@ -789,6 +789,7 @@ class P1CollectionTest(unittest.TestCase):
             html: str | None,
             language: str,
             input_type: str = "web",
+            **_,
         ) -> IntakeItem:
             now = utcnow()
             item = IntakeItem(
@@ -1085,11 +1086,11 @@ class P1CollectionTest(unittest.TestCase):
             async def __aexit__(self, *_):
                 return False
 
-            async def get(self, *_):
+            async def get(self, *_, **__):
                 return self.response
 
         with patch(
-            "pldr_api.importers.validate_public_http_url", side_effect=lambda url: url
+            "pldr_api.importers.validate_public_http_url", side_effect=lambda url, resolve=True: url
         ), patch("pldr_api.importers.httpx.AsyncClient", BufferedClient):
             BufferedClient.response = BufferedResponse(b"binary", "application/octet-stream")
             with self.assertRaises(UnsupportedContentTypeError):
@@ -1129,11 +1130,11 @@ class P1CollectionTest(unittest.TestCase):
             async def __aexit__(self, *_):
                 return False
 
-            def stream(self, *_):
+            def stream(self, *_, **__):
                 return StreamContext()
 
         with patch(
-            "pldr_api.importers.validate_public_http_url", side_effect=lambda url: url
+            "pldr_api.importers.validate_public_http_url", side_effect=lambda url, resolve=True: url
         ), patch("pldr_api.importers.httpx.AsyncClient", StreamingClient):
             with self.assertRaises(ResponseTooLargeError):
                 asyncio.run(fetch_public_text_response("https://example.org/stream", max_bytes=64))
@@ -1150,7 +1151,7 @@ class P1CollectionTest(unittest.TestCase):
                     return CompressedStreamingResponse()
 
             class CompressedStreamingClient(StreamingClient):
-                def stream(self, *_):
+                def stream(self, *_, **__):
                     return CompressedStreamContext()
 
             with patch("pldr_api.importers.httpx.AsyncClient", CompressedStreamingClient):
@@ -1169,11 +1170,11 @@ class P1CollectionTest(unittest.TestCase):
                 return SlowStreamingResponse()
 
         class SlowStreamingClient(StreamingClient):
-            def stream(self, *_):
+            def stream(self, *_, **__):
                 return SlowStreamContext()
 
         with patch(
-            "pldr_api.importers.validate_public_http_url", side_effect=lambda url: url
+            "pldr_api.importers.validate_public_http_url", side_effect=lambda url, resolve=True: url
         ), patch("pldr_api.importers.httpx.AsyncClient", SlowStreamingClient):
             with self.assertRaises(httpx.TimeoutException):
                 asyncio.run(
@@ -1490,12 +1491,14 @@ class P1CollectionTest(unittest.TestCase):
 
     def test_collector_loop_starts_the_configured_bounded_worker_slots(self):
         worker = AsyncMock(return_value=None)
-        with patch("pldr_api.collector._worker_loop", new=worker):
-            asyncio.run(_run_loop(poll_seconds=0.25, concurrency=4))
-        self.assertEqual(worker.await_count, 4)
+        with patch.dict(os.environ, {"PLDR_COLLECTOR_CONCURRENCY": "4"}):
+            with patch("pldr_api.collector._worker_loop", new=worker):
+                asyncio.run(_run_loop(poll_seconds=0.25, concurrency=8))
+            self.assertEqual(os.environ["PLDR_COLLECTOR_CONCURRENCY"], "8")
+        self.assertEqual(worker.await_count, 8)
         self.assertEqual(
             {call.kwargs["slot"] for call in worker.await_args_list},
-            {1, 2, 3, 4},
+            {1, 2, 3, 4, 5, 6, 7, 8},
         )
         self.assertTrue(all(call.kwargs["poll_seconds"] == 0.25 for call in worker.await_args_list))
 

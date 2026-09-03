@@ -41,6 +41,7 @@ class IntakeMultiVersionTest(unittest.TestCase):
         title: str,
         fetched_at: str,
         collection: dict | None = None,
+        url: str = "https://versioned.example.org/report",
     ) -> str:
         from pldr_api.extraction import content_hash
         from pldr_api.intake import _base_item, _store_candidates, sha256_text
@@ -51,8 +52,8 @@ class IntakeMultiVersionTest(unittest.TestCase):
         item = _base_item(
             "collection" if collection is not None else "web",
             source_description="Versioned Example",
-            source_url="https://versioned.example.org/report",
-            canonical_url="https://versioned.example.org/report",
+            source_url=url,
+            canonical_url=url,
             title=title,
             language="en",
             raw_snapshot=body,
@@ -445,6 +446,42 @@ class IntakeMultiVersionTest(unittest.TestCase):
             self.assertNotIn("Terminal status: collection V2", rendered_old)
             self.assertIn("name='viewport'", rendered_old)
             self.assertIn("overflow-wrap:anywhere", rendered_old)
+
+    def test_updating_duplicate_family_root_does_not_create_reference_cycle(self):
+        from pldr_api.models import Document, Snapshot
+
+        body = "A sufficiently long identical dispatch remains stable across two public locations."
+        with self.Session() as session:
+            first_id = self._add_item(
+                session, body=body, title="Root report", fetched_at="2026-08-29T01:00:00Z"
+            )
+            _, first_result, _ = self._confirm(
+                session, first_id, self._request(title="Root report", body=body)
+            )
+            root_id = first_result["formal_object_ids"]["document"]
+            event_id = first_result["formal_object_ids"]["event"]
+
+            repost_id = self._add_item(
+                session, body=body, title="Repost", fetched_at="2026-08-29T02:00:00Z",
+                url="https://repost.example.org/report",
+            )
+            _, repost_result, _ = self._confirm(
+                session, repost_id, self._request(title="Repost", body=body)
+            )
+            repost = session.get(Document, repost_result["formal_object_ids"]["document"])
+            self.assertEqual(repost.metadata_json["duplicate_of_document_id"], root_id)
+
+            update_id = self._add_item(
+                session, body=body, title="Root report updated", fetched_at="2026-08-29T03:00:00Z"
+            )
+            _, update_result, _ = self._confirm(
+                session, update_id,
+                self._request(title="Root report updated", body=body, merge_event_id=event_id),
+            )
+            root = session.get(Document, root_id)
+            snapshot = session.get(Snapshot, update_result["formal_object_ids"]["snapshot"])
+            self.assertNotIn("duplicate_of_document_id", root.metadata_json)
+            self.assertNotIn("duplicate_of_document_id", snapshot.metadata_json)
 
 
 if __name__ == "__main__":

@@ -13,13 +13,14 @@ class ModelContractTest(unittest.TestCase):
         )
 
         contract = request["required_output"]
-        self.assertEqual(set(contract), {"event", "entities", "claims"})
+        self.assertEqual(set(contract), {"relevance", "relevance_reason", "event", "entities", "claims"})
         self.assertIn("summary", contract["event"])
         self.assertIn("event_time", contract["event"])
         self.assertIn("location_name", contract["event"])
         self.assertIn("entity_type", contract["entities"][0])
         self.assertIn("text", contract["claims"][0])
         self.assertIn("snippet", contract["claims"][0]["evidence"][0])
+        self.assertIn("paragraph_id", contract["claims"][0]["evidence"][0])
 
     def test_common_provider_aliases_are_normalized_without_losing_source_text(self):
         raw = {

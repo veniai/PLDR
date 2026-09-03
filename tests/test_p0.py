@@ -2110,7 +2110,7 @@ class P0Test(unittest.TestCase):
             async def __aexit__(self, *_):
                 return False
 
-            async def get(self, *_):
+            async def get(self, *_, **__):
                 return RedirectResponse()
 
         real_validator = validate_public_http_url

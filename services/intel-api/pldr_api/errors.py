@@ -46,3 +46,13 @@ class IntakeMutationConflictError(ValueError):
         super().__init__(
             f"This intake item changed while work was running. Reopen it before {action}."
         )
+
+
+class ModelGenerationError(RuntimeError):
+    """Raised when saved source material could not be analyzed by the model."""
+
+    code = "model_error"
+
+    def __init__(self, message: str, *, timed_out: bool = False) -> None:
+        self.timed_out = timed_out
+        super().__init__(message)

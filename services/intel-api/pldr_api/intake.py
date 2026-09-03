@@ -17,8 +17,18 @@ from sqlalchemy import DateTime, bindparam, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .errors import ArchivedIntakeError, IntakeMutationConflictError
-from .extraction import canonicalize_url, content_hash, extract_page, normalize_text
-from .importers import fetch_public_text
+from .extraction import (
+    assess_extraction,
+    canonicalize_url,
+    content_hash,
+    extract_page,
+    normalize_text,
+    normalize_structured_text,
+    near_duplicate_similarity,
+    paragraph_id_for_offset,
+    paragraph_spans,
+)
+from .importers import fetch_public_text, fetch_public_text_response
 from .llm import run_model_task
 from .models import (
     Claim,
@@ -30,6 +40,7 @@ from .models import (
     Evidence,
     IntakeCandidate,
     IntakeItem,
+    Investigation,
     InvestigationLink,
     ReviewTask,
     Snapshot,
@@ -77,6 +88,54 @@ def parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def extracted_material_metadata(
+    page: Any,
+    *,
+    resolved_url: str | None = None,
+    fetched_at: datetime | None = None,
+    fetch_method: str = "provided",
+    fetch_metadata: dict[str, Any] | None = None,
+    existing: dict[str, Any] | None = None,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    quality = assess_extraction(page)
+    return {
+        **(existing or {}),
+        "resolved_url": resolved_url,
+        "fetched_at": iso(fetched_at),
+        "http_status": http_status,
+        "fetch_method": fetch_method,
+        "fetch_metadata": fetch_metadata or {},
+        "extraction_method": page.extraction_method,
+        "quality": {
+            "status": quality.status,
+            "reasons": list(quality.reasons),
+            "text_chars": quality.text_chars,
+            "paragraph_count": quality.paragraph_count,
+            "link_ratio": quality.link_ratio,
+        },
+        "metadata": {
+            "author": page.author,
+            "site_name": page.site_name,
+            "canonical_url": page.canonical_url,
+            "published_at": iso(page.published_at),
+        },
+        "paragraphs": paragraph_metadata(page.body),
+    }
+
+
+def paragraph_metadata(text_value: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": paragraph.id,
+            "start_offset": paragraph.start_offset,
+            "end_offset": paragraph.end_offset,
+            "content_hash": content_hash(paragraph.text),
+        }
+        for paragraph in paragraph_spans(text_value)
+    ]
 
 
 def _normalized_new_event_fields(item: IntakeItem, request: IntakeConfirmationRequest) -> dict[str, Any]:
@@ -210,6 +269,36 @@ def _generation_baseline(item: IntakeItem) -> tuple[str, str | None]:
     return item.status, iso(item.updated_at)
 
 
+def _linked_topic_context(session: Session, item: IntakeItem) -> dict[str, Any] | None:
+    link = session.scalar(
+        select(InvestigationLink)
+        .where(
+            InvestigationLink.object_type == "intake",
+            InvestigationLink.object_id == item.id,
+        )
+        .order_by(InvestigationLink.created_at.asc())
+        .limit(1)
+    )
+    investigation = session.get(Investigation, link.investigation_id) if link else None
+    if investigation is None:
+        return None
+    settings = investigation.settings_json or {}
+    return {
+        "title": investigation.title,
+        "question": investigation.question,
+        "event_start_at": iso(investigation.event_start_at),
+        "event_end_at": iso(investigation.event_end_at),
+        "tracking_mode": investigation.tracking_mode,
+        "output_language": settings.get("report_language") or "zh-CN",
+    }
+
+
+def _model_snapshot(item: IntakeItem) -> str:
+    return "\n".join(
+        f"[{paragraph.id}] {paragraph.text}" for paragraph in paragraph_spans(item.extracted_snapshot)
+    )
+
+
 def _require_generation_baseline(
     item: IntakeItem,
     baseline: tuple[str, str | None],
@@ -226,20 +315,24 @@ async def generate_candidates(session: Session, item: IntakeItem) -> IntakeItem:
         raise ArchivedIntakeError("regenerating candidates")
     item_id = item.id
     baseline = _generation_baseline(item)
+    topic_context = _linked_topic_context(session, item)
     payload = {
         "intake_item_id": item.id,
         "input_type": item.input_type,
+        "topic_context": topic_context,
         "known_fields": {
             "title": _clean_known(item.title),
             "source_description": _clean_known(item.source_description),
             "source_url": _clean_known(item.source_url),
             "published_at": iso(item.published_at),
         },
-        "snapshot": item.extracted_snapshot,
+        "snapshot": _model_snapshot(item),
         "output_contract": {
-            "event": "one object; use null for unknown fields",
-            "entities": "list; use [] when unknown",
-            "claims": "list of concise paraphrased propositions with evidence arrays; claim.text must never copy evidence verbatim, while every evidence.snippet must be an exact snapshot substring",
+            "relevance": "relevant, uncertain, or not_relevant to topic_context; use relevant when topic_context is null",
+            "event": "at most one main event; use null for unknown fields",
+            "entities": "at most 8 key entities; use [] when unknown",
+            "claims": "at most 5 concise Chinese propositions; each has 1-2 evidence items; claim.text must never copy evidence verbatim",
+            "evidence": "snippet is exact source text without the [Pnnn] marker; paragraph_id is the matching marker",
         },
     }
     try:
@@ -420,7 +513,21 @@ def _store_candidates(
             machine_data=_candidate_machine_data(event, mode),
         )
     )
+    relevance = result.get("relevance")
+    if relevance == "unclear":
+        relevance = "uncertain"
+    if relevance not in {"relevant", "uncertain", "not_relevant"}:
+        relevance = "relevant"
+    review = dict(item.review or {})
+    review["analysis"] = {
+        "relevance": relevance,
+        "model": model_name,
+        "candidate_mode": mode,
+        "reason": result.get("relevance_reason"),
+    }
+    item.review = review
     raw_entities = result.get("entities") if isinstance(result.get("entities"), list) else []
+    raw_entities = raw_entities[:8] if relevance != "not_relevant" else []
     for idx, entity in enumerate(raw_entities):
         if not isinstance(entity, dict):
             continue
@@ -444,6 +551,7 @@ def _store_candidates(
     claims = result.get("claims")
     if not isinstance(claims, list):
         claims = []
+    claims = claims[:5] if relevance != "not_relevant" else []
     evidence_index = 0
     for claim_idx, claim in enumerate(claims):
         if not isinstance(claim, dict):
@@ -452,6 +560,7 @@ def _store_candidates(
         evidence_items = claim.get("evidence")
         if not isinstance(evidence_items, list):
             evidence_items = []
+        evidence_items = evidence_items[:2]
         claim_text = claim.get("text")
         if isinstance(claim_text, str) and any(
             isinstance(evidence.get("snippet"), str)
@@ -482,20 +591,54 @@ def _store_candidates(
             evidence_index += 1
             key = f"evidence:{evidence_index}"
             snippet = evidence.get("snippet")
+            supplied_paragraph_id = evidence.get("paragraph_id")
             validation_error = None
             start_offset = end_offset = -1
             if not isinstance(snippet, str) or not snippet:
                 validation_error = "Evidence snippet is missing"
             else:
-                start = item.extracted_snapshot.find(snippet)
-                if start < 0:
+                occurrences: list[tuple[int, int]] = []
+                cursor = 0
+                while True:
+                    found = item.extracted_snapshot.find(snippet, cursor)
+                    if found < 0:
+                        break
+                    occurrences.append((found, found + len(snippet)))
+                    cursor = found + max(1, len(snippet))
+                if not occurrences:
                     validation_error = "Evidence snippet is not an exact substring of the complete snapshot"
                 else:
-                    start_offset, end_offset = start, start + len(snippet)
+                    start_offset, end_offset = occurrences[0]
+                    if isinstance(supplied_paragraph_id, str):
+                        matching = next(
+                            (
+                                offsets
+                                for offsets in occurrences
+                                if paragraph_id_for_offset(
+                                    item.extracted_snapshot, offsets[0], offsets[1]
+                                )
+                                == supplied_paragraph_id
+                            ),
+                            None,
+                        )
+                        if matching is not None:
+                            start_offset, end_offset = matching
+            paragraph_id = (
+                paragraph_id_for_offset(item.extracted_snapshot, start_offset, end_offset)
+                if start_offset >= 0
+                else None
+            )
+            if (
+                validation_error is None
+                and supplied_paragraph_id is not None
+                and supplied_paragraph_id != paragraph_id
+            ):
+                validation_error = "Evidence paragraph_id does not match the exact quote location"
             fields = {
                 "snippet": snippet if isinstance(snippet, str) else "",
                 "start_offset": start_offset,
                 "end_offset": end_offset,
+                "paragraph_id": paragraph_id,
                 "stance": evidence.get("stance") or "context",
                 "strength": evidence.get("strength", 0.5),
             }
@@ -541,22 +684,42 @@ async def submit_web_intake(
         "source_description": (source_name or "").strip(),
     }
     try:
+        fetched_remotely = html is None
         canonical_url = canonicalize_url(requested_url)
         validate_public_http_url(canonical_url, resolve=html is None)
         resolved_url = canonical_url
         fetched_at = utcnow()
+        fetch_method = "provided_html"
+        fetched_metadata: dict[str, object] = {}
         if html is None:
             resolved_url, html = await fetch_public_text(canonical_url)
             resolved_url = canonicalize_url(resolved_url)
+            fetch_method = "safe_http_or_reader"
             canonical_url = resolved_url
         if not html or not html.strip():
             raise ValueError("Fetched page is empty")
-        page = extract_page(html, fallback_title=title or "")
-        if len(page.body) < 40:
-            raise ValueError("Extracted page body is too short")
-        known_title = (title or page.title or "").strip() or None
+        page = extract_page(html, fallback_title=title or "", url=resolved_url)
+        quality = assess_extraction(page)
+        if (fetched_remotely and quality.status != "usable") or len(page.body) < 40:
+            raise ValueError(
+                "Extracted page body is too short or not usable: " + ", ".join(quality.reasons)
+            )
+        known_title = (page.title or title or str(fetched_metadata.get("title") or "")).strip() or None
+        reader_published_at = fetched_metadata.get("published_at")
+        published_at = page.published_at
+        if published_at is None and isinstance(reader_published_at, str):
+            try:
+                published_at = parse_datetime(reader_published_at)
+            except ValueError:
+                published_at = None
         review: dict[str, Any] = {
-            "material": {"resolved_url": resolved_url, "fetched_at": iso(fetched_at)}
+            "material": extracted_material_metadata(
+                page,
+                resolved_url=resolved_url,
+                fetched_at=fetched_at,
+                fetch_method=fetch_method,
+                fetch_metadata=fetched_metadata,
+            )
         }
         if review_extra:
             review.update(review_extra)
@@ -566,6 +729,7 @@ async def submit_web_intake(
             source_url=requested_url,
             canonical_url=canonical_url,
             title=known_title,
+            published_at=published_at,
             language=language,
             raw_snapshot=html,
             raw_hash=sha256_text(html),
@@ -613,7 +777,7 @@ async def submit_text_intake(
         "language": request.language,
     }
     try:
-        text = normalize_text(request.text)
+        text = normalize_structured_text(request.text)
         if len(text) < 10:
             raise ValueError("Pasted text is empty or too short")
         if len(request.source_description.strip()) < 3:
@@ -626,7 +790,12 @@ async def submit_text_intake(
             raw_hash=sha256_text(request.text),
             extracted_snapshot=text,
             extracted_hash=content_hash(text),
-            review={"material": {"input_method": "browser-paste"}},
+            review={
+                "material": {
+                    "input_method": "browser-paste",
+                    "paragraphs": paragraph_metadata(text),
+                }
+            },
             **common,
         )
         session.add(item)
@@ -713,6 +882,10 @@ async def submit_file_intake(
             raw_snapshot = failure_values["raw_snapshot"]
             raw_hash = failure_values["raw_hash"]
             raw_encoding = "base64"
+            material_metadata = {
+                "fetch_method": "uploaded_pdf",
+                "paragraphs": paragraph_metadata(extracted),
+            }
         else:
             try:
                 raw_text = data.decode("utf-8")
@@ -729,8 +902,16 @@ async def submit_file_intake(
             if suffix in {".html", ".htm"}:
                 page = extract_page(raw_text)
                 extracted = page.body
+                material_metadata = extracted_material_metadata(
+                    page,
+                    fetch_method="uploaded_html",
+                )
             else:
-                extracted = normalize_text(raw_text)
+                extracted = normalize_structured_text(raw_text)
+                material_metadata = {
+                    "fetch_method": "uploaded_file",
+                    "paragraphs": paragraph_metadata(extracted),
+                }
         if len(extracted) < 10:
             raise ValueError("File contains no extractable text")
         item = _base_item(
@@ -742,7 +923,7 @@ async def submit_file_intake(
             raw_hash=raw_hash,
             extracted_snapshot=extracted,
             extracted_hash=content_hash(extracted),
-            review={"material": {"raw_encoding": raw_encoding}},
+            review={"material": {**material_metadata, "raw_encoding": raw_encoding}},
             **common,
         )
         session.add(item)
@@ -1098,6 +1279,7 @@ def serialize_intake_summary(
         "updated_at": iso(item.updated_at),
         **_intake_archive_payload(item, session),
         "search": item.review.get("external_search") or None,
+        "analysis": item.review.get("analysis") or None,
         "candidate_generation": {
             "mode": item.candidate_mode,
             "model": item.candidate_model,
@@ -1147,6 +1329,7 @@ def serialize_intake(
         },
         "search": item.review.get("external_search") or None,
         "search_history": item.review.get("external_search_history") or [],
+        "analysis": item.review.get("analysis") or None,
         "candidate_generation": {
             "mode": item.candidate_mode,
             "model": item.candidate_model,
@@ -1496,6 +1679,8 @@ def _snapshot_metadata(
     item: IntakeItem,
     *,
     duplicate_of_document_id: str | None = None,
+    similar_to_document_id: str | None = None,
+    similarity: float | None = None,
 ) -> dict[str, Any]:
     metadata = {
         "intake_item_id": item.id,
@@ -1513,7 +1698,66 @@ def _snapshot_metadata(
     }
     if duplicate_of_document_id is not None:
         metadata["duplicate_of_document_id"] = duplicate_of_document_id
+        metadata["duplicate_kind"] = "exact"
+    elif similar_to_document_id is not None:
+        metadata["similar_to_document_id"] = similar_to_document_id
+        metadata["similarity"] = round(similarity or 0.0, 4)
+        metadata["duplicate_kind"] = "near"
     return metadata
+
+
+def _near_duplicate_document(
+    session: Session, item: IntakeItem, *, exclude_id: str | None = None
+) -> tuple[Document | None, float]:
+    if len(normalize_text(item.extracted_snapshot)) < 250:
+        return None, 0.0
+    threshold = float(os.getenv("PLDR_NEAR_DUPLICATE_THRESHOLD", "0.82"))
+    query = select(Document).order_by(Document.fetched_at.desc()).limit(200)
+    if exclude_id:
+        query = query.where(Document.id != exclude_id)
+    best: Document | None = None
+    best_score = 0.0
+    for document in session.scalars(query):
+        score = near_duplicate_similarity(item.extracted_snapshot, document.body or "")
+        if score > best_score:
+            best, best_score = document, score
+    return (best, best_score) if best is not None and best_score >= threshold else (None, best_score)
+
+
+def _duplicate_root(session: Session, document: Document) -> Document:
+    current = document
+    seen = {current.id}
+    while True:
+        parent_id = (current.metadata_json or {}).get("duplicate_of_document_id")
+        if not isinstance(parent_id, str) or parent_id in seen:
+            return current
+        parent = session.get(Document, parent_id)
+        if parent is None:
+            return current
+        seen.add(parent.id)
+        current = parent
+
+
+def _exact_duplicate_document(
+    session: Session, content_digest: str, *, exclude_id: str | None = None
+) -> Document | None:
+    candidates = list(
+        session.scalars(
+            select(Document)
+            .where(Document.content_hash == content_digest)
+            .order_by(Document.fetched_at.asc(), Document.id.asc())
+        )
+    )
+    returned: set[str] = set()
+    for candidate in candidates:
+        if candidate.id == exclude_id:
+            continue
+        root = _duplicate_root(session, candidate)
+        if root.id == exclude_id or root.id in returned:
+            continue
+        returned.add(root.id)
+        return root
+    return None
 
 
 def _aware_datetime(value: datetime) -> datetime:
@@ -1587,10 +1831,22 @@ def _updated_document_metadata(
         else:
             metadata.pop("latest_collection", None)
         duplicate_of = (snapshot.metadata_json or {}).get("duplicate_of_document_id")
+        similar_to = (snapshot.metadata_json or {}).get("similar_to_document_id")
         if duplicate_of is not None:
             metadata["duplicate_of_document_id"] = duplicate_of
+            metadata["duplicate_kind"] = "exact"
+            metadata.pop("similar_to_document_id", None)
+            metadata.pop("similarity", None)
+        elif similar_to is not None:
+            metadata["similar_to_document_id"] = similar_to
+            metadata["similarity"] = (snapshot.metadata_json or {}).get("similarity")
+            metadata["duplicate_kind"] = "near"
+            metadata.pop("duplicate_of_document_id", None)
         else:
             metadata.pop("duplicate_of_document_id", None)
+            metadata.pop("similar_to_document_id", None)
+            metadata.pop("similarity", None)
+            metadata.pop("duplicate_kind", None)
     return metadata
 
 
@@ -1603,13 +1859,11 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         # Evidence points to exactly that capture. Review order must not make an older
         # collector version replace a newer formal head.
         current_head = _latest_document_snapshot(existing)
-        duplicate = session.scalar(
-            select(Document)
-            .where(
-                Document.id != existing.id,
-                Document.content_hash == item.extracted_hash,
-            )
-            .order_by(Document.fetched_at.asc())
+        duplicate = _exact_duplicate_document(
+            session, item.extracted_hash, exclude_id=existing.id
+        )
+        similar, similarity = (None, 0.0) if duplicate else _near_duplicate_document(
+            session, item, exclude_id=existing.id
         )
         snapshot_id = "snap_intake_" + hashlib.sha1(
             f"{existing.id}:{item.id}:{item.extracted_hash}".encode("utf-8")
@@ -1624,6 +1878,8 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
             metadata_json=_snapshot_metadata(
                 item,
                 duplicate_of_document_id=duplicate.id if duplicate else None,
+                similar_to_document_id=similar.id if similar else None,
+                similarity=similarity,
             ),
         )
         session.add(snapshot)
@@ -1648,11 +1904,8 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         return existing
     source = _get_or_create_intake_source(session, item)
     document_id = "doc_intake_" + hashlib.sha1(f"{item.id}:{item.extracted_hash}".encode("utf-8")).hexdigest()[:14]
-    duplicate = session.scalar(
-        select(Document)
-        .where(Document.content_hash == item.extracted_hash)
-        .order_by(Document.fetched_at.asc())
-    )
+    duplicate = _exact_duplicate_document(session, item.extracted_hash)
+    similar, similarity = (None, 0.0) if duplicate else _near_duplicate_document(session, item)
     snapshot_id = "snap_intake_" + hashlib.sha1(document_id.encode("utf-8")).hexdigest()[:16]
     metadata = {
         "intake_item_id": item.id,
@@ -1670,6 +1923,11 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
         metadata["latest_collection"] = item.review["collection"]
     if duplicate is not None:
         metadata["duplicate_of_document_id"] = duplicate.id
+        metadata["duplicate_kind"] = "exact"
+    elif similar is not None:
+        metadata["similar_to_document_id"] = similar.id
+        metadata["similarity"] = round(similarity, 4)
+        metadata["duplicate_kind"] = "near"
     document = Document(
         id=document_id,
         source_id=source.id,
@@ -1697,6 +1955,8 @@ def _create_formal_document(session: Session, item: IntakeItem) -> Document:
             metadata_json=_snapshot_metadata(
                 item,
                 duplicate_of_document_id=duplicate.id if duplicate else None,
+                similar_to_document_id=similar.id if similar else None,
+                similarity=similarity,
             ),
         )
     )

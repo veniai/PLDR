@@ -1835,7 +1835,7 @@ function investigationPanelHeading(eyebrow, title, description, actions = "") {
 }
 
 function taskFailureActionLabel(error) {
-  if (["generate", "model"].includes(error?.stage)) return "重新生成草稿";
+  if (["generate", "model"].includes(error?.stage)) return "重新分析";
   if (["fetch", "parse", "extract"].includes(error?.stage)) return "重试抓取";
   return "重试处理";
 }
@@ -1843,7 +1843,7 @@ function taskFailureActionLabel(error) {
 function taskProgressText(stage) {
   return ({
     ready: "草稿已经准备好，核对并明确确认前不会写入正式档案。",
-    generating: "原始材料已保存，正在准备可核对草稿。",
+    generating: "原始材料已保存，AI 正在分析正文。",
     fetching: "正在保存原始页面；搜索摘要不会进入证据链。",
     queued: "任务已进入处理队列，尚未开始抓取。",
     accepted: "已由人工确认并保存到正式档案。",
@@ -1881,7 +1881,7 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
     } else if (canRetryTask) {
       primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-task" data-task-id="${escapeHtml(taskId)}">${escapeHtml(taskFailureActionLabel(normalizedError))}</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.status === "generation_failed") {
-      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">重新生成草稿</button>`;
+      primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-intake" data-intake-id="${escapeHtml(intakeId)}">重新分析</button>`;
     } else if (retryAllowed && stage === "failed" && intake?.search?.result_id) {
       primaryAction = `<button class="btn btn-ghost warning" type="button" data-investigation-action="retry-search" data-search-result-id="${escapeHtml(intake.search.result_id)}" data-intake-id="${escapeHtml(intakeId)}">重试抓取</button>`;
     } else if (stage === "failed") {
@@ -3290,6 +3290,7 @@ function renderDocumentsTab(event) {
     <div class="document-list">
       ${documents.map((document, index) => {
         const duplicate = document.metadata?.duplicate_of_document_id;
+        const similar = document.metadata?.similar_to_document_id;
         return `
           <article class="document-card">
             <span class="document-index">${String(index + 1).padStart(2, "0")}</span>
@@ -3298,7 +3299,7 @@ function renderDocumentsTab(event) {
                 <span>${escapeHtml(document.source.name)}</span>
                 <span>T${document.source.reliability_tier}</span>
                 <span>${escapeHtml(document.language)}</span>
-                ${duplicate ? '<span class="duplicate-chip">转载折叠</span>' : ""}
+                ${duplicate ? '<span class="duplicate-chip">重复来源</span>' : similar ? '<span class="duplicate-chip">相似报道</span>' : ""}
               </div>
                 <h3>${escapeHtml(document.title || "未知标题")}</h3>
               <p>${formatDate(document.published_at, true)} · 抓取 ${formatDate(document.fetched_at, true)}</p>
@@ -4523,6 +4524,7 @@ function renderIntakeList() {
       <span class="intake-type">${escapeHtml(LABELS.inputType[item.input_type] || item.input_type)}</span>
       <strong>${escapeHtml(intakeTitle(item))}</strong>
       <small>${state.intakeVisibility === "archived" || recordIsArchived(item) ? "已删除" : escapeHtml(LABELS.intakeStatus[item.status] || item.status)} · ${formatDate(item.archived_at || item.removed_at || item.created_at, true)}</small>
+      ${item.analysis?.relevance ? `<em>${escapeHtml(({ relevant: "与专题相关", uncertain: "相关性待确认", not_relevant: "可能与专题无关" })[item.analysis.relevance] || item.analysis.relevance)}</em>` : ""}
       ${item.error ? `<em>${escapeHtml(normalizeOperationalError(item.error, item.status === "generation_failed" ? "generate" : "fetch").title)}</em>` : ""}
       </button>
     </div>
@@ -4646,7 +4648,7 @@ function renderIntakeDetail(item = null) {
   const normalizedItemError = errorValue ? normalizeOperationalError(errorValue, errorStage) : null;
   const recordActions = renderIntakeRecordActions(item);
   const errorAction = normalizedItemError?.retryable !== false && item.status === "generation_failed"
-    ? '<button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新生成草稿</button>'
+    ? '<button class="btn btn-ghost" type="button" data-intake-action="regenerate">重新分析</button>'
     : normalizedItemError?.retryable !== false && item.status === "failed" && item.search?.result_id
       ? `<button class="btn btn-ghost warning" type="button" data-intake-action="retry-search" data-search-result-id="${escapeHtml(item.search.result_id)}">重试抓取</button>`
       : "";
