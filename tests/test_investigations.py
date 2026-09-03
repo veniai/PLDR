@@ -29,6 +29,7 @@ class InvestigationWorkflowTest(unittest.TestCase):
         global enqueue_target_run, run_once, FetchedPublicText
         global DEMO_INVESTIGATION_ID, UNCLASSIFIED_INVESTIGATION_ID
         global bootstrap_legacy_investigations, recover_expired_review_task_leases
+        global recover_retryable_model_tasks
         global run_review_task_once, CollectionTarget, DecisionLog, Event, IntakeItem
         global InvestigationLink, ReviewTask, SearchQueryRun, SearchResult
         global BackendSearchResponse, SearchHit, seed_database
@@ -41,6 +42,7 @@ class InvestigationWorkflowTest(unittest.TestCase):
             UNCLASSIFIED_INVESTIGATION_ID,
             bootstrap_legacy_investigations,
             recover_expired_review_task_leases,
+            recover_retryable_model_tasks,
             run_review_task_once,
         )
         from pldr_api.main import app
@@ -349,7 +351,7 @@ class InvestigationWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(unclassified.json()["investigation"]["kind"], "system")
 
-    def test_worker_isolates_failures_and_model_error_has_reviewable_retryable_fallback(self):
+    def test_worker_isolates_fetch_failure_and_auto_retries_model_failure(self):
         result_ids = self.add_search_results(2)
         investigation_id = self.create_investigation()
         queued = self.client.post(
@@ -395,7 +397,14 @@ class InvestigationWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(retried.status_code, 200, retried.text)
         first_fetch = self.fetched("https://public.example.org/1", "first")
-        with patch(
+        retry_env = {
+            "LLM_API_KEY": "configured-for-test",
+            "LLM_BASE_URL": "https://model.example.test/v1",
+            "LLM_MODEL_NAME": "test-model",
+            "PLDR_MODEL_AUTO_RETRY_ATTEMPTS": "3",
+            "PLDR_MODEL_AUTO_RETRY_BASE_SECONDS": "0",
+        }
+        with patch.dict(os.environ, retry_env), patch(
             "pldr_api.investigations.fetch_public_text_response",
             new=AsyncMock(return_value=first_fetch),
         ), patch(
@@ -403,19 +412,15 @@ class InvestigationWorkflowTest(unittest.TestCase):
             new=AsyncMock(side_effect=TimeoutError("model timeout")),
         ):
             asyncio.run(run_review_task_once(worker_id="review-worker"))
-        failed_analysis = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
-        self.assertEqual(failed_analysis["status"], "failed")
-        self.assertFalse(failed_analysis["fallback_used"])
-        self.assertTrue(failed_analysis["retryable"])
-        self.assertEqual(failed_analysis["error"]["code"], "model_timeout")
-        self.assertIn("model timeout", failed_analysis["error"]["message"])
-        self.assertEqual(failed_analysis["intake_item"]["candidates"], [])
+        waiting_analysis = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
+        self.assertEqual(waiting_analysis["status"], "queued")
+        self.assertTrue(waiting_analysis["waiting_for_model_retry"])
+        self.assertFalse(waiting_analysis["retryable"])
+        self.assertEqual(waiting_analysis["model_retry"]["retry_number"], 1)
+        self.assertEqual(waiting_analysis["intake_item"]["status"], "parsed")
+        self.assertEqual(waiting_analysis["intake_item"]["candidates"], [])
 
-        retry_ai = self.client.post(
-            f"/pldr-api/v1/tasks/{task_ids[0]}/retry", json={"actor": "tester"}
-        )
-        self.assertEqual(retry_ai.status_code, 200, retry_ai.text)
-        with patch(
+        with patch.dict(os.environ, retry_env), patch(
             "pldr_api.investigations.fetch_public_text_response",
             new=AsyncMock(side_effect=AssertionError("AI-only retry must reuse snapshot")),
         ), patch(
@@ -425,6 +430,7 @@ class InvestigationWorkflowTest(unittest.TestCase):
             asyncio.run(run_review_task_once(worker_id="review-worker"))
         recovered = self.client.get(f"/pldr-api/v1/tasks/{task_ids[0]}").json()
         self.assertEqual(recovered["status"], "ready")
+        self.assertFalse(recovered["waiting_for_model_retry"])
         self.assertFalse(recovered["fallback_used"])
         self.assertTrue(recovered["degraded"])
         self.assertEqual(recovered["degradation"]["code"], "rule_fallback")
@@ -473,6 +479,104 @@ class InvestigationWorkflowTest(unittest.TestCase):
             ["confirmed_reuse_event"],
         )
         self.assertIsNone(confirmed_detail["events"][0]["start_at"])
+
+    def test_model_auto_retry_waits_for_backoff_and_eventually_stops(self):
+        result_id = self.add_search_results(1)[0]
+        investigation_id = self.create_investigation("Bounded model retry")
+        queued = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={"result_ids": [result_id], "investigation_id": investigation_id},
+        )
+        task_id = queued.json()["tasks"][0]["id"]
+        retry_env = {
+            "LLM_API_KEY": "configured-for-test",
+            "LLM_BASE_URL": "https://model.example.test/v1",
+            "LLM_MODEL_NAME": "test-model",
+            "PLDR_MODEL_AUTO_RETRY_ATTEMPTS": "1",
+            "PLDR_MODEL_AUTO_RETRY_BASE_SECONDS": "300",
+        }
+        timed_out = AsyncMock(side_effect=TimeoutError("model timeout"))
+        with patch.dict(os.environ, retry_env), patch(
+            "pldr_api.investigations.fetch_public_text_response",
+            new=AsyncMock(return_value=self.fetched("https://public.example.org/1")),
+        ), patch("pldr_api.intake.run_model_task", new=timed_out):
+            asyncio.run(run_review_task_once(worker_id="bounded-retry-worker"))
+            self.assertIsNone(
+                asyncio.run(run_review_task_once(worker_id="bounded-retry-worker")),
+                "a future retry must not be claimed before its backoff expires",
+            )
+        self.assertEqual(timed_out.await_count, 1)
+
+        waiting = self.client.get(f"/pldr-api/v1/tasks/{task_id}").json()
+        self.assertEqual(waiting["status"], "queued")
+        self.assertTrue(waiting["waiting_for_model_retry"])
+        self.assertFalse(waiting["retryable"])
+        self.assertEqual(waiting["attempt_number"], 2)
+
+        with SessionLocal() as session:
+            task = session.get(ReviewTask, task_id)
+            task.queued_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.commit()
+        with patch.dict(os.environ, retry_env), patch(
+            "pldr_api.investigations.fetch_public_text_response",
+            new=AsyncMock(side_effect=AssertionError("model retry must reuse saved text")),
+        ), patch(
+            "pldr_api.intake.run_model_task",
+            new=AsyncMock(side_effect=TimeoutError("model timeout again")),
+        ):
+            asyncio.run(run_review_task_once(worker_id="bounded-retry-worker"))
+
+        failed = self.client.get(f"/pldr-api/v1/tasks/{task_id}").json()
+        self.assertEqual(failed["status"], "failed")
+        self.assertFalse(failed["waiting_for_model_retry"])
+        self.assertEqual(failed["error"]["code"], "model_timeout")
+        self.assertEqual(failed["intake_item"]["status"], "generation_failed")
+
+    def test_legacy_model_fallback_is_recovered_into_queue_once(self):
+        result_id = self.add_search_results(1)[0]
+        investigation_id = self.create_investigation("Legacy model retry recovery")
+        queued = self.client.post(
+            "/pldr-api/v1/search/select",
+            json={"result_ids": [result_id], "investigation_id": investigation_id},
+        )
+        task_id = queued.json()["tasks"][0]["id"]
+        with patch(
+            "pldr_api.investigations.fetch_public_text_response",
+            new=AsyncMock(return_value=self.fetched("https://public.example.org/1")),
+        ), patch(
+            "pldr_api.intake.run_model_task",
+            new=AsyncMock(return_value={"mode": "fallback"}),
+        ):
+            asyncio.run(run_review_task_once(worker_id="legacy-fallback-worker"))
+
+        with SessionLocal() as session:
+            task = session.get(ReviewTask, task_id)
+            item = session.get(IntakeItem, task.intake_item_id)
+            item.candidate_mode = "fallback-after-error"
+            item.candidate_error = "Model request exceeded 90 second total deadline"
+            task.error_class = "model_fallback"
+            task.error_message = item.candidate_error
+            session.commit()
+
+        retry_env = {
+            "LLM_API_KEY": "configured-for-test",
+            "LLM_BASE_URL": "https://model.example.test/v1",
+            "LLM_MODEL_NAME": "test-model",
+            "PLDR_MODEL_AUTO_RETRY_ATTEMPTS": "3",
+            "PLDR_MODEL_AUTO_RETRY_BASE_SECONDS": "60",
+        }
+        with patch.dict(os.environ, retry_env):
+            with SessionLocal() as session:
+                self.assertEqual(recover_retryable_model_tasks(session), 1)
+            with SessionLocal() as session:
+                self.assertEqual(recover_retryable_model_tasks(session), 0)
+
+        recovered = self.client.get(f"/pldr-api/v1/tasks/{task_id}").json()
+        self.assertEqual(recovered["status"], "queued")
+        self.assertTrue(recovered["waiting_for_model_retry"])
+        self.assertTrue(recovered["model_retry"]["recovered_legacy_fallback"])
+        self.assertEqual(recovered["intake_item"]["status"], "parsed")
+        self.assertEqual(recovered["intake_item"]["candidates"], [])
 
     def test_worker_preserves_rejection_committed_after_candidate_generation(self):
         from pldr_api.intake import reject_intake

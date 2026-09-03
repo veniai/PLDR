@@ -160,9 +160,12 @@ LLM_TIMEOUT_SECONDS=60
 LLM_MAX_CONCURRENCY=1
 LLM_EXTRACTION_MAX_TOKENS=1400
 LLM_REASONING_EFFORT=
+PLDR_MODEL_AUTO_RETRY_ATTEMPTS=3
+PLDR_MODEL_AUTO_RETRY_BASE_SECONDS=60
+PLDR_MODEL_AUTO_RETRY_MAX_SECONDS=900
 ```
 
-业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。网页正文使用 Trafilatura 清理；可选 Jina Reader 只在安全直抓失败或正文质量不足后启用。代理网络可配置 HTTPS DoH 独立验证公开目标后再走 Reader，不能通过 Reader 绕过非公网地址保护。模型失败保留原文并允许只重试分析，不再生成容易误解的伪成功草稿。
+业务层只调用统一任务：标题规范化、事件摘要、实体地点抽取、主张证据抽取、采集箱候选抽取和报告草稿。所有候选仍需人工确认。网页正文使用 Trafilatura 清理；可选 Jina Reader 只在安全直抓失败或正文质量不足后启用。代理网络可配置 HTTPS DoH 独立验证公开目标后再走 Reader，不能通过 Reader 绕过非公网地址保护。模型超时或临时失败时保留原文、按退避时间自动重新排队，默认自动重试 3 次；重试期间不要求用户操作，也不生成容易误解的伪成功草稿。多次重试仍失败后才进入需要处理，并允许用户只重试分析。
 
 ## 当前边界
 
