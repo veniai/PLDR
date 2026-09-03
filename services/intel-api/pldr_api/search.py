@@ -136,7 +136,7 @@ def assess_topic_relevance(
     publication_time = result.published_at or _explicit_result_publication_time(
         result.title,
         result.snippet,
-    )
+    ) or _explicit_result_url_time(result.canonical_url)
     event_start = investigation.event_start_at
     if publication_time is not None and event_start is not None:
         if publication_time.tzinfo is None:
@@ -149,7 +149,7 @@ def assess_topic_relevance(
                 "label": "时间范围待核对",
                 "matched_terms": matched,
                 "reason": (
-                    f"材料发布于 {publication_time.date().isoformat()}，早于专题事件范围 "
+                    f"搜索结果标注日期为 {publication_time.date().isoformat()}，早于专题事件范围 "
                     f"{event_start.date().isoformat()}；保留在线索列表，不自动进入待处理。"
                 ),
                 "time_scope": {
@@ -458,6 +458,36 @@ def _explicit_result_publication_time(*values: str) -> datetime | None:
     return None
 
 
+_EXPLICIT_RESULT_URL_DATE_PATTERNS = (
+    re.compile(
+        r"(?<!\d)(?P<year>20\d{2})[-_/](?P<month>\d{1,2})[-_/]"
+        r"(?P<day>\d{1,2})(?!\d)"
+    ),
+    re.compile(
+        r"(?<!\d)(?P<year>20\d{2})(?P<month>\d{2})(?P<day>\d{2})(?!\d)"
+    ),
+)
+
+
+def _explicit_result_url_time(value: str) -> datetime | None:
+    """Read a complete calendar date embedded in a public result path."""
+    path = urlsplit(value).path[:900]
+    for pattern in _EXPLICIT_RESULT_URL_DATE_PATTERNS:
+        match = pattern.search(path)
+        if match is None:
+            continue
+        try:
+            return datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            continue
+    return None
+
+
 def _normalize_hit(raw: dict[str, Any], *, provider: str, engine: str | None = None) -> SearchHit:
     original_url, canonical_url, fingerprint, host = _parse_public_result_url(raw.get("url"))
     meta_url = raw.get("meta_url") if isinstance(raw.get("meta_url"), dict) else {}
@@ -469,7 +499,9 @@ def _normalize_hit(raw: dict[str, Any], *, provider: str, engine: str | None = N
     snippet = _safe_text(raw.get("description") or raw.get("content"), 2000)
     published_at = _parse_datetime(
         raw.get("publishedDate") or raw.get("page_age") or raw.get("timestamp")
-    ) or _explicit_result_publication_time(title, snippet)
+    ) or _explicit_result_publication_time(title, snippet) or _explicit_result_url_time(
+        canonical_url
+    )
     return SearchHit(
         original_url=original_url,
         canonical_url=canonical_url,
@@ -824,7 +856,7 @@ def serialize_search_result(
     publication_time = result.published_at or _explicit_result_publication_time(
         result.title,
         result.snippet,
-    )
+    ) or _explicit_result_url_time(result.canonical_url)
     return {
         "id": result.id,
         "query_run_id": result.query_run_id,

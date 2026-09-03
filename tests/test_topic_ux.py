@@ -470,6 +470,10 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("据当前仅有一个独立来源支持的材料", report_page.text)
         self.assertIn("The public dispatch outcome-one states", report_page.text)
         self.assertNotIn("SHA-256", report_page.text)
+        self.assertNotIn(
+            'target="_blank" rel="noopener">查看保存的原文',
+            report_page.text,
+        )
         baseline = self.client.get(f"/pldr-api/v1/investigations/{topic}/outcome").json()
         self.assertEqual(baseline["changes"]["basis"], "latest_report")
         self.assertEqual(baseline["changes"]["new_event_count"], 0)
@@ -820,6 +824,9 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("async function startInitialTopicCollection", source)
         self.assertIn("function renderOutcomeHero", source)
         self.assertIn("function renderOutcomeFindings", source)
+        self.assertIn("function outcomeSourceSearchSeed", source)
+        self.assertIn('data-investigation-find-source="${escapeHtml(outcomeSourceSearchSeed', source)
+        self.assertIn("if (keyword && autoStart)", source)
         self.assertIn('.filter((event) => event.status === "confirmed")', source)
         self.assertIn("investigationOutcome: (id)", source)
         self.assertIn('data-intake-action="accept"', source)
@@ -836,6 +843,17 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("其余有效内容仍可直接加入专题", source)
         self.assertIn("该事件发生在专题设定的开始时间之前", source)
         self.assertIn("系统结合材料年份补全", source)
+        self.assertIn("window.location.assign(result.url)", source)
+        outcome_findings = source[
+            source.index("function renderOutcomeFindings"):
+            source.index("function renderOutcomeTimeline")
+        ]
+        outcome_reports = source[
+            source.index("function renderOutcomeReportHistory"):
+            source.index("function renderInvestigationOutcomes")
+        ]
+        self.assertNotIn('target="_blank"', outcome_findings)
+        self.assertNotIn('target="_blank"', outcome_reports)
         self.assertIn('data-investigation-action="archive-topic"', source)
         self.assertIn('data-investigation-action="restore-topic"', source)
         self.assertIn('ACTIVE_INTAKE_STATUSES.has(item.status)', source)

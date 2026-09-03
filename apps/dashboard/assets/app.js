@@ -1800,7 +1800,7 @@ function renderOutcomeFindings(outcome) {
         <summary><span class="claim-status">${escapeHtml(LABELS.claim[claim.status] || claim.status || "缺少依据")}</span><strong>${escapeHtml(claim.text || "未填写关键信息")}</strong><small>${Number(claim.source_verification?.independent_source_count || 0)} 个独立来源</small></summary>
         <div class="outcome-finding-body">
           <p class="outcome-finding-event">来自事件：${escapeHtml(claim.event_title || "未知事件")}<button class="text-btn" type="button" data-investigation-event="${escapeHtml(claim.event_id || "")}">打开事件档案</button></p>
-          ${evidence.length ? evidence.map((item) => `<blockquote class="outcome-evidence ${escapeHtml(item.stance || "context")}"><p>${escapeHtml(item.snippet || "")}</p><footer><span>${escapeHtml(item.document?.source?.name || "来源未知")} · ${formatDate(item.document?.published_at)}</span><a href="${escapeHtml(withEventContext(item.snapshot_url || item.document?.snapshot_url, claim.event_id))}" target="_blank" rel="noopener">查看保存的原文 ↗</a></footer></blockquote>`).join("") : '<p class="outcome-gap-note">这条信息还没有连接可定位的原文依据。</p>'}
+          ${evidence.length ? evidence.map((item) => `<blockquote class="outcome-evidence ${escapeHtml(item.stance || "context")}"><p>${escapeHtml(item.snippet || "")}</p><footer><span>${escapeHtml(item.document?.source?.name || "来源未知")} · ${formatDate(item.document?.published_at)}</span><a href="${escapeHtml(withEventContext(item.snapshot_url || item.document?.snapshot_url, claim.event_id))}">查看保存的原文</a></footer></blockquote>`).join("") : '<p class="outcome-gap-note">这条信息还没有连接可定位的原文依据。</p>'}
           ${claim.status === "single_source" || claim.status === "unverified" ? `<button class="btn btn-ghost" type="button" data-investigation-find-source="${escapeHtml(claim.text || claim.event_title || "")}">搜索更多来源</button>` : ""}
         </div>
       </details>`;
@@ -1819,7 +1819,16 @@ function renderOutcomeTimeline(outcome) {
   </section>`;
 }
 
-function renderOutcomeEntitiesAndGaps(outcome) {
+function outcomeSourceSearchSeed(investigation, outcome) {
+  const gap = (outcome.information_gaps || []).find((item) => String(item || "").trim());
+  const claim = (outcome.claims || []).find((item) => ["single_source", "unverified", "contested"].includes(item.status));
+  return String(gap || claim?.text || investigation?.question || investigation?.title || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+function renderOutcomeEntitiesAndGaps(investigation, outcome) {
   const entities = outcome.entities || [];
   const gaps = [...new Set((outcome.information_gaps || []).map((item) => String(item).trim()).filter(Boolean))];
   const counts = outcome.counts || {};
@@ -1829,7 +1838,7 @@ function renderOutcomeEntitiesAndGaps(outcome) {
     </section>
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>未知与下一步</h3><p>明确说出还不知道什么</p></div></div>
       <ul class="outcome-gap-list">${gaps.map((gap) => `<li>${escapeHtml(gap)}</li>`).join("")}${Number(counts.single_source_claims || 0) ? `<li>${Number(counts.single_source_claims)} 条关键信息目前只有一个独立来源。</li>` : ""}${Number(counts.claims_without_evidence || 0) ? `<li>${Number(counts.claims_without_evidence)} 条关键信息缺少可定位的原文依据。</li>` : ""}${Number(counts.unresolved_claims || 0) ? `<li>${Number(counts.unresolved_claims)} 条关键信息存在冲突或缺少依据。</li>` : ""}</ul>
-      <button class="btn btn-ghost" type="button" data-investigation-action="search">搜索更多来源</button>
+      <button class="btn btn-ghost" type="button" data-investigation-find-source="${escapeHtml(outcomeSourceSearchSeed(investigation, outcome))}">搜索更多来源</button>
       ${!gaps.length && !Number(counts.single_source_claims || 0) && !Number(counts.claims_without_evidence || 0) && !Number(counts.unresolved_claims || 0) ? '<p class="outcome-gap-note">当前没有登记明确缺口；这不等于信息已经完整。</p>' : ""}
     </section>
   </div>`;
@@ -1840,7 +1849,7 @@ function renderOutcomeReportHistory(investigation, outcome) {
   const canGenerate = Number(outcome.counts?.events || 0) > 0;
   return `<section class="workbench-surface outcome-reports">
     <div class="workbench-surface-head"><div><h3>报告与历史版本</h3><p>报告只使用生成时已经确认的正式成果</p></div><button class="btn btn-primary" type="button" data-investigation-action="generate-report" ${canGenerate ? "" : "disabled"}>生成当前报告</button></div>
-    ${reports.length ? `<div class="outcome-report-list">${reports.map((report, index) => `<article><div><span>${index ? "历史版本" : "最新版本"}</span><h4>${escapeHtml(report.title || `PLDR 专题报告：${investigation.title}`)}</h4><p>${formatDate(report.generated_at || report.created_at, true)} · ${escapeHtml(report.event_count ?? "未知")} 个事件 · ${escapeHtml(report.evidence_count ?? "未知")} 条证据</p></div>${report.url ? `<a class="btn btn-ghost" href="${escapeHtml(report.url)}" target="_blank" rel="noopener">打开报告 ↗</a>` : ""}</article>`).join("")}</div>` : '<div class="investigation-empty"><strong>尚未生成报告</strong><p>专题成果会持续显示；生成报告后会留下可回看的冻结版本。</p></div>'}
+    ${reports.length ? `<div class="outcome-report-list">${reports.map((report, index) => `<article><div><span>${index ? "历史版本" : "最新版本"}</span><h4>${escapeHtml(report.title || `PLDR 专题报告：${investigation.title}`)}</h4><p>${formatDate(report.generated_at || report.created_at, true)} · ${escapeHtml(report.event_count ?? "未知")} 个事件 · ${escapeHtml(report.evidence_count ?? "未知")} 条证据</p></div>${report.url ? `<a class="btn btn-ghost" href="${escapeHtml(report.url)}">打开报告</a>` : ""}</article>`).join("")}</div>` : '<div class="investigation-empty"><strong>尚未生成报告</strong><p>专题成果会持续显示；生成报告后会留下可回看的冻结版本。</p></div>'}
   </section>`;
 }
 
@@ -1851,7 +1860,7 @@ function renderInvestigationOutcomes(investigation) {
     ${renderOutcomeChanges(outcome)}
     ${renderOutcomeFindings(outcome)}
     ${renderOutcomeTimeline(outcome)}
-    ${renderOutcomeEntitiesAndGaps(outcome)}
+    ${renderOutcomeEntitiesAndGaps(investigation, outcome)}
     ${renderOutcomeReportHistory(investigation, outcome)}
   </div>`;
 }
@@ -2148,7 +2157,7 @@ function renderInvestigationClaims(investigation) {
       <article class="investigation-claim ${escapeHtml(claim.status || "unverified")}">
         <span class="task-stage ${claim.status === "confirmed" ? "ready" : claim.status === "contested" ? "generating" : "completed"}">${escapeHtml(LABELS.claim[claim.status] || claim.status || "待核实")}</span>
         <h3>${escapeHtml(claim.text)}</h3>
-        ${(claim.evidence || []).map((evidence) => `<blockquote>${escapeHtml(evidence.snippet)}<footer><span>${escapeHtml(evidence.document?.source?.name || "来源未知")} · ${formatDate(evidence.document?.published_at)}</span><a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document?.snapshot_url, event.id))}" target="_blank" rel="noopener">打开固定快照 ↗</a></footer></blockquote>`).join("") || '<p class="muted">该主张尚未连接原文证据。</p>'}
+        ${(claim.evidence || []).map((evidence) => `<blockquote>${escapeHtml(evidence.snippet)}<footer><span>${escapeHtml(evidence.document?.source?.name || "来源未知")} · ${formatDate(evidence.document?.published_at)}</span><a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document?.snapshot_url, event.id))}">打开固定快照</a></footer></blockquote>`).join("") || '<p class="muted">该主张尚未连接原文证据。</p>'}
         <footer><span>事件：${escapeHtml(event.title)}</span><button class="text-btn" type="button" data-investigation-event="${escapeHtml(event.id)}">打开事件档案</button></footer>
       </article>`).join("") : detailErrors.length ? '<div class="investigation-empty"><strong>部分正式事件详情读取失败</strong><p>没有用候选补齐主张与证据；请按上方错误提示重试。</p></div>' : '<div class="investigation-empty"><strong>该专题还没有已确认主张</strong><p>候选不会提前出现在这里。</p></div>'}</div>`;
 }
@@ -2169,7 +2178,7 @@ function renderInvestigationReports(investigation) {
   const canGenerate = eventsForInvestigation(investigation).length > 0;
   return `${investigationPanelHeading("REPORT ARTIFACTS", "专题报告", "只根据专题已确认对象生成；生成成功后才显示真实报告链接。", `<button class="btn btn-primary" type="button" data-investigation-action="generate-report" ${canGenerate ? "" : "disabled"}>▣ 生成专题报告</button>`)}
     <section class="workbench-surface"><div class="workbench-surface-head"><div><h3>已生成报告</h3><p>${investigation.sync_mode === "local" ? "本页索引仅保存在此浏览器，报告文件仍来自服务端" : "服务端返回的报告制品"}</p></div><span class="count-badge">${reports.length}</span></div>
-      ${reports.length ? reports.map((report) => `<article class="report-card"><div><h3>${escapeHtml(report.title || `PLDR 专题报告：${investigation.title}`)}</h3><p>${formatDate(report.created_at || report.generated_at, true)} · ${escapeHtml(report.evidence_count ?? "未知")} 条证据</p></div>${report.url ? `<a class="btn btn-ghost" href="${escapeHtml(report.url)}" target="_blank" rel="noopener">打开报告 ↗</a>` : '<span class="muted">未返回可打开链接</span>'}</article>`).join("") : `<div class="investigation-empty"><strong>尚未生成专题报告</strong><p>${canGenerate ? "不会用模板报告冒充生成结果。" : "请先人工确认至少一个事件；候选不能用于生成正式专题报告。"}</p></div>`}
+      ${reports.length ? reports.map((report) => `<article class="report-card"><div><h3>${escapeHtml(report.title || `PLDR 专题报告：${investigation.title}`)}</h3><p>${formatDate(report.created_at || report.generated_at, true)} · ${escapeHtml(report.evidence_count ?? "未知")} 条证据</p></div>${report.url ? `<a class="btn btn-ghost" href="${escapeHtml(report.url)}">打开报告</a>` : '<span class="muted">未返回可打开链接</span>'}</article>`).join("") : `<div class="investigation-empty"><strong>尚未生成专题报告</strong><p>${canGenerate ? "不会用模板报告冒充生成结果。" : "请先人工确认至少一个事件；候选不能用于生成正式专题报告。"}</p></div>`}
     </section>`;
 }
 
@@ -2652,7 +2661,7 @@ async function generateInvestigationReport() {
     toast(`专题报告已生成，共 ${result.evidence_count ?? "未知"} 条证据。`, "success");
     if (isServerInvestigation(investigation)) await loadInvestigationWorkspace(investigation.id, { quiet: true });
     else renderInvestigationPage();
-    if (result.url) window.open(result.url, "_blank", "noopener");
+    if (result.url) window.location.assign(result.url);
   } catch (error) {
     toast(`专题报告生成失败：${error.message}`, "error", 7000);
   } finally {
@@ -3374,7 +3383,7 @@ function renderClaimsTab(event) {
             <blockquote>${escapeHtml(evidence.snippet)}</blockquote>
             <footer>
               <span>${escapeHtml(evidence.document.source.name)} · ${formatDate(evidence.document.published_at)}</span>
-              <a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document.snapshot_url, event.id))}" target="_blank" rel="noopener">查看证据快照 ↗</a>
+              <a href="${escapeHtml(withEventContext(evidence.snapshot_url || evidence.document.snapshot_url, event.id))}">查看证据快照</a>
             </footer>
           </article>`).join("") : '<p class="muted">该主张尚未连接原文证据。</p>'}
       </div>
@@ -3413,7 +3422,7 @@ function renderDocumentsTab(event) {
               <small>来源与原文快照已保存</small>
             </div>
             <div class="document-actions">
-              <a href="${escapeHtml(withEventContext(document.snapshot_url, event.id))}" target="_blank" rel="noopener">证据快照</a>
+              <a href="${escapeHtml(withEventContext(document.snapshot_url, event.id))}">证据快照</a>
               ${document.canonical_url ? `<a href="${escapeHtml(document.canonical_url)}" target="_blank" rel="noopener noreferrer">原始链接</a>` : ""}
             </div>
           </article>`;
@@ -3519,7 +3528,7 @@ async function generateReport(eventIds = null) {
       }),
     });
     toast(`简报已生成，共 ${result.evidence_count} 条证据。`, "success");
-    window.open(result.url, "_blank", "noopener");
+    window.location.assign(result.url);
     return result;
   } catch (error) {
     toast(`简报生成失败：${error.message}`, "error");
@@ -4949,7 +4958,7 @@ function renderConfirmedRecord(item, final) {
         <button class="btn btn-primary" type="button" data-intake-action="open-event" data-event-target="${escapeHtml(eventId)}" ${eventId ? "" : "disabled"}>查看正式事件</button>
         <button class="btn btn-ghost" type="button" data-intake-action="continue-review">继续下一条</button>
       </div>
-      ${snapshotId ? `<a href="/snapshots/${escapeHtml(snapshotId)}" target="_blank" rel="noopener">查看保存的原文 ↗</a>` : ""}
+      ${snapshotId ? `<a href="/snapshots/${escapeHtml(snapshotId)}">查看保存的原文</a>` : ""}
     </section>`;
 }
 
