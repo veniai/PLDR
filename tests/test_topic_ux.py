@@ -827,6 +827,14 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertIn("function outcomeSourceSearchSeed", source)
         self.assertIn('data-investigation-find-source="${escapeHtml(outcomeSourceSearchSeed', source)
         self.assertIn("if (keyword && autoStart)", source)
+        search_modal = source[
+            source.index("async function openExternalSearchModal"):
+            source.index("function closeExternalSearchModal")
+        ]
+        self.assertLess(
+            search_modal.index("switchSearchWorkspaceContext(destinationId)"),
+            search_modal.index("const openSerial = state.searchRequestSerial"),
+        )
         self.assertIn('.filter((event) => event.status === "confirmed")', source)
         self.assertIn("investigationOutcome: (id)", source)
         self.assertIn('data-intake-action="accept"', source)
