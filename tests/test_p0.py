@@ -876,6 +876,92 @@ class P0Test(unittest.TestCase):
         self.assertEqual(partial_event["event_time_source_text"], "8月11日")
         self.assertEqual(partial_event["event_time_basis"], "source_partial_date_with_document_year")
 
+        cued_day_sentence = (
+            "据央视新闻报道，当地时间11日，也门海岸警卫队表示一艘商船在曼德海峡遇袭。"
+        )
+
+        async def omitted_date_model_task(task: str, payload: dict):
+            return {
+                "mode": "api",
+                "model": "test-model",
+                "result": {
+                    "event": {
+                        "title": "曼德海峡商船遇袭",
+                        "summary": "一艘商船在曼德海峡遇袭。",
+                        "event_time": None,
+                        "location_name": "曼德海峡",
+                    },
+                    "entities": [],
+                    "claims": [{
+                        "text": "也门海岸警卫队表示一艘商船在曼德海峡遇袭。",
+                        "evidence": [{
+                            "snippet": cued_day_sentence,
+                            "stance": "supports",
+                            "strength": 0.8,
+                        }],
+                    }],
+                },
+            }
+
+        with patch("pldr_api.intake.run_model_task", side_effect=omitted_date_model_task):
+            cued_day_response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": cued_day_sentence,
+                    "source_description": "公开报道",
+                    "title": "模型漏填日期兜底测试",
+                    "published_at": "2026-08-12T00:00:00Z",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(cued_day_response.status_code, 200, cued_day_response.text)
+        cued_day_event = self.candidate_map(
+            cued_day_response.json()["intake_item"]
+        )["event"]["machine"]["fields"]
+        self.assertEqual(cued_day_event["event_time"], "2026-08-11T00:00:00Z")
+        self.assertEqual(cued_day_event["event_time_source_text"], "当地时间11日")
+        self.assertEqual(
+            cued_day_event["event_time_basis"],
+            "source_cued_day_with_document_month",
+        )
+
+        uncued_day_sentence = "公开材料列出11日的值班记录，但没有说明事件发生时间。"
+
+        async def uncued_date_model_task(task: str, payload: dict):
+            result = await omitted_date_model_task(task, payload)
+            result["result"]["event"] = {
+                "title": "值班记录",
+                "summary": "材料列出值班记录。",
+                "event_time": None,
+                "location_name": None,
+            }
+            result["result"]["claims"] = [{
+                "text": "材料列出11日的值班记录。",
+                "evidence": [{
+                    "snippet": uncued_day_sentence,
+                    "stance": "context",
+                    "strength": 0.5,
+                }],
+            }]
+            return result
+
+        with patch("pldr_api.intake.run_model_task", side_effect=uncued_date_model_task):
+            uncued_day_response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": uncued_day_sentence,
+                    "source_description": "公开材料",
+                    "title": "无日期提示不推断测试",
+                    "published_at": "2026-08-12T00:00:00Z",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(uncued_day_response.status_code, 200, uncued_day_response.text)
+        uncued_day_event = self.candidate_map(
+            uncued_day_response.json()["intake_item"]
+        )["event"]["machine"]["fields"]
+        self.assertIsNone(uncued_day_event["event_time"])
+
         ranged_sentence = "专题关注范围为2026年8月15日至今，具体事件时间尚未核实。"
 
         async def ranged_model_task(task: str, payload: dict):

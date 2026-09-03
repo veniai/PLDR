@@ -1804,7 +1804,7 @@ function renderOutcomeFindings(outcome) {
           ${claim.status === "single_source" || claim.status === "unverified" ? `<button class="btn btn-ghost" type="button" data-investigation-find-source="${escapeHtml(claim.text || claim.event_title || "")}">搜索更多来源</button>` : ""}
         </div>
       </details>`;
-    }).join("")}</div>` : '<div class="investigation-empty"><strong>还没有可展示的关键发现</strong><p>事件可以先被确认；主张和证据仍保持为空，不会自动编造。</p></div>'}
+    }).join("")}</div>` : '<div class="investigation-empty"><strong>还没有可展示的关键发现</strong><p>事件可以先确认；暂时没有关键信息或原文依据时会保持为空，不会自动编造。</p></div>'}
   </section>`;
 }
 
@@ -2297,7 +2297,7 @@ function syncInvestigationModeFields() {
 
 function suggestedInvestigationQuestion(title) {
   const cleaned = String(title || "").trim();
-  return cleaned ? `关于“${cleaned}”，目前有哪些得到公开资料支持的关键事件、参与方、主张和证据？` : "";
+  return cleaned ? `关于“${cleaned}”，目前发生了什么，哪些信息已有公开资料支持，还有哪些需要继续确认？` : "";
 }
 
 function syncInvestigationStarterSuggestions() {
