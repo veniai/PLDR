@@ -4735,6 +4735,8 @@ function candidateConfirmationDefaults(item) {
 async function handleIntakeBatch(action) {
   const ids = state.intakeItems.filter((item) => state.selectedIntakeIds.has(item.id) && item.status === "candidate_ready").map((item) => item.id);
   if (!ids.length || state.intakeActionBusy) return;
+  const workspaceId = state.intakeScopeInvestigationId
+    || (isServerInvestigation(activeInvestigation()) ? state.activeInvestigationId : null);
   const verb = action === "accept" ? "加入专题" : "忽略";
   if (!window.confirm(`确认批量${verb}选中的 ${ids.length} 条材料？`)) return;
   setIntakeActionBusy(true);
@@ -4769,6 +4771,9 @@ async function handleIntakeBatch(action) {
     }
     await refreshData({ keepSelection: false, quiet: true });
     await refreshInvestigationDirectory();
+    if (workspaceId && state.activeInvestigationId === workspaceId) {
+      await loadInvestigationWorkspace(workspaceId, { quiet: true });
+    }
     await refreshIntakeData(null);
     toast(failures.length ? `已${verb} ${completed} 条，${failures.length} 条需要单独处理。` : `已批量${verb} ${completed} 条。`, failures.length ? "warning" : "success", 7000);
     if (failures.length) console.warn("Batch intake failures", failures);
@@ -5725,6 +5730,10 @@ async function handleIntakeAction(action, domEvent = null) {
       toast("处理已撤销，未写入正式区。", "success");
     }
     await refreshData({ keepSelection: true, quiet: true });
+    await refreshInvestigationDirectory();
+    if (actionScope && state.activeInvestigationId === actionScope) {
+      await loadInvestigationWorkspace(actionScope, { quiet: true });
+    }
     if (!actionIsCurrent()) return;
     await refreshIntakeData(null);
     setIntakeMobileStep(selectedIntakeItem() ? 1 : 0);
