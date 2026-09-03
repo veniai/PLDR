@@ -14,6 +14,64 @@ TEMPLATE_DIR=Path(__file__).resolve().parent/"templates"
 REPORT_DIR=Path(os.getenv("PLDR_REPORT_DIR",str(REPO_ROOT/"reports"))).expanduser().resolve(); REPORT_DIR.mkdir(parents=True,exist_ok=True)
 env=Environment(loader=FileSystemLoader(TEMPLATE_DIR),autoescape=select_autoescape(["html","xml"]),trim_blocks=True,lstrip_blocks=True)
 
+
+def compose_current_answer(
+    findings: list[dict[str, Any]],
+    *,
+    assessment: str | None = None,
+    fallback_summary: str | None = None,
+) -> tuple[str, str]:
+    """Create a useful answer without overstating single-source material."""
+    judgement = (assessment or "").strip()
+    if judgement:
+        return judgement, "formal_assessment"
+
+    def texts(*statuses: str) -> list[str]:
+        allowed = set(statuses)
+        return [
+            str(item.get("text") or "").strip()
+            for item in findings
+            if item.get("status") in allowed and str(item.get("text") or "").strip()
+        ]
+
+    def joined(items: list[str]) -> str:
+        return "；".join(
+            item.rstrip(" \t\r\n。；;")
+            for item in items[:3]
+            if item.rstrip(" \t\r\n。；;")
+        )
+
+    supported = texts("confirmed", "supported")
+    if supported:
+        return f"{joined(supported)}。", "supported_claims"
+    single_source = texts("single_source")
+    if single_source:
+        return (
+            f"据当前仅有一个独立来源支持的材料：{joined(single_source)}。"
+            "这些信息尚待更多独立来源印证。",
+            "single_source_claims",
+        )
+    contested = texts("contested")
+    if contested:
+        return (
+            f"现有来源说法存在冲突：{joined(contested)}。",
+            "contested_claims",
+        )
+    grounded = [
+        str(item.get("text") or "").strip()
+        for item in findings
+        if item.get("evidence_count") and str(item.get("text") or "").strip()
+    ]
+    if grounded:
+        return (
+            f"现有材料记录了：{joined(grounded)}。仍需继续核实。",
+            "grounded_unverified_claims",
+        )
+    summary = (fallback_summary or "").strip()
+    if summary:
+        return f"已确认事件记录：{summary}", "confirmed_event_summary"
+    return "现有材料还不足以形成专题结论，请先补充来源或处理冲突。", "insufficient_evidence"
+
 def safe_slug(value:str)->str:
     value=re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+","-",value).strip("-"); return value[:50] or "pldr-brief"
 
@@ -97,8 +155,11 @@ def build_report(
         ),
     )[1]
     latest_assessment=latest_event.get("assessment") or {}
-    supported_findings=[item["text"] for item in key_findings if item["status"] in {"confirmed", "supported"}]
-    current_answer=(current_answer_override or "").strip() or latest_assessment.get("judgement") or ("；".join(supported_findings[:3]) if supported_findings else "现有材料还不足以形成专题结论，请先补充来源或处理冲突。")
+    current_answer, _ = compose_current_answer(
+        key_findings,
+        assessment=(current_answer_override or "").strip() or latest_assessment.get("judgement"),
+        fallback_summary=latest_event.get("summary"),
+    )
     html=env.get_template("report.html").render(
         title=report_title,
         generated_at=generated_at.isoformat().replace("+00:00","Z"),

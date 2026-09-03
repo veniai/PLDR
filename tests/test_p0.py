@@ -832,6 +832,50 @@ class P0Test(unittest.TestCase):
             "2026-08-15T00:00:00Z",
         )
 
+        partial_sentence = "也门政府表示，胡塞武装周二（8月11日）对红海商船发动袭击。"
+
+        async def partial_date_model_task(task: str, payload: dict):
+            return {
+                "mode": "api",
+                "model": "test-model",
+                "result": {
+                    "event": {
+                        "title": "红海商船遇袭",
+                        "summary": "胡塞武装袭击了一艘红海商船。",
+                        # Providers often normalize this value even though the
+                        # source itself carries only month/day wording.
+                        "event_time": "2026年8月11日",
+                        "location_name": "红海",
+                    },
+                    "entities": [],
+                    "claims": [{
+                        "text": "胡塞武装在8月11日袭击了一艘红海商船。",
+                        "evidence": [{
+                            "snippet": partial_sentence,
+                            "stance": "supports",
+                            "strength": 0.8,
+                        }],
+                    }],
+                },
+            }
+
+        with patch("pldr_api.intake.run_model_task", side_effect=partial_date_model_task):
+            partial_response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": partial_sentence,
+                    "source_description": "公开报道",
+                    "title": "部分日期补全年份测试",
+                    "published_at": "2026-08-12T00:00:00Z",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(partial_response.status_code, 200, partial_response.text)
+        partial_event = self.candidate_map(partial_response.json()["intake_item"])["event"]["machine"]["fields"]
+        self.assertEqual(partial_event["event_time"], "2026-08-11T00:00:00Z")
+        self.assertEqual(partial_event["event_time_source_text"], "8月11日")
+        self.assertEqual(partial_event["event_time_basis"], "source_partial_date_with_document_year")
+
         ranged_sentence = "专题关注范围为2026年8月15日至今，具体事件时间尚未核实。"
 
         async def ranged_model_task(task: str, payload: dict):

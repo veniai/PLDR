@@ -74,7 +74,7 @@ TASK_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
         "event": {
             "title": "string or null",
             "summary": "string or null",
-            "event_time": "exact unambiguous occurrence date/time text from the source, or null; never a publication date",
+            "event_time": "exact occurrence date/time wording copied from the source (a partial month/day is allowed), or null; never a publication date and never a normalized value absent from the source",
             "location_name": "string or null",
         },
         "entities": [

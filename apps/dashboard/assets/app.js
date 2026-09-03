@@ -4892,6 +4892,8 @@ function renderReviewMaterialSummary(item) {
 function validationErrorLabel(error) {
   const text = String(error || "");
   if (/Event start time must be a valid ISO-8601 datetime/i.test(text)) return "事件时间格式无法识别，请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。";
+  if (/Event time .* earlier than investigation start/i.test(text)) return "该事件发生在专题设定的开始时间之前，不能直接加入本专题；请核对时间、修改专题范围，或不采用这条材料。";
+  if (/Event time .* later than investigation end/i.test(text)) return "该事件发生在专题设定的结束时间之后，不能直接加入本专题；请核对时间、修改专题范围，或不采用这条材料。";
   if (/At least one claim/i.test(text)) return "至少保留一条主张候选。";
   if (/At least one evidence/i.test(text)) return "至少纳入一条能够在快照中定位的证据原句。";
   if (/Evidence snippet is missing/i.test(text)) return "这条原文依据没有内容，已默认不采用。";
@@ -4977,7 +4979,9 @@ function renderIntakeReview(item) {
   const normalizedEventTime = normalizeEventTimeForConfirmation(rawEventTime, { strict: false });
   const eventTimeNotice = rawEventTime && !normalizedEventTime
     ? '<small class="validation-error">系统无法可靠识别候选时间，已留空；原始表述仍保留在上方原文中。</small>'
-    : '<small>可填写 YYYY-MM-DD 或完整 ISO 时间；无法确定时留空。</small>';
+    : event.event_time_basis === "source_partial_date_with_document_year" && event.event_time_source_text
+      ? `<small>原文写作“${escapeHtml(event.event_time_source_text)}”，系统结合材料年份补全；加入前可修改。</small>`
+      : '<small>可填写 YYYY-MM-DD 或完整 ISO 时间；无法确定时留空。</small>';
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">
       <strong>基础草稿 · 需要逐项核对</strong>

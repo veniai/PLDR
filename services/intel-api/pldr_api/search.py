@@ -133,6 +133,28 @@ def assess_topic_relevance(
             + context_concept_hits
         )
     )[:6]
+    publication_time = result.published_at
+    event_start = investigation.event_start_at
+    if publication_time is not None and event_start is not None:
+        if publication_time.tzinfo is None:
+            publication_time = publication_time.replace(tzinfo=timezone.utc)
+        if event_start.tzinfo is None:
+            event_start = event_start.replace(tzinfo=timezone.utc)
+        if publication_time.astimezone(timezone.utc) < event_start.astimezone(timezone.utc):
+            return {
+                "level": "uncertain",
+                "label": "时间范围待核对",
+                "matched_terms": matched,
+                "reason": (
+                    f"材料发布于 {publication_time.date().isoformat()}，早于专题事件范围 "
+                    f"{event_start.date().isoformat()}；保留在线索列表，不自动进入待处理。"
+                ),
+                "time_scope": {
+                    "status": "published_before_event_start",
+                    "published_at": iso(publication_time),
+                    "event_start_at": iso(event_start),
+                },
+            }
     if strong_title_match:
         title_matched = list(dict.fromkeys(title_anchor_hits + title_concept_hits))[:4]
         return {

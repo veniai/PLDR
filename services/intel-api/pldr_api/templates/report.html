@@ -24,7 +24,6 @@
     .claim{margin:12px 0;padding:15px 16px;background:#f5f9fb;border:1px solid #dce8ed;border-left:4px solid #4eaccb;border-radius:0 8px 8px 0}
     .claim.contested{border-left-color:#d29a35}.claim.unverified{border-left-color:#9568c4}.claim.refuted{border-left-color:#d4565b}
     .claim-title{display:flex;gap:9px;align-items:flex-start}.claim-title b{font-size:14px;line-height:1.55}.status,.claim-origin{flex:0 0 auto;padding:3px 6px;border-radius:4px;background:#dcecf2;color:#396477;font-size:10px}.claim-origin{background:#e7f4ea;color:#357149}
-    .citations{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.citations a{padding:4px 7px;border-radius:5px;background:#e8f3f7;color:#087a9f;font-size:11px;font-weight:650;text-decoration:none}.citations a:hover{text-decoration:underline}
     .evidence{margin:10px 0 0;padding:12px 14px;background:#fff;border:1px solid #dae5e9;border-left:3px solid #4da86f;border-radius:0 7px 7px 0}
     .evidence.contradicts{border-left-color:#d45c60}.evidence.context{border-left-color:#c89a36}.evidence blockquote{margin:7px 0;color:#334e5b;font-size:13px;line-height:1.65}
     .evidence-top{display:flex;gap:8px;color:#678392;font-size:11px}.evidence-top strong{color:#315f72}
@@ -68,11 +67,13 @@
       <article class="claim {{ finding.status }}" data-origin="{{ finding.origin }}">
         <div class="claim-title"><span class="status">{{ claim_status_labels.get(finding.status, finding.status) }}</span><b>{{ finding.text }}</b></div>
         <p class="meta">来自事件：{{ finding.event_title }} · {{ finding.independent_source_count }} 个独立来源</p>
-        <div class="citations">
-          {% for evidence in finding.evidence %}
-          <a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">原文 E{{ evidence.index }} · {{ evidence.document.source.name }}</a>
-          {% endfor %}
+        {% for evidence in finding.evidence %}
+        <div class="evidence {{ evidence.stance }}">
+          <div class="evidence-top"><strong>原文 E{{ evidence.index }}</strong><span>{{ stance_labels.get(evidence.stance, evidence.stance) }}</span></div>
+          <blockquote>{{ evidence.snippet }}</blockquote>
+          <footer><span>{{ evidence.document.source.name }} · {{ evidence.document.published_at or "发布时间未知" }}</span><a href="{{ evidence.snapshot_url }}" target="_blank" rel="noopener">查看保存的原文</a></footer>
         </div>
+        {% endfor %}
       </article>
       {% endfor %}
     </section>
