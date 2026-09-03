@@ -21,6 +21,7 @@ from .investigations import (
     DEMO_INVESTIGATION_ID,
     bootstrap_legacy_investigations,
     investigation_event_ids,
+    recover_retryable_model_tasks,
     record_action,
     router as investigation_router,
     task_router as investigation_task_router,
@@ -377,6 +378,7 @@ async def lifespan(_: FastAPI):
     backfill_evidence_snapshots()
     with SessionLocal() as session:
         bootstrap_legacy_investigations(session)
+        recover_retryable_model_tasks(session)
     yield
 
 

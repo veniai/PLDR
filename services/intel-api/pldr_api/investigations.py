@@ -72,7 +72,51 @@ UNCLASSIFIED_INVESTIGATION_ID = "inv_unclassified"
 ACTIVE_TASK_STATUSES = {"queued", "fetching", "generating"}
 TERMINAL_TASK_STATUSES = {"ready", "failed", "confirmed", "rejected"}
 DEFAULT_TASK_LEASE_SECONDS = 180
+DEFAULT_MODEL_AUTO_RETRY_ATTEMPTS = 3
+DEFAULT_MODEL_AUTO_RETRY_BASE_SECONDS = 60
+DEFAULT_MODEL_AUTO_RETRY_MAX_SECONDS = 900
 SOURCE_EVENT_LINK_ROLE = "source_event"
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def model_auto_retry_attempts() -> int:
+    """Number of automatic model retries after the initial attempt."""
+    return _env_int(
+        "PLDR_MODEL_AUTO_RETRY_ATTEMPTS",
+        DEFAULT_MODEL_AUTO_RETRY_ATTEMPTS,
+        minimum=0,
+        maximum=20,
+    )
+
+
+def model_auto_retry_delay_seconds(retry_number: int) -> int:
+    base = _env_int(
+        "PLDR_MODEL_AUTO_RETRY_BASE_SECONDS",
+        DEFAULT_MODEL_AUTO_RETRY_BASE_SECONDS,
+        minimum=0,
+        maximum=86400,
+    )
+    maximum = _env_int(
+        "PLDR_MODEL_AUTO_RETRY_MAX_SECONDS",
+        DEFAULT_MODEL_AUTO_RETRY_MAX_SECONDS,
+        minimum=0,
+        maximum=86400,
+    )
+    return min(maximum, base * (2 ** max(0, retry_number - 1)))
+
+
+def _model_api_configured() -> bool:
+    return all(
+        os.getenv(name, "").strip()
+        for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL_NAME")
+    )
 
 
 def _task_has_current_intake_link():
@@ -1106,6 +1150,13 @@ def serialize_task(
             }
         )
     fallback_used = task.error_class in {"model_fallback", "rule_fallback"}
+    task_payload = task.payload_json or {}
+    model_retry = task_payload.get("model_retry")
+    waiting_for_model_retry = bool(
+        task.status == "queued"
+        and isinstance(model_retry, dict)
+        and model_retry.get("status") == "waiting"
+    )
     payload = {
         "id": task.id,
         "task_id": task.id,
@@ -1135,14 +1186,18 @@ def serialize_task(
         "fallback_used": fallback_used,
         "degraded": bool(structured_error and structured_error["degraded"]),
         "retryable": (
-            bool(structured_error["retryable"])
+            False
+            if waiting_for_model_retry
+            else bool(structured_error["retryable"])
             if structured_error is not None
             else task.status == "failed"
         ),
+        "waiting_for_model_retry": waiting_for_model_retry,
+        "model_retry": model_retry if waiting_for_model_retry else None,
         "intake_item_id": task.intake_item_id,
         "selection_id": task.selection_id,
-        "payload": task.payload_json or {},
-        "payload_json": task.payload_json or {},
+        "payload": task_payload,
+        "payload_json": task_payload,
         "created_at": iso(task.created_at),
         "updated_at": iso(task.updated_at),
     }
@@ -2157,6 +2212,7 @@ def claim_next_review_task(
             select(ReviewTask.id, ReviewTask.intake_item_id)
             .where(
                 ReviewTask.status == "queued",
+                ReviewTask.queued_at <= now,
                 _task_has_current_intake_link(),
                 _task_intake_is_visible(),
             )
@@ -2186,6 +2242,7 @@ def claim_next_review_task(
             .where(
                 ReviewTask.id == task_id,
                 ReviewTask.status == "queued",
+                ReviewTask.queued_at <= now,
                 _task_has_current_intake_link(),
                 _task_intake_is_visible(),
             )
@@ -2278,6 +2335,156 @@ def _mark_task_terminal(
         },
     )
     _update_task_batches(session, task)
+
+
+def _schedule_model_retry(
+    session: Session,
+    task: ReviewTask,
+    item: IntakeItem,
+    selection: SearchSelection | None,
+    exc: ModelGenerationError,
+    *,
+    actor: str,
+    now: datetime | None = None,
+    recovered_legacy_fallback: bool = False,
+) -> bool:
+    """Return a failed model call to the durable queue with bounded backoff."""
+    if not _model_api_configured():
+        return False
+    payload = dict(task.payload_json or {})
+    try:
+        retries_used = max(0, int(payload.get("model_auto_retry_count") or 0))
+    except (TypeError, ValueError):
+        retries_used = 0
+    retry_limit = model_auto_retry_attempts()
+    if retries_used >= retry_limit:
+        return False
+
+    retry_number = retries_used + 1
+    scheduled_at = now or utcnow()
+    next_attempt_at = scheduled_at + timedelta(
+        seconds=model_auto_retry_delay_seconds(retry_number)
+    )
+    error_class = _task_error_class(exc)
+    error_message = str(exc)[:4000]
+    fingerprint = payload.get("result_fingerprint") or task.subject_id
+    active_key = _active_task_key(task.investigation_id, str(fingerprint))
+    conflicting = session.scalar(
+        select(ReviewTask.id).where(
+            ReviewTask.active_key == active_key,
+            ReviewTask.id != task.id,
+        )
+    )
+    if conflicting:
+        return False
+
+    task.status = "queued"
+    task.active_key = active_key
+    task.attempt_number += 1
+    # queued_at doubles as the eligibility time; claim_next_review_task excludes
+    # future values so retries cannot hot-loop against a slow provider.
+    task.queued_at = next_attempt_at
+    task.started_at = None
+    task.completed_at = None
+    task.lease_owner = None
+    task.lease_expires_at = None
+    task.error_class = error_class
+    task.error_message = error_message
+    payload["force_ai_retry"] = True
+    payload["model_auto_retry_count"] = retry_number
+    payload["model_retry"] = {
+        "status": "waiting",
+        "retry_number": retry_number,
+        "retry_limit": retry_limit,
+        "next_attempt_at": iso(next_attempt_at),
+        "last_error_class": error_class,
+        "last_error_message": error_message,
+        "recovered_legacy_fallback": recovered_legacy_fallback,
+    }
+    task.payload_json = payload
+    task.updated_at = scheduled_at
+
+    # The original snapshot is already durable. Keep the intake parsed and
+    # non-reviewable until a real model result succeeds.
+    item.status = "parsed"
+    item.error = None
+    item.candidate_mode = "pending-ai-retry"
+    item.candidate_model = None
+    item.candidate_error = error_message
+    item.candidate_relations = []
+    item.updated_at = scheduled_at
+    if selection is not None:
+        selection.status = "queued"
+        selection.outcome = "retry_waiting"
+        selection.last_error = error_message
+        selection.updated_at = scheduled_at
+
+    record_action(
+        session,
+        task.investigation_id,
+        "task.retry_scheduled",
+        actor=actor,
+        object_type=task.subject_type,
+        object_id=task.subject_id,
+        task_id=task.id,
+        detail={
+            "intake_item_id": item.id,
+            "error_class": error_class,
+            "error_message": error_message,
+            "retry_number": retry_number,
+            "retry_limit": retry_limit,
+            "next_attempt_at": iso(next_attempt_at),
+            "recovered_legacy_fallback": recovered_legacy_fallback,
+        },
+    )
+    _update_task_batches(session, task)
+    return True
+
+
+def recover_retryable_model_tasks(session: Session) -> int:
+    """Move pre-auto-retry model failures back to the durable queue once."""
+    if not _model_api_configured() or model_auto_retry_attempts() == 0:
+        return 0
+    tasks = list(
+        session.scalars(
+            select(ReviewTask).where(
+                ReviewTask.status.in_(("ready", "failed")),
+                ReviewTask.error_class.in_(("model_fallback", "model_timeout", "model_error")),
+                _task_has_current_intake_link(),
+                _task_intake_is_visible(),
+            )
+        )
+    )
+    recovered = 0
+    for task in tasks:
+        item = session.get(IntakeItem, task.intake_item_id) if task.intake_item_id else None
+        if item is None or item.status in {"confirmed", "rejected", "cancelled"}:
+            continue
+        payload = dict(task.payload_json or {})
+        if payload.get("model_auto_retry_count") is not None:
+            continue
+        message = task.error_message or item.candidate_error or "Previous model analysis did not complete"
+        exc = ModelGenerationError(
+            message,
+            timed_out="timeout" in message.lower() or "deadline" in message.lower(),
+        )
+        selection = session.get(SearchSelection, task.selection_id) if task.selection_id else None
+        if _schedule_model_retry(
+            session,
+            task,
+            item,
+            selection,
+            exc,
+            actor="system:model-retry-recovery",
+            recovered_legacy_fallback=True,
+        ):
+            for candidate in list(item.candidates):
+                session.delete(candidate)
+            session.flush()
+            recovered += 1
+    if recovered:
+        session.commit()
+    return recovered
 
 
 def _populate_intake_from_fetch(item: IntakeItem, fetched: Any) -> None:
@@ -2671,6 +2878,8 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
             fallback_error = None
             task_payload = dict(task.payload_json or {})
             task_payload["candidate_mode"] = item.candidate_mode
+            task_payload.pop("model_retry", None)
+            task_payload.pop("force_ai_retry", None)
             task.payload_json = task_payload
             if selection is not None:
                 selection.status = item.status
@@ -2833,6 +3042,16 @@ async def execute_claimed_review_task(task_id: str) -> ReviewTask:
                         )
                         session.commit()
                         return task
+                if isinstance(exc, ModelGenerationError) and _schedule_model_retry(
+                    session,
+                    task,
+                    item,
+                    selection,
+                    exc,
+                    actor=actor,
+                ):
+                    session.commit()
+                    return task
                 item.status = "generation_failed" if isinstance(exc, ModelGenerationError) else "failed"
                 item.error = str(exc)[:4000]
                 item.updated_at = utcnow()
@@ -2933,6 +3152,8 @@ def retry_review_task(
     task.error_class = None
     task.error_message = None
     payload["force_ai_retry"] = fallback_retry or failed_model_retry
+    payload["model_auto_retry_count"] = 0
+    payload.pop("model_retry", None)
     task.payload_json = payload
     task.updated_at = utcnow()
     record_action(

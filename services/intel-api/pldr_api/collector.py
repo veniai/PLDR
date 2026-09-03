@@ -6,7 +6,11 @@ import os
 
 from .collection import run_once, worker_identity
 from .database import Base, SessionLocal, engine
-from .investigations import bootstrap_legacy_investigations, run_review_task_once
+from .investigations import (
+    bootstrap_legacy_investigations,
+    recover_retryable_model_tasks,
+    run_review_task_once,
+)
 
 
 async def _worker_loop(*, poll_seconds: float, slot: int) -> None:
@@ -69,6 +73,7 @@ def main() -> int:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as session:
         bootstrap_legacy_investigations(session)
+        recover_retryable_model_tasks(session)
     try:
         if args.once:
             asyncio.run(_run_single())

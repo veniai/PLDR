@@ -236,6 +236,7 @@ const ACTIVITY_ACTION_LABELS = Object.freeze({
   "task.reused": "复用了已有处理任务",
   "task.lease_recovered": "超时任务已恢复到队列",
   "task.retry": "重新提交了失败任务",
+  "task.retry_scheduled": "AI 未完成，系统已自动重新排队",
   "intake.confirmed": "人工确认材料入档",
   "intake.rejected": "人工决定不采用材料",
   "intake.cancelled": "撤销材料处理",
@@ -885,9 +886,9 @@ function taskErrorPayload(task) {
   return message ? { message, stage: task.error_stage || canonicalTaskStage(task), retryable: task.retryable } : null;
 }
 
-function taskStatusMarkup(stage) {
+function taskStatusMarkup(stage, task = null) {
   const safe = canonicalTaskStage({ status: stage });
-  const humanState = LABELS.taskStage[safe]
+  const humanState = task?.waiting_for_model_retry ? "等待 AI 重试" : LABELS.taskStage[safe]
     || (["ready"].includes(safe) ? "待核对" : ["failed", "blocked"].includes(safe) ? "需要处理" : ["accepted", "rejected", "cancelled", "completed"].includes(safe) ? "已完成" : "处理中");
   return `<span class="task-stage ${escapeHtml(safe)}">${escapeHtml(humanState)}</span>`;
 }
@@ -1157,8 +1158,8 @@ function renderInvestigationHome() {
         <span class="assignment-copy">
           <h3>${escapeHtml(taskTitle(task))}</h3>
           <span class="assignment-meta"><span>${escapeHtml(investigation?.sync_mode === "system" ? "系统待归类" : investigation?.title || "待归类材料")}</span><span>${formatDate(task.updated_at || task.created_at, true)}</span></span>
-          ${taskError(task) ? `<p>${escapeHtml(normalizeOperationalError(taskErrorPayload(task), canonicalTaskStage(task)).title)}</p>` : ""}
-          <span class="assignment-meta">${taskStatusMarkup(stage)}</span>
+          ${task?.waiting_for_model_retry ? "<p>AI 分析未完成，后台将自动重试。</p>" : taskError(task) ? `<p>${escapeHtml(normalizeOperationalError(taskErrorPayload(task), canonicalTaskStage(task)).title)}</p>` : ""}
+          <span class="assignment-meta">${taskStatusMarkup(stage, task)}</span>
         </span>
         <span class="assignment-go">›</span>
       </button>`;
@@ -1856,7 +1857,10 @@ function taskFailureActionLabel(error) {
   return "重试处理";
 }
 
-function taskProgressText(stage) {
+function taskProgressText(stage, task = null) {
+  if (stage === "queued" && task?.waiting_for_model_retry) {
+    return "AI 分析本次未完成，已自动重新排队；后台会继续处理，无需手动操作。";
+  }
   return ({
     ready: "草稿已经准备好，核对并明确确认前不会写入正式档案。",
     generating: "原始材料已保存，AI 正在分析正文。",
@@ -1915,8 +1919,8 @@ function renderTaskRows(tasks, emptyMessage = "当前没有待处理任务。") 
       <article class="topic-task-row">
         <div>
           <h3>${escapeHtml(taskTitle(task))}</h3>
-          ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true, actionHtml: primaryAction }) : degradation ? renderTaskDegradation(degradation) : `<p>${escapeHtml(taskProgressText(stage))}</p>`}
-          <div class="topic-task-meta">${relevance ? `<span class="search-relevance ${escapeHtml(relevance.level)}" title="${escapeHtml(relevance.reason)}">${escapeHtml(relevance.label)}</span>` : ""}${taskStatusMarkup(stage)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span></div>
+          ${errorPayload ? renderOperationalError(errorPayload, { stage: errorPayload.stage || "unknown", compact: true, actionHtml: primaryAction }) : degradation ? renderTaskDegradation(degradation) : `<p>${escapeHtml(taskProgressText(stage, task))}</p>`}
+          <div class="topic-task-meta">${relevance ? `<span class="search-relevance ${escapeHtml(relevance.level)}" title="${escapeHtml(relevance.reason)}">${escapeHtml(relevance.label)}</span>` : ""}${taskStatusMarkup(stage, task)}<span>${formatDate(task.updated_at || task.created_at || task.queued_at, true)}</span></div>
         </div>
         <div class="topic-task-actions">
           ${errorPayload ? "" : primaryAction}

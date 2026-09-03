@@ -95,7 +95,14 @@ class TopicUxContractTest(unittest.TestCase):
     def test_topic_starter_material_is_saved_before_background_candidate_generation(self):
         topic = self.create_topic("Background starter material")
         model = AsyncMock(side_effect=TimeoutError("model timeout"))
-        with patch("pldr_api.intake.run_model_task", new=model):
+        retry_env = {
+            "LLM_API_KEY": "configured-for-test",
+            "LLM_BASE_URL": "https://model.example.test/v1",
+            "LLM_MODEL_NAME": "test-model",
+            "PLDR_MODEL_AUTO_RETRY_ATTEMPTS": "3",
+            "PLDR_MODEL_AUTO_RETRY_BASE_SECONDS": "0",
+        }
+        with patch.dict(os.environ, retry_env), patch("pldr_api.intake.run_model_task", new=model):
             response = self.client.post(
                 "/pldr-api/v1/intake/text?defer_candidates=true",
                 json={
@@ -175,11 +182,11 @@ class TopicUxContractTest(unittest.TestCase):
             asyncio.run(run_review_task_once(worker_id="topic-onboarding-worker"))
             model.assert_awaited_once()
 
-        ready = self.client.get(f"/pldr-api/v1/tasks/{task['id']}")
-        self.assertEqual(ready.status_code, 200, ready.text)
-        self.assertEqual(ready.json()["status"], "failed")
-        self.assertFalse(ready.json()["fallback_used"])
-        self.assertEqual(ready.json()["error"]["code"], "model_timeout")
+        waiting = self.client.get(f"/pldr-api/v1/tasks/{task['id']}")
+        self.assertEqual(waiting.status_code, 200, waiting.text)
+        self.assertEqual(waiting.json()["status"], "queued")
+        self.assertTrue(waiting.json()["waiting_for_model_retry"])
+        self.assertEqual(waiting.json()["model_retry"]["retry_number"], 1)
 
     def link(self, topic_id: str, object_type: str, object_id: str) -> None:
         response = self.client.post(
@@ -710,6 +717,8 @@ class TopicUxContractTest(unittest.TestCase):
             'taskRetry: (id) => `/pldr-api/v1/tasks/${encodeURIComponent(id)}/retry`',
             source,
         )
+        self.assertIn('task?.waiting_for_model_retry ? "等待 AI 重试"', source)
+        self.assertIn("后台会继续处理，无需手动操作", source)
 
     def test_topic_onboarding_presents_one_clear_human_confirmation_flow(self):
         page = self.client.get("/")
