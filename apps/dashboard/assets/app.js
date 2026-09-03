@@ -3583,7 +3583,6 @@ function setImportMode(mode) {
 
 async function openExternalSearchModal(preferredInvestigationId = state.activeInvestigationId, { keyword = "", autoStart = false } = {}) {
   const modal = $("#search-modal");
-  const openSerial = state.searchRequestSerial;
   state.searchHistoryVisibility = "active";
   renderDestinationPickers(preferredInvestigationId);
   if (typeof modal.showModal === "function" && !modal.open) modal.showModal();
@@ -3591,6 +3590,7 @@ async function openExternalSearchModal(preferredInvestigationId = state.activeIn
   renderSearchProvider();
   const destinationId = currentSearchDestinationId();
   switchSearchWorkspaceContext(destinationId);
+  const openSerial = state.searchRequestSerial;
   renderSearchHistory();
   renderSearchResults();
   updateSearchSelectionCount();
