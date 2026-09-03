@@ -81,8 +81,37 @@ def iso(value: datetime | None) -> str | None:
 def parse_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
+    cleaned = value.strip()
+    chinese_match = re.fullmatch(
+        r"(\d{4})年(\d{1,2})月(\d{1,2})日"
+        r"(?:\s*(?:(\d{1,2})时(?:(\d{1,2})分)?(?:(\d{1,2})秒)?"
+        r"|(\d{1,2}):(\d{2})(?::(\d{2}))?))?",
+        cleaned,
+    )
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if chinese_match:
+            (
+                year,
+                month,
+                day,
+                han_hour,
+                han_minute,
+                han_second,
+                colon_hour,
+                colon_minute,
+                colon_second,
+            ) = chinese_match.groups()
+            parsed = datetime(
+                int(year),
+                int(month),
+                int(day),
+                int(han_hour or colon_hour or 0),
+                int(han_minute or colon_minute or 0),
+                int(han_second or colon_second or 0),
+                tzinfo=timezone.utc,
+            )
+        else:
+            parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
     except ValueError as exc:
         raise ValueError("Invalid ISO-8601 datetime") from exc
     if parsed.tzinfo is None:
@@ -501,6 +530,14 @@ def _store_candidates(
             and (not isinstance(event_time, str) or event_time not in item.extracted_snapshot)
         ):
             event_time = None
+        elif event_time is not None:
+            try:
+                event_time = iso(parse_datetime(event_time))
+            except ValueError:
+                # Keep unambiguous time normalization separate from the raw
+                # source wording. Natural-language ranges remain in the saved
+                # snapshot but must not prefill an invalid confirmation value.
+                event_time = None
         event["event_time"] = event_time
     event_key = "event"
     session.add(

@@ -764,6 +764,9 @@ class TopicUxContractTest(unittest.TestCase):
         self.assertEqual(script.status_code, 200, script.text)
         source = script.text
         self.assertIn("function suggestedInvestigationQuestion", source)
+        self.assertIn("function normalizeEventTimeForConfirmation", source)
+        self.assertIn("系统无法可靠识别候选时间，已留空", source)
+        self.assertIn("事件时间格式无法识别。请填写 YYYY-MM-DD", source)
         self.assertIn("async function startInitialTopicCollection", source)
         self.assertIn("function renderOutcomeHero", source)
         self.assertIn("function renderOutcomeFindings", source)

@@ -19,7 +19,7 @@ os.environ.pop("PLDR_ADMIN_TOKEN", None)
 from fastapi.testclient import TestClient
 from pldr_api.database import Base, SessionLocal, engine
 from pldr_api.main import app
-from pldr_api.intake import confirm_intake, get_intake_item
+from pldr_api.intake import confirm_intake, get_intake_item, parse_datetime
 from pldr_api.importers import fetch_public_text
 from pldr_api.models import (
     Claim,
@@ -703,6 +703,110 @@ class P0Test(unittest.TestCase):
         self.assertIn("must not duplicate", duplicate_item["candidate_generation"]["error"])
         self.assertFalse(duplicate_item["candidates"])
         self.assertEqual(counts(SessionLocal()), baseline)
+
+    def test_event_time_is_normalized_or_left_unknown_before_confirmation(self):
+        self.assertEqual(
+            parse_datetime("2026年8月15日"),
+            datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            parse_datetime("2026年8月15日 14时30分"),
+            datetime(2026, 8, 15, 14, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            parse_datetime("2026-08-15T06:30:00Z"),
+            datetime(2026, 8, 15, 6, 30, tzinfo=timezone.utc),
+        )
+        with self.assertRaises(ValueError):
+            parse_datetime("2026年8月15日至今")
+
+        source_sentence = "公开通报称，事件发生于2026年8月15日，相关部门随后启动调查。"
+
+        async def dated_model_task(task: str, payload: dict):
+            return {
+                "mode": "api",
+                "model": "test-model",
+                "result": {
+                    "event": {
+                        "title": "公开通报事件",
+                        "summary": "通报记录了一项待人工确认的事件。",
+                        "event_time": "2026年8月15日",
+                        "location_name": None,
+                    },
+                    "entities": [],
+                    "claims": [{
+                        "text": "公开通报记录了一项事件。",
+                        "evidence": [{
+                            "snippet": source_sentence,
+                            "stance": "supports",
+                            "strength": 0.8,
+                        }],
+                    }],
+                },
+            }
+
+        with patch("pldr_api.intake.run_model_task", side_effect=dated_model_task):
+            response = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": source_sentence,
+                    "source_description": "公开通报",
+                    "title": "事件时间规范化测试",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        item = response.json()["intake_item"]
+        event = self.candidate_map(item)["event"]["machine"]["fields"]
+        self.assertEqual(event["event_time"], "2026-08-15T00:00:00Z")
+        request = self.confirmation_request(item)
+        request["event"]["start_at"] = "2026年8月15日"
+        preview = self.client.post(f"/pldr-api/v1/intake/{item['id']}/preview", json=request)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertTrue(preview.json()["confirmable"], preview.text)
+        self.assertEqual(
+            preview.json()["semantic_preview"]["event"]["start_at"],
+            "2026-08-15T00:00:00Z",
+        )
+
+        ranged_sentence = "专题关注范围为2026年8月15日至今，具体事件时间尚未核实。"
+
+        async def ranged_model_task(task: str, payload: dict):
+            return {
+                "mode": "api",
+                "model": "test-model",
+                "result": {
+                    "event": {
+                        "title": "时间范围待核实",
+                        "summary": "材料只给出了专题范围。",
+                        "event_time": "2026年8月15日至今",
+                        "location_name": None,
+                    },
+                    "entities": [],
+                    "claims": [{
+                        "text": "材料没有给出明确事件时间。",
+                        "evidence": [{
+                            "snippet": ranged_sentence,
+                            "stance": "context",
+                            "strength": 0.6,
+                        }],
+                    }],
+                },
+            }
+
+        with patch("pldr_api.intake.run_model_task", side_effect=ranged_model_task):
+            ranged = self.client.post(
+                "/pldr-api/v1/intake/text",
+                json={
+                    "text": ranged_sentence,
+                    "source_description": "专题范围说明",
+                    "title": "事件时间范围测试",
+                    "language": "zh-CN",
+                },
+            )
+        self.assertEqual(ranged.status_code, 200, ranged.text)
+        ranged_event = self.candidate_map(ranged.json()["intake_item"])["event"]["machine"]["fields"]
+        self.assertIsNone(ranged_event["event_time"])
 
     def test_intake_archive_is_reversible_idempotent_and_never_changes_processing_state(self):
         with patch(

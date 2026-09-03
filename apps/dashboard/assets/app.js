@@ -2304,6 +2304,57 @@ function dateInputToIso(value, endOfDay = false) {
   return `${value}T${endOfDay ? "23:59:59" : "00:00:00"}Z`;
 }
 
+function utcIsoFromParts(year, month, day, hour = 0, minute = 0, second = 0) {
+  const values = [year, month, day, hour, minute, second].map(Number);
+  const date = new Date(Date.UTC(values[0], values[1] - 1, values[2], values[3], values[4], values[5]));
+  if (
+    date.getUTCFullYear() !== values[0]
+    || date.getUTCMonth() + 1 !== values[1]
+    || date.getUTCDate() !== values[2]
+    || date.getUTCHours() !== values[3]
+    || date.getUTCMinutes() !== values[4]
+    || date.getUTCSeconds() !== values[5]
+  ) return null;
+  return date.toISOString().replace(".000Z", "Z");
+}
+
+function normalizeEventTimeForConfirmation(value, { strict = true } = {}) {
+  const cleaned = String(value || "").trim();
+  if (!cleaned) return null;
+  const chinese = cleaned.match(/^(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*(?:(\d{1,2})时(?:(\d{1,2})分)?(?:(\d{1,2})秒)?|(\d{1,2}):(\d{2})(?::(\d{2}))?))?$/);
+  let normalized = chinese
+    ? utcIsoFromParts(
+      chinese[1], chinese[2], chinese[3],
+      chinese[4] || chinese[7] || 0,
+      chinese[5] || chinese[8] || 0,
+      chinese[6] || chinese[9] || 0,
+    )
+    : null;
+  const dateOnly = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!normalized && dateOnly) {
+    normalized = utcIsoFromParts(dateOnly[1], dateOnly[2], dateOnly[3]);
+  }
+  const localDateTime = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!normalized && localDateTime) {
+    normalized = utcIsoFromParts(
+      localDateTime[1], localDateTime[2], localDateTime[3],
+      localDateTime[4], localDateTime[5], localDateTime[6] || 0,
+    );
+  }
+  const zonedDateTime = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/i);
+  if (!normalized && zonedDateTime && utcIsoFromParts(
+    zonedDateTime[1], zonedDateTime[2], zonedDateTime[3],
+    zonedDateTime[4], zonedDateTime[5], zonedDateTime[6] || 0,
+  )) {
+    const parsed = new Date(cleaned);
+    if (!Number.isNaN(parsed.getTime())) normalized = parsed.toISOString();
+  }
+  if (!normalized && strict) {
+    throw new Error("事件时间格式无法识别。请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。");
+  }
+  return normalized;
+}
+
 function investigationCreateFields() {
   const trackingMode = $('input[name="investigation-create-mode"]:checked')?.value || "continuous";
   return {
@@ -4603,7 +4654,7 @@ function defaultConfirmationForItem(item) {
       title: event.title || item.title || "",
       summary: event.summary || "",
       event_type: event.event_type || "incident",
-      start_at: event.start_at || event.event_time || null,
+      start_at: normalizeEventTimeForConfirmation(event.start_at || event.event_time, { strict: false }),
       location_name: event.location_name || "",
       importance: event.importance || "medium",
     },
@@ -4790,6 +4841,7 @@ function renderReviewMaterialSummary(item) {
 
 function validationErrorLabel(error) {
   const text = String(error || "");
+  if (/Event start time must be a valid ISO-8601 datetime/i.test(text)) return "事件时间格式无法识别，请填写 YYYY-MM-DD、完整 ISO 时间，或留空表示未知。";
   if (/At least one claim/i.test(text)) return "至少保留一条主张候选。";
   if (/At least one evidence/i.test(text)) return "至少纳入一条能够在快照中定位的证据原句。";
   if (/cannot be precisely located/i.test(text)) return "所选证据无法在完整快照中精确定位，请恢复原句或排除它。";
@@ -4865,6 +4917,11 @@ function renderIntakeReview(item) {
     : null;
   const defaultDisposition = suggestedMerge ? "merge" : "create";
   const degraded = ["fallback", "fallback-after-error"].includes(generation.mode);
+  const rawEventTime = String(event.start_at || event.event_time || "").trim();
+  const normalizedEventTime = normalizeEventTimeForConfirmation(rawEventTime, { strict: false });
+  const eventTimeNotice = rawEventTime && !normalizedEventTime
+    ? '<small class="validation-error">系统无法可靠识别候选时间，已留空；原始表述仍保留在上方原文中。</small>'
+    : '<small>可填写 YYYY-MM-DD 或完整 ISO 时间；无法确定时留空。</small>';
   const degradedWarning = degraded ? `
     <div class="task-degradation review-degradation" role="status">
       <strong>基础草稿 · 需要逐项核对</strong>
@@ -4914,7 +4971,7 @@ function renderIntakeReview(item) {
         <div class="review-grid">
           <label><span>标题（未知必须由人工补实）</span><input id="intake-event-title" value="${escapeHtml(event.title || "")}" maxlength="500"></label>
           <label><span>事件类型</span><input id="intake-event-type" value="${escapeHtml(event.event_type || "incident")}" maxlength="80"></label>
-          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(event.start_at || event.event_time || "")}" placeholder="YYYY-MM-DDTHH:MM:SSZ"></label>
+          <label><span>事件时间（未知留空）</span><input id="intake-event-start" value="${escapeHtml(normalizedEventTime || "")}" placeholder="YYYY-MM-DD">${eventTimeNotice}</label>
           <label><span>地点（未知留空）</span><input id="intake-event-location" value="${escapeHtml(event.location_name || "")}" maxlength="200"></label>
           <label><span>重要性</span><select id="intake-event-importance"><option value="medium" ${event.importance === "medium" || !event.importance ? "selected" : ""}>中</option><option value="high" ${event.importance === "high" ? "selected" : ""}>高</option><option value="critical" ${event.importance === "critical" ? "selected" : ""}>极高</option><option value="low" ${event.importance === "low" ? "selected" : ""}>低</option></select></label>
         </div>
@@ -5337,7 +5394,7 @@ function buildConfirmation(item) {
       title: value("#intake-event-title"),
       summary: value("#intake-event-summary"),
       event_type: value("#intake-event-type") || "incident",
-      start_at: value("#intake-event-start") || null,
+      start_at: normalizeEventTimeForConfirmation(value("#intake-event-start")),
       location_name: value("#intake-event-location"),
       importance: value("#intake-event-importance") || "medium",
     },
