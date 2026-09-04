@@ -840,9 +840,10 @@ class TopicUxContractTest(unittest.TestCase):
         html = page.text
         for label in ("专题成果", "待处理", "资料与来源"):
             self.assertIn(label, html)
-        self.assertIn("进行中专题待处理", html)
-        self.assertIn("已删除专题和系统待归类不会混入", html)
-        self.assertIn("只汇总当前专题", html)
+        self.assertIn('<h2 id="my-investigations-title">专题</h2>', html)
+        self.assertIn('<h2 id="my-assignments-title">待处理</h2>', html)
+        self.assertNotIn("已删除专题和系统待归类不会混入", html)
+        self.assertNotIn("只汇总当前专题", html)
         self.assertIn("全局待确认", html)
         self.assertLess(
             html.index('data-investigation-tab="outcomes"'),
